@@ -505,7 +505,9 @@ example](../skills/setup/assets/cabannes-thesis-project/mkdocs.yml).
 Prove2Me workspace: a Lake project with `Definitions/`, `Theorems/`, and
 `Solutions/` libraries, by default `$PROVE2ME_WORKSPACE` or
 `~/prove2me_workspace` (`--workspace` overrides it). The API key comes from
-`$PROVE2ME_API_KEY`, else the workspace's `credentials.json`. It is exchanged
+`$PROVE2ME_API_KEY`, else the workspace's `credentials.json`, else the
+default workspace's, so a second checkout pinned to another Mathlib needs no
+copy of the key. It is exchanged
 for an access token in memory, never printed, and only ever sent to
 `https://prove2.me/api/v1`; no option changes that host.
 

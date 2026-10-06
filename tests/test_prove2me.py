@@ -100,10 +100,32 @@ def test_environment_key_takes_precedence(tmp_path: Path, monkeypatch) -> None:
     assert prove2me.load_credentials(tmp_path).source == "PROVE2ME_API_KEY"
 
 
-def test_missing_credentials_point_to_onboarding(tmp_path: Path, monkeypatch) -> None:
+@pytest.fixture
+def default_workspace(tmp_path: Path, monkeypatch) -> Path:
+    """Point the default workspace at an empty directory, never the real one."""
+    default = tmp_path / "default-workspace"
+    default.mkdir()
     monkeypatch.delenv("PROVE2ME_API_KEY", raising=False)
+    monkeypatch.delenv("PROVE2ME_WORKSPACE", raising=False)
+    monkeypatch.setattr(prove2me, "DEFAULT_WORKSPACE", default)
+    return default
+
+
+def test_missing_credentials_point_to_onboarding(tmp_path: Path, default_workspace: Path) -> None:
     with pytest.raises(Prove2MeError, match="start.md"):
-        prove2me.load_credentials(tmp_path)
+        prove2me.load_credentials(tmp_path / "checkout")
+
+
+def test_a_second_checkout_borrows_the_default_workspace_key(tmp_path: Path, default_workspace: Path) -> None:
+    (default_workspace / "credentials.json").write_text(json.dumps({"api_key": KEY, "username": "u"}))
+    checkout = tmp_path / "prove2me-c5ea003"
+    checkout.mkdir()
+
+    credentials = prove2me.load_credentials(checkout)
+
+    assert credentials.source == str(default_workspace / "credentials.json")
+    (checkout / "credentials.json").write_text(json.dumps({"api_key": _key(FUTURE + 1)}))
+    assert prove2me.load_credentials(checkout).source == str(checkout / "credentials.json")
 
 
 # --- client ------------------------------------------------------------------

@@ -58,22 +58,28 @@ def workspace_path(explicit: str | Path | None = None) -> Path:
 
 
 def load_credentials(workspace: Path) -> Credentials:
-    """Read the key from `$PROVE2ME_API_KEY`, else the workspace's credentials.json."""
+    """Read the key from `$PROVE2ME_API_KEY`, else a credentials.json.
+
+    The key belongs to the account, not to a checkout, so a workspace without
+    its own credentials.json (a second checkout pinned to another Mathlib, a
+    scratch copy) falls back to the default workspace's.
+    """
     env_key = os.environ.get("PROVE2ME_API_KEY", "").strip()
     if env_key:
         return Credentials(env_key, "PROVE2ME_API_KEY", expires_at=_key_expiry(env_key))
 
-    path = workspace / "credentials.json"
+    candidates = [workspace / "credentials.json", workspace_path() / "credentials.json"]
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        raise Prove2MeError(
+            f"no Prove2Me API key: set PROVE2ME_API_KEY or create {candidates[-1]} "
+            "(see https://prove2.me/start.md)"
+        )
     try:
         stored = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise Prove2MeError(
-            f"no Prove2Me API key: set PROVE2ME_API_KEY or create {path} "
-            "(see https://prove2.me/start.md)"
-        ) from None
     except json.JSONDecodeError as exc:
         raise Prove2MeError(f"{path} is not valid JSON: {exc.msg}") from None
-    key = str(stored.get("api_key") or "").strip()
+    key = str(stored.get("api_key") or "").strip() if isinstance(stored, dict) else ""
     if not key:
         raise Prove2MeError(f"{path} has no api_key")
     expires = _parse_time(stored.get("api_key_expires_at")) or _key_expiry(key)
