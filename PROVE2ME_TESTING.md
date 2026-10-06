@@ -102,24 +102,47 @@ Without `--skip-compile`, `verify` refuses a Mathlib mismatch, re-mirrors the
 target, builds the solution, and checks
 `example : type_of% @<target> := @solution`. For this mission that needs a
 workspace pinned to `c5ea003`. Prove2Me's `references/lean-setup.md`
-recommends a second checkout rather than re-pinning the main one:
+recommends a second checkout rather than re-pinning the main one.
+
+The workspace repository does not ship `lean-toolchain` or `lakefile.lean`:
+both are gitignored and environment-specific, so a fresh clone has neither and
+`lake` fails with "no configuration file". Write both for the environment
+(the toolchain and `mathlib_rev` come from `GET /api/v1/environments`, which
+`autoform prove2me get /environments` prints):
 
 ```bash
 git clone https://github.com/prove2me/prove2me_workspace ~/prove2me-c5ea003
 cd ~/prove2me-c5ea003
 echo "leanprover/lean4:v4.30.0" > lean-toolchain
-sed -i '' 's/777aaa61dcd2a1258d2b4962dbe983ede4d23b2e/c5ea00351c28e24afc9f0f84379aa41082b1188f/' lakefile.lean
+cat > lakefile.lean <<'EOF'
+import Lake
+open Lake DSL
+
+package «prove2me» where
+  leanOptions := #[⟨`autoImplicit, false⟩]
+
+require mathlib from git
+  "https://github.com/leanprover-community/mathlib4.git" @
+  "c5ea00351c28e24afc9f0f84379aa41082b1188f"
+
+lean_lib «Definitions» where
+lean_lib «Theorems» where
+@[default_target]
+lean_lib «Solutions» where
+EOF
 lake update && lake exe cache get && lake build Solutions.SmokeTest   # seconds, not hours
 cd -
 export PROVE2ME_WORKSPACE=~/prove2me-c5ea003
 ```
 
+`lake update` clones Mathlib, and `lake exe cache get` downloads several GB of
+prebuilt files. If `lake build Solutions.SmokeTest` starts compiling Mathlib
+modules one by one, stop it and rerun `lake exe cache get`. To confirm the pin
+resolved, `git -C .lake/packages/mathlib rev-parse HEAD` must print
+`c5ea00351c28e24afc9f0f84379aa41082b1188f`.
+
 The second checkout needs no copy of the key: without its own
 `credentials.json`, the CLI uses the one in `~/prove2me_workspace`.
-
-The `sed` pattern must match the revision currently in `lakefile.lean`; check
-it first. If `lake build Solutions.SmokeTest` starts compiling Mathlib, stop
-it and rerun `lake exe cache get`.
 
 Then put solutions under `$PROVE2ME_WORKSPACE/Solutions/` and confirm each
 outcome:
@@ -257,6 +280,7 @@ publishes under your account and the platform's Apache 2.0 terms.
 | `rejected the API key … expired or been revoked` | The server refused the key; mint a new one. |
 | `CERTIFICATE_VERIFY_FAILED` from other Python tools | The system Python lacks a CA store. The CLI uses httpx with certifi and is unaffected. |
 | `workspace pins Mathlib … re-pin` | The target lives in another environment; use a matching checkout (stage 3). |
+| `no configuration file with a supported extension` | A fresh workspace clone has no `lakefile.lean`; write it and `lean-toolchain` for the environment (stage 3). |
 | `could not find platform module …` | An import names a theorem or definition the API could not resolve in that environment. |
 | `HTTP 429 … too many pending` | Wait for queued submissions or publish jobs to finish instead of resubmitting. |
 | `no visible Prove2Me mission matches` | The name differs from the URL slug, or the mission is private to someone else. |
