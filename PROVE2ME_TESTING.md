@@ -1,0 +1,262 @@
+# Testing the Prove2Me integration
+
+How to exercise `autoform prove2me`, the `prove2me` skill, and
+`formalize_statement.sh`. The stages run from safest to riskiest; finish each
+before moving on. Only stages 4 and 7 write to Prove2Me, and stage 4 keeps
+everything private.
+
+All commands run from the root of this checkout unless stated otherwise.
+
+## Prerequisites
+
+- A Prove2Me API key in `~/prove2me_workspace/credentials.json` (`api_key`),
+  or exported as `PROVE2ME_API_KEY`. Mint one at prove2.me: account menu (top
+  right) > **API key**. Keys last 30 days. Other workspaces, including the
+  scratch ones below, fall back to this file.
+- The Prove2Me workspace at `~/prove2me_workspace`, or another path exported
+  as `PROVE2ME_WORKSPACE`. First-time setup: <https://prove2.me/start.md>.
+- `uv`, `lake` (via elan), and `claude` on `PATH`.
+
+Throughout, the example mission is
+[Positive definite matrix integral inequality](https://prove2.me/missions/Positive_definite_matrix_integral_inequality);
+its open leaf at the time of writing is
+`RybinAI2026.P01.one_sphere_l2_coefficients`
+(`60f0b1c6-208b-4532-a25d-92cf073d331e`), verified in Mathlib `c5ea003`
+(Lean v4.30.0).
+
+## 1. Unit tests (offline)
+
+```bash
+uv run pytest tests/test_prove2me.py -q
+```
+
+These replace the platform with an in-process fake, so they need no network
+and no key. They cover key loading and expiry, re-authentication, the host
+restriction, mission lookup across pages, mirroring, the local gates, verdict
+and publish-job polling, and the `verify` and `publish` commands.
+
+The checks that tie the skill and CLI into the plugin:
+
+```bash
+uv run pytest tests/test_skill_examples.py tests/test_plugin_runtime.py tests/test_cli.py -q
+uv run ruff check autoform_cli servers tests
+```
+
+About the full suite (`make test`):
+
+- `tests/test_skeleton.py` runs real Lean builds and can take over half an
+  hour. Skip it while iterating with `--ignore=tests/test_skeleton.py`.
+- Four `tests/test_scaffold.py` tests fail when `origin` uses an SSH alias
+  such as `org-…@github.com:facebookresearch/autoform-bot.git`: scaffolding
+  cannot derive a pinnable source from it and writes no CI. They fail the same
+  way without these changes.
+
+## 2. Read-only commands against the live platform
+
+```bash
+uv run autoform prove2me auth
+uv run autoform prove2me mission Positive_definite_matrix_integral_inequality
+uv run autoform prove2me get /theorems/60f0b1c6-208b-4532-a25d-92cf073d331e/submissions
+```
+
+Expect `auth` to print your username, the key's expiry, and the platform
+version, and never the key itself. `mission` also accepts the full URL, the
+plain name, or the mission id. `get` refuses anything that is not a path under
+the API, for example `https://example.com/x`.
+
+`fetch` writes files, so point it at a scratch workspace first:
+
+```bash
+mkdir -p /tmp/p2m-scratch
+cp ~/prove2me_workspace/{lakefile.lean,lake-manifest.json} /tmp/p2m-scratch/
+uv run autoform prove2me fetch 60f0b1c6-208b-4532-a25d-92cf073d331e --workspace /tmp/p2m-scratch
+```
+
+Expect `Theorems/Thm_RybinAI2026_P01_one_sphere_l2_coefficients.lean` and two
+`Definitions/Def_rybin2026_p01_*.lean` files (the second is imported by the
+first), plus a warning if the workspace pins a different Mathlib. Running it
+again should report every file as unchanged (`=`).
+
+## 3. Local gates without submitting
+
+`verify --dry-run` never writes to the platform. With `--skip-compile` it runs
+only the source checks, so any workspace will do:
+
+```bash
+cd /tmp/p2m-scratch && mkdir -p Solutions
+printf 'namespace X\ntheorem solution : True := by sorry\nend X\n' > Solutions/bad.lean
+printf 'theorem solution : True := trivial\n' > Solutions/good.lean
+cd -
+for f in bad good; do
+  uv run autoform prove2me verify 60f0b1c6-208b-4532-a25d-92cf073d331e \
+    /tmp/p2m-scratch/Solutions/$f.lean --workspace /tmp/p2m-scratch --dry-run --skip-compile
+done
+```
+
+Expect `bad.lean` to fail on `sorry` and on the namespace, and `good.lean` to
+pass. Passing here says nothing about the statement: that is the compile step.
+
+### The full dry run needs a matching workspace
+
+Without `--skip-compile`, `verify` refuses a Mathlib mismatch, re-mirrors the
+target, builds the solution, and checks
+`example : type_of% @<target> := @solution`. For this mission that needs a
+workspace pinned to `c5ea003`. Prove2Me's `references/lean-setup.md`
+recommends a second checkout rather than re-pinning the main one:
+
+```bash
+git clone https://github.com/prove2me/prove2me_workspace ~/prove2me-c5ea003
+cd ~/prove2me-c5ea003
+echo "leanprover/lean4:v4.30.0" > lean-toolchain
+sed -i '' 's/777aaa61dcd2a1258d2b4962dbe983ede4d23b2e/c5ea00351c28e24afc9f0f84379aa41082b1188f/' lakefile.lean
+lake update && lake exe cache get && lake build Solutions.SmokeTest   # seconds, not hours
+cd -
+export PROVE2ME_WORKSPACE=~/prove2me-c5ea003
+```
+
+The second checkout needs no copy of the key: without its own
+`credentials.json`, the CLI uses the one in `~/prove2me_workspace`.
+
+The `sed` pattern must match the revision currently in `lakefile.lean`; check
+it first. If `lake build Solutions.SmokeTest` starts compiling Mathlib, stop
+it and rerun `lake exe cache get`.
+
+Then put solutions under `$PROVE2ME_WORKSPACE/Solutions/` and confirm each
+outcome:
+
+| File | Expected |
+| --- | --- |
+| A correct proof | `OK: … passes the local gates` |
+| A proof of a different statement | `Type mismatch` and "does not match the target's formal_statement" |
+| Contains `sorry` | Refused before compiling |
+| Outside `Solutions/` | Refused: the type check needs an importable module |
+
+The type check compares types up to definitional equality and ignores binder
+annotations, so `{n : ℕ}` versus `(n : ℕ)` passes locally even though the
+platform asks for identical binders. The server's verdict is final.
+
+## 4. A real submission, kept private
+
+This is the only way to exercise `publish`, `verify` without `--dry-run`,
+verdict polling, and `explain` end to end. A private theorem is visible only
+to you, but it still occupies its name in its environment, so pick a unique
+one.
+
+Create `smoke.json`:
+
+```json
+{
+  "theorem_name": "chaikon_autoform_smoke_1",
+  "theorem_title": "Autoform smoke test",
+  "formal_statement": "theorem chaikon_autoform_smoke_1 : True := by sorry",
+  "natural_language_statement": "Truth holds; a private test of the submission pipeline."
+}
+```
+
+```bash
+uv run autoform prove2me publish problem smoke.json --env default --private --dry-run
+uv run autoform prove2me publish problem smoke.json --env default --private
+# prints: chaikon_autoform_smoke_1: PUBLISHED job … -> theorem <new-id>
+
+echo 'theorem solution : True := trivial' > ~/prove2me_workspace/Solutions/Sol_smoke.lean
+uv run autoform prove2me verify <new-id> ~/prove2me_workspace/Solutions/Sol_smoke.lean \
+  --workspace ~/prove2me_workspace --allow-env-mismatch
+# expect: status: ACCEPTED
+
+echo 'The statement is `True`, closed by `trivial`.' > why.md
+uv run autoform prove2me explain <submission-id> --file why.md
+```
+
+`--allow-env-mismatch` is safe here only because the file imports nothing
+from Mathlib, so the local build and type check are still meaningful. Do not
+use it for real targets.
+
+Also worth trying on the private theorem: a file that proves the wrong
+statement with `--skip-compile` (expect `WA` from the server), and `--json`
+on each command.
+
+Afterwards, retire the theorem with Prove2Me's deprecation flag
+(`references/contribute.md`); the CLI does not wrap that yet.
+
+## 5. The skill, interactively
+
+Start Claude Code in the Prove2Me workspace with this checkout as the plugin:
+
+```bash
+cd ~/prove2me_workspace
+claude --plugin-dir ~/Desktop/autoform-bot
+```
+
+If autoform is also installed from the marketplace, disable that copy first
+(`/plugin`); it has no `prove2me` skill and the two would collide.
+
+Then ask, for example:
+
+> /autoform:prove2me pick a theorem in Positive_definite_matrix_integral_inequality and show me a dry run
+
+You approve each tool call, so check that it:
+
+- reads the workspace's `SKILL.md`, `references/mission_solver.md`, and
+  `references/prove.md` before acting;
+- uses `autoform prove2me …` for every API call, and never `curl`, a
+  hand-written HTTP client, or `credentials.json`;
+- scouts milestone history, prior submissions, and discussion before choosing;
+- notices the Mathlib mismatch instead of compiling against the wrong one;
+- follows the cited source rather than improvising a proof;
+- stops at `verify --dry-run` and asks before submitting;
+- writes an explanation that reads like a section of a paper.
+
+Also check it stays out of the way: in a fresh session, "build a roadmap for
+this paper" should use the roadmap skill, not this one.
+
+Skills load when a session starts, so restart Claude Code after editing
+`skills/prove2me/SKILL.md`.
+
+## 6. The script, without spending a Claude run
+
+`formalize_statement.sh` only assembles a prompt and a permission list, then
+calls `claude`. A stand-in `claude` that prints its arguments shows exactly
+what would run:
+
+```bash
+mkdir -p /tmp/fakebin
+printf '#!/bin/bash\nprintf "ARG: %%s\\n" "$@"\n' > /tmp/fakebin/claude
+chmod +x /tmp/fakebin/claude
+
+PATH=/tmp/fakebin:$PATH ./formalize_statement.sh --prove2me Positive_definite_matrix_integral_inequality --dry-run
+PATH=/tmp/fakebin:$PATH PROVE2ME_API_KEY=p2m_x.eyJleHAiOjEwMDB9.x ./formalize_statement.sh --prove2me x
+```
+
+Expect the first to authenticate for real, then print the prompt and an
+allow-list without `curl` or `python3`. Expect the second to stop with an
+expired-key error before reaching `claude`. The `git pull` of the workspace
+may wait on the network; it only warns on failure.
+
+Statement mode works the same way, but its first real run creates
+`./statements` and downloads Mathlib; use `--roadmap-only` or
+`--project <existing Mathlib project>` to avoid that while testing the
+plumbing.
+
+## 7. The script, for real
+
+```bash
+./formalize_statement.sh --prove2me Positive_definite_matrix_integral_inequality --dry-run
+./formalize_statement.sh "6 is not a prime number"
+```
+
+The first runs the skill unattended with a fixed permission list. Anything it
+needed but was not allowed shows up as a refused tool call in its final
+report. Drop `--dry-run` only once stages 4 and 5 look right: that run
+publishes under your account and the platform's Apache 2.0 terms.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| `expired at …` before any request | The key is past its `exp`; mint a new one and update `credentials.json`. |
+| `rejected the API key … expired or been revoked` | The server refused the key; mint a new one. |
+| `CERTIFICATE_VERIFY_FAILED` from other Python tools | The system Python lacks a CA store. The CLI uses httpx with certifi and is unaffected. |
+| `workspace pins Mathlib … re-pin` | The target lives in another environment; use a matching checkout (stage 3). |
+| `could not find platform module …` | An import names a theorem or definition the API could not resolve in that environment. |
+| `HTTP 429 … too many pending` | Wait for queued submissions or publish jobs to finish instead of resubmitting. |
+| `no visible Prove2Me mission matches` | The name differs from the URL slug, or the mission is private to someone else. |
