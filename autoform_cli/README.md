@@ -499,6 +499,71 @@ its local context. Point `mkdocs.yml` at `docs_dir: site-src` and enable
 `md_in_html` plus a `pymdownx.superfences` mermaid fence; see the [repository
 example](../skills/setup/assets/cabannes-thesis-project/mkdocs.yml).
 
+### Prove2Me
+
+`autoform prove2me` works on [Prove2Me](https://prove2.me) missions from a
+Prove2Me workspace: a Lake project with `Definitions/`, `Theorems/`, and
+`Solutions/` libraries, by default `$PROVE2ME_WORKSPACE` or
+`~/prove2me_workspace` (`--workspace` overrides it). The API key comes from
+`$PROVE2ME_API_KEY`, else the workspace's `credentials.json`. It is exchanged
+for an access token in memory, never printed, and only ever sent to
+`https://prove2.me/api/v1`; no option changes that host.
+
+Check the key and the platform version, then read a mission's milestones and
+open frontier. A mission is named by its URL, URL slug, name, or id:
+
+```bash
+autoform prove2me auth
+autoform prove2me mission https://prove2.me/missions/Positive_definite_matrix_integral_inequality
+```
+
+Mirror a target into the workspace exactly where the verifier resolves it:
+`Theorems/Thm_<slug>.lean` from its preamble and formal statement, plus every
+`Theorems.Thm_*` and `Definitions.Def_*` module it imports, transitively. It
+warns when the workspace pins a different Mathlib than the target's
+`mathlib_rev`; re-pin before compiling. Scouting reads (milestone history,
+discussion, prior submissions, decompositions) go through a read-only `get`:
+
+```bash
+autoform prove2me fetch <theorem-id>
+autoform prove2me get /theorems/<theorem-id>/submissions --param status=ACCEPTED
+```
+
+`verify` refuses locally what the server would reject: `sorry` or `admit` in
+the file, an import of the target's own module, and a `theorem solution` that
+is missing or inside a namespace. It then refuses a Mathlib mismatch, re-mirrors
+the target, builds the solution with Lake, and elaborates
+`example : type_of% @<target> := @solution` to catch a proof of the wrong
+statement before the server reports `WA`. That check is necessary rather than
+sufficient: it compares types up to definitional equality and ignores binder
+annotations, so the server's verdict is final. The solution must live under
+`Solutions/`. `--dry-run` stops after every local check without writing to the
+platform. Otherwise it submits, waits for a verdict, and exits zero only on
+`ACCEPTED` or `SKETCH_ACCEPTED`:
+
+```bash
+autoform prove2me verify <theorem-id> Solutions/Sol_<slug>.lean \
+  --explanation-file explanation.md --dry-run
+autoform prove2me explain <submission-id> --file explanation.md
+```
+
+Pass `--disprove` when the file proves the negation of the whole statement,
+`--no-wait` to return once queued, and `--json` for machine-readable output.
+
+A sketch imports child lemmas that must exist first. `publish` validates a
+problem or definition spec (the platform's JSON body: one object, a list, or
+`{"problems": [...]}`), publishes it in an explicit environment, and waits for
+each compile job. Children belong in the parent theorem's `mathlib_rev`.
+`--private` keeps the batch visible only to you; visibility and environment
+come from the flags, and a spec that sets them itself is refused:
+
+```bash
+autoform prove2me publish problem children.json --env <mathlib-rev> --dry-run
+```
+
+Every write -- `verify` without `--dry-run`, `publish`, and `explain` -- is
+public under the platform's Apache 2.0 terms.
+
 ## Validation
 
 `autoform check` rejects cycles, missing targets, escaping paths,

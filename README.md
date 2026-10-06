@@ -107,6 +107,7 @@ complete frontmatter, hierarchy, status, and validation rules.
 | `autoform skeleton` | Extract what a reader must trust for each formalized statement. |
 | `autoform claim` | Coordinate temporary ownership through Git refs. |
 | `autoform render` | Generate publishable MkDocs source. |
+| `autoform prove2me` | Mirror, gate, and submit Prove2Me mission theorems. |
 | `autoform-visualize` | Generate the Mermaid dependency graph. |
 
 Inside an Autoform checkout, use `uv run`:
