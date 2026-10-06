@@ -65,11 +65,17 @@ Next use the host skills from the Lean project:
 | Build a source-grounded roadmap | `/autoform:roadmap` | `$roadmap` |
 | Prepare a person-led review | `/autoform:human-review` | `$human-review` |
 | Run an independent agent review | `/autoform:agent-review` | `$agent-review` |
+| Prove and submit to a Prove2Me mission | `/autoform:prove2me` | `$prove2me` |
 
 For example: “Build a roadmap for Sections 2–4 of `paper.pdf`; confirm the scope
 and completion criteria before writing articles.” Keep the source in the
 repository or provide an accessible path. Human and agent review are
 alternatives; review the roadmap before treating it as an execution plan.
+
+Prove2Me is opt-in. The Prove2Me skill works in a separate
+[Prove2Me](https://prove2.me) Lean workspace with your API key, gates each
+solution locally, and publishes only when you ask it to submit; see
+`autoform prove2me` in the [CLI reference](autoform_cli/README.md#prove2me).
 
 ## Blueprint model
 

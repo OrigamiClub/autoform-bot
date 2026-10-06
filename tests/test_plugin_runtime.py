@@ -18,6 +18,7 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
         "human-review",
         "agent-review",
         "develop-plugin",
+        "prove2me",
     }
 
     review_dir = repo_root / "skills" / "agent-review"
@@ -49,7 +50,7 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
             assert config["mcpServers"][name]["args"][-2:] == ["-m", module]
 
     codex_manifest = json.loads((repo_root / ".codex-plugin/plugin.json").read_text())
-    assert len(codex_manifest["interface"]["defaultPrompt"]) == 5
+    assert len(codex_manifest["interface"]["defaultPrompt"]) == 6
     muse = json.loads((repo_root / ".muse-plugin/plugin.json").read_text())
     assert [command["id"] for command in muse["capabilities"]["commands"]] == [
         "setup",
@@ -57,6 +58,7 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
         "human-review",
         "agent-review",
         "develop-plugin",
+        "prove2me",
     ]
     for command in muse["capabilities"]["commands"]:
         assert (repo_root / command["path"]).is_file()

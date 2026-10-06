@@ -23,7 +23,8 @@
       "Build or refine an Autoform roadmap from my mathematical sources.",
       "Prepare the visual blueprint surfaces so I can review this formalization.",
       "Judge this roadmap or Lean formalization with evidence-based review rubrics.",
-      "Develop Autoform itself through its executable formalization example."
+      "Develop Autoform itself through its executable formalization example.",
+      "Prove an open theorem in my Prove2Me mission and dry-run the submission."
     ],
     "brandColor": "#2563EB",
     "composerIcon": "./assets/autoform-small.svg",
