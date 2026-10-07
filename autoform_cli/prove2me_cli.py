@@ -198,6 +198,9 @@ def _verify(client: prove2me.Client, args: argparse.Namespace, workspace: Path) 
         mirrored = prove2me.fetch_theorem(client, args.theorem_id, workspace)
         problems.extend(f"could not mirror platform module {module}" for module in mirrored.unresolved)
     if not problems and not args.skip_compile:
+        # Lake prints nothing until it finishes, and a cold `import Mathlib` can take many minutes.
+        print(f"building {path.name} and checking it against {theorem['theorem_name']} with Lake; "
+              "files that import all of Mathlib can take many minutes", file=sys.stderr, flush=True)
         ok, output = prove2me.compile_locally(path, workspace, theorem["theorem_name"], args.compile_timeout)
         report["compile_output"] = output[-4000:]
         if not ok:
