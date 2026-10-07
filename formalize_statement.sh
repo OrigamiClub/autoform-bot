@@ -192,8 +192,8 @@ fi
 
 # Lean source directory: the package's own directory if lake made one.
 LEAN_DIR="$PACKAGE"
-[[ -d "$PROJECT/$LEAN_DIR" ]] || LEAN_DIR="$(cd "$PROJECT" && ls -d */ 2>/dev/null \
-  | grep -vE '^(blueprint|\.lake|site|site-src|theme)/$' | grep -E '^[A-Z]' | head -1 | tr -d /)"
+[[ -d "$PROJECT/$LEAN_DIR" ]] || LEAN_DIR="$(cd "$PROJECT" && { ls -d */ 2>/dev/null \
+  | grep -vE '^(blueprint|\.lake|site|site-src|theme)/$' | grep -E '^[A-Z]' | head -1 | tr -d /; } || true)"
 LEAN_FILE="${LEAN_DIR:-$PACKAGE}/$MODULE.lean"
 
 # --- Prompt ------------------------------------------------------------------
