@@ -81,8 +81,18 @@ ALLOWED_TOOLS=(
   "mcp__plugin_autoform_autoform-lsp" "mcp__plugin_autoform_autoform-repl"
 )
 
+# `claude -p` exits as soon as Claude ends its reply, killing anything still
+# running. A Lean build that imports all of Mathlib can take tens of minutes on
+# a small machine, longer than Claude Code's default shell timeout, after which
+# the command moves to the background and Claude tends to stop and "wait".
+FOREGROUND_NOTE="This session exits the moment you end your reply, and anything
+still running is killed with it. Run every command, including long Lean builds
+and 'autoform prove2me verify', in the foreground with a timeout of at least
+3600000 ms and wait for it to finish. Never run a command in the background and
+never end your reply while something is still running."
+
 run_claude() {  # run_claude <prompt> [extra allowed tools...]
-  local prompt="$1"; shift
+  local prompt="$1"$'\n\n'"$FOREGROUND_NOTE"; shift
   local args=(
     -p "$prompt"
     --plugin-dir "$ROOT"
@@ -91,7 +101,9 @@ run_claude() {  # run_claude <prompt> [extra allowed tools...]
     --allowedTools "${ALLOWED_TOOLS[@]}" "$@"
   )
   [[ -n "$MODEL" ]] && args+=(--model "$MODEL")
-  claude "${args[@]}"
+  BASH_DEFAULT_TIMEOUT_MS="${BASH_DEFAULT_TIMEOUT_MS:-3600000}" \
+    BASH_MAX_TIMEOUT_MS="${BASH_MAX_TIMEOUT_MS:-3600000}" \
+    claude "${args[@]}"
 }
 
 # --- Prove2Me mission mode ---------------------------------------------------
