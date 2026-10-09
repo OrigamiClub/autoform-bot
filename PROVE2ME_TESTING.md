@@ -24,6 +24,24 @@ its open leaf at the time of writing is
 (`60f0b1c6-208b-4532-a25d-92cf073d331e`), verified in Mathlib `c5ea003`
 (Lean v4.30.0).
 
+## 0. One-command setup
+
+```bash
+uv run autoform prove2me setup --mission Positive_definite_matrix_integral_inequality
+```
+
+Clones `~/prove2me_workspace` if missing, asks for your API key (hidden) if
+there is no working one, and picks or prepares a checkout pinned to the
+mission's Mathlib. Before cloning or downloading it prints what it will do and
+asks; it refuses the download outright with less than about 16 GB free.
+`formalize_statement.sh --prove2me` runs this first, so a fresh machine needs
+nothing else. Stage 3 below shows what it does by hand.
+
+Mathlib checkouts are large (one measured 15 GB with its cache), and missions
+use different environments: Weak Goldbach is on `0df444a`, the matrix
+inequality mission on `c5ea003`. Check free space before trying a mission in a
+new environment.
+
 ## 1. Unit tests (offline)
 
 ```bash
@@ -280,7 +298,9 @@ publishes under your account and the platform's Apache 2.0 terms.
 | `rejected the API key … expired or been revoked` | The server refused the key; mint a new one. |
 | `CERTIFICATE_VERIFY_FAILED` from other Python tools | The system Python lacks a CA store. The CLI uses httpx with certifi and is unaffected. |
 | `workspace pins Mathlib … re-pin` | The target lives in another environment; use a matching checkout (stage 3). |
-| `no configuration file with a supported extension` | A fresh workspace clone has no `lakefile.lean`; write it and `lean-toolchain` for the environment (stage 3). |
+| `no configuration file with a supported extension` | A fresh workspace clone has no `lakefile.lean`; run `autoform prove2me setup --mission …`, or write it by hand (stage 3). |
+| `only … GB is free (needs about 16 GB)` | Setup will not start a Mathlib download that cannot fit. Free space, or reuse a checkout already on that environment. |
+| `No space left on device` during `lake update` | The disk filled mid-download. Delete the half-made checkout (it was created by that run) before retrying. |
 | `could not find platform module …` | An import names a theorem or definition the API could not resolve in that environment. |
 | `HTTP 429 … too many pending` | Wait for queued submissions or publish jobs to finish instead of resubmitting. |
 | `no visible Prove2Me mission matches` | The name differs from the URL slug, or the mission is private to someone else. |
