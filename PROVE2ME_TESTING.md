@@ -9,13 +9,13 @@ All commands run from the root of this checkout unless stated otherwise.
 
 ## Prerequisites
 
-- A Prove2Me API key in `~/prove2me_workspace/credentials.json` (`api_key`),
-  or exported as `PROVE2ME_API_KEY`. Mint one at prove2.me: account menu (top
-  right) > **API key**. Keys last 30 days. Other workspaces, including the
-  scratch ones below, fall back to this file.
-- The Prove2Me workspace at `~/prove2me_workspace`, or another path exported
-  as `PROVE2ME_WORKSPACE`. First-time setup: <https://prove2.me/start.md>.
-- `uv`, `lake` (via elan), and `claude` on `PATH`.
+- `git`, `uv`, `lake` (via [elan](https://github.com/leanprover/elan)), and
+  `claude` on `PATH`.
+- A Prove2Me account. New accounts register at <https://prove2.me>; see
+  <https://prove2.me/start.md>. Stage 0 clones the workspace and asks for the
+  API key, so neither has to exist beforehand.
+- Free disk space: each Mathlib environment needs its own checkout of about
+  7-15 GB.
 
 Throughout, the example mission is
 [Positive definite matrix integral inequality](https://prove2.me/missions/Positive_definite_matrix_integral_inequality);
@@ -24,23 +24,66 @@ its open leaf at the time of writing is
 (`60f0b1c6-208b-4532-a25d-92cf073d331e`), verified in Mathlib `c5ea003`
 (Lean v4.30.0).
 
-## 0. One-command setup
+## 0. Set up the workspace
+
+One command clones the workspace, stores the key, and prepares Mathlib for a
+mission:
 
 ```bash
 uv run autoform prove2me setup --mission Positive_definite_matrix_integral_inequality
 ```
 
-Clones `~/prove2me_workspace` if missing, asks for your API key (hidden) if
-there is no working one, and picks or prepares a checkout pinned to the
-mission's Mathlib. Before cloning or downloading it prints what it will do and
-asks; it refuses the download outright with less than about 16 GB free.
-`formalize_statement.sh --prove2me` runs this first, so a fresh machine needs
-nothing else. Stage 3 below shows what it does by hand.
+It does each step only if it is missing, so it is safe to rerun:
 
-Mathlib checkouts are large (one measured 15 GB with its cache), and missions
-use different environments: Weak Goldbach is on `0df444a`, the matrix
-inequality mission on `c5ea003`. Check free space before trying a mission in a
-new environment.
+1. **Clone.** If `~/prove2me_workspace` (or `$PROVE2ME_WORKSPACE`) does not
+   exist, it clones <https://github.com/prove2me/prove2me_workspace> there.
+2. **Key.** If there is no working key, it says why and prompts:
+
+   ```text
+   no Prove2Me API key: run `autoform prove2me setup` in a terminal, or set PROVE2ME_API_KEY (...)
+   Mint a key at https://prove2.me (account menu, top right > API key). New accounts: https://prove2.me/start.md
+   Prove2Me API key (input hidden):
+   saved the key to /Users/you/prove2me_workspace/credentials.json (readable only by you)
+   ```
+
+   Paste the key at the prompt; nothing is echoed. A rejected key is
+   reported and asked for again, up to three times. The key is stored in the
+   default workspace, which every other checkout falls back to. To replace
+   an expired key, rerun `setup`: it notices and asks again.
+3. **Mathlib.** It looks up the mission's environment and picks a checkout:
+   the default workspace if it is unpinned or already on that environment,
+   otherwise a sibling `~/prove2me-<rev7>`, for example
+   `~/prove2me-c5ea003`. It writes that checkout's gitignored
+   `lean-toolchain` and `lakefile.lean`, then runs `lake update`,
+   `lake exe cache get`, and `lake build Solutions.SmokeTest`. An existing
+   pin is never changed.
+4. **Confirm.** Before cloning or downloading it lists what it will do and
+   asks `Continue? [y/N]`. It refuses the download outright when less than
+   about 16 GB is free.
+
+Useful flags:
+
+| Flag | Effect |
+| --- | --- |
+| `--env <rev>` or `--env default` | Pin to an environment directly instead of a mission's |
+| `--no-fetch` | Clone and pin, but skip the Mathlib download |
+| `--yes` | Skip the confirmation, for unattended use |
+| `--print-workspace` | Print only the chosen checkout's path, for scripts |
+| `--json` | Report the workspace, its pin, and whether Mathlib is ready |
+
+To point the rest of this guide at the checkout it chose:
+
+```bash
+export PROVE2ME_WORKSPACE="$(uv run autoform prove2me setup \
+  --mission Positive_definite_matrix_integral_inequality --print-workspace)"
+```
+
+`formalize_statement.sh --prove2me` runs `setup --mission` itself, so on a
+fresh machine the script alone is enough.
+
+Missions use different environments: Weak Goldbach is on `0df444a`, the
+matrix inequality mission on `c5ea003`. Trying a mission in a new environment
+means a new multi-gigabyte checkout, so check free space first.
 
 ## 1. Unit tests (offline)
 
@@ -122,11 +165,25 @@ target, builds the solution, and checks
 workspace pinned to `c5ea003`. Prove2Me's `references/lean-setup.md`
 recommends a second checkout rather than re-pinning the main one.
 
+Stage 0 prepares that checkout:
+
+```bash
+export PROVE2ME_WORKSPACE="$(uv run autoform prove2me setup \
+  --mission Positive_definite_matrix_integral_inequality --print-workspace)"
+```
+
+To confirm the pin resolved, `git -C "$PROVE2ME_WORKSPACE/.lake/packages/mathlib" rev-parse HEAD`
+must print `c5ea00351c28e24afc9f0f84379aa41082b1188f`. If
+`lake build Solutions.SmokeTest` ever starts compiling Mathlib modules one by
+one, the cache missed: stop it and rerun `lake exe cache get` in the checkout.
+
+<details>
+<summary>The same steps by hand</summary>
+
 The workspace repository does not ship `lean-toolchain` or `lakefile.lean`:
 both are gitignored and environment-specific, so a fresh clone has neither and
-`lake` fails with "no configuration file". Write both for the environment
-(the toolchain and `mathlib_rev` come from `GET /api/v1/environments`, which
-`autoform prove2me get /environments` prints):
+`lake` fails with "no configuration file". The toolchain and `mathlib_rev`
+come from `uv run autoform prove2me get /environments`.
 
 ```bash
 git clone https://github.com/prove2me/prove2me_workspace ~/prove2me-c5ea003
@@ -148,18 +205,14 @@ lean_lib «Theorems» where
 @[default_target]
 lean_lib «Solutions» where
 EOF
-lake update && lake exe cache get && lake build Solutions.SmokeTest   # seconds, not hours
+lake update && lake exe cache get && lake build Solutions.SmokeTest
 cd -
 export PROVE2ME_WORKSPACE=~/prove2me-c5ea003
 ```
 
-`lake update` clones Mathlib, and `lake exe cache get` downloads several GB of
-prebuilt files. If `lake build Solutions.SmokeTest` starts compiling Mathlib
-modules one by one, stop it and rerun `lake exe cache get`. To confirm the pin
-resolved, `git -C .lake/packages/mathlib rev-parse HEAD` must print
-`c5ea00351c28e24afc9f0f84379aa41082b1188f`.
+</details>
 
-The second checkout needs no copy of the key: without its own
+Either way, the second checkout needs no copy of the key: without its own
 `credentials.json`, the CLI uses the one in `~/prove2me_workspace`.
 
 Then put solutions under `$PROVE2ME_WORKSPACE/Solutions/` and confirm each
@@ -294,11 +347,12 @@ publishes under your account and the platform's Apache 2.0 terms.
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `expired at …` before any request | The key is past its `exp`; mint a new one and update `credentials.json`. |
-| `rejected the API key … expired or been revoked` | The server refused the key; mint a new one. |
+| `expired at …` before any request | The key is past its `exp`; mint a new one and rerun `autoform prove2me setup` to enter it. |
+| `rejected the API key … expired or been revoked` | The server refused the key; mint a new one and rerun `setup`. |
+| `not asking without a terminal; … pass --yes` | `setup` needed to clone or download but had no terminal to ask in; run it yourself first. |
 | `CERTIFICATE_VERIFY_FAILED` from other Python tools | The system Python lacks a CA store. The CLI uses httpx with certifi and is unaffected. |
 | `workspace pins Mathlib … re-pin` | The target lives in another environment; use a matching checkout (stage 3). |
-| `no configuration file with a supported extension` | A fresh workspace clone has no `lakefile.lean`; run `autoform prove2me setup --mission …`, or write it by hand (stage 3). |
+| `no configuration file with a supported extension` | A fresh workspace clone has no `lakefile.lean`; run `autoform prove2me setup --mission …` (stage 0). |
 | `only … GB is free (needs about 16 GB)` | Setup will not start a Mathlib download that cannot fit. Free space, or reuse a checkout already on that environment. |
 | `No space left on device` during `lake update` | The disk filled mid-download. Delete the half-made checkout (it was created by that run) before retrying. |
 | `could not find platform module …` | An import names a theorem or definition the API could not resolve in that environment. |
