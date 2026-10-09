@@ -35,7 +35,8 @@ class FakeApi:
         self.requests.append(request)
         path = request.url.path.removeprefix("/api/v1")
         if path == "/agent/refresh":
-            assert json.loads(request.content) == {"api_key": KEY}
+            if json.loads(request.content) != {"api_key": KEY}:
+                return httpx.Response(401, json={"error": "invalid api key"})
             self.tokens += 1
             return httpx.Response(200, json={"access_token": f"tok{self.tokens}", "expires_at": 0, "version": "9.9"})
         if self.reject_next_token:
@@ -114,6 +115,17 @@ def default_workspace(tmp_path: Path, monkeypatch) -> Path:
 def test_missing_credentials_point_to_onboarding(tmp_path: Path, default_workspace: Path) -> None:
     with pytest.raises(Prove2MeError, match="start.md"):
         prove2me.load_credentials(tmp_path / "checkout")
+
+
+def test_a_checkout_named_by_the_environment_still_finds_the_default_key(
+    tmp_path: Path, default_workspace: Path, monkeypatch
+) -> None:
+    (default_workspace / "credentials.json").write_text(json.dumps({"api_key": KEY}))
+    checkout = tmp_path / "prove2me-c5ea003"
+    checkout.mkdir()
+    monkeypatch.setenv("PROVE2ME_WORKSPACE", str(checkout))
+
+    assert prove2me.load_credentials(prove2me.workspace_path()).api_key == KEY
 
 
 def test_a_second_checkout_borrows_the_default_workspace_key(tmp_path: Path, default_workspace: Path) -> None:
@@ -480,3 +492,138 @@ def test_publish_dry_run_and_invalid_specs_never_post(cli_api, tmp_path: Path, c
     assert main(["prove2me", "publish", "problem", str(bad), "--env", "c5ea", "--workspace", str(tmp_path)]) == 1
     assert "must end with" in capsys.readouterr().out
     assert not any(request.method == "POST" and "submit" in request.url.path for request in api.requests)
+
+
+# --- setup -------------------------------------------------------------------
+
+
+ENVIRONMENTS = {
+    "environments": [
+        {"mathlib_rev": "0df444a" + "0" * 33, "toolchain": "leanprover/lean4:v4.33.1", "is_default": True},
+        {"mathlib_rev": "c5ea003" + "0" * 33, "toolchain": "leanprover/lean4:v4.30.0", "is_default": False},
+    ]
+}
+C5EA = ENVIRONMENTS["environments"][1]
+
+
+def test_store_api_key_keeps_other_fields_and_is_private(tmp_path: Path) -> None:
+    (tmp_path / "credentials.json").write_text(json.dumps({"api_key": "old", "username": "u"}))
+
+    path = prove2me.store_api_key(tmp_path, KEY)
+
+    assert json.loads(path.read_text()) == {"api_key": KEY, "username": "u", "api_key_expires_at": FUTURE}
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_choose_workspace_uses_one_checkout_per_environment(tmp_path: Path) -> None:
+    home = tmp_path / "prove2me_workspace"
+    home.mkdir()
+    assert prove2me.choose_workspace(home, C5EA["mathlib_rev"]) == home
+
+    (home / "lakefile.lean").write_text(prove2me._LAKEFILE.format(rev=C5EA["mathlib_rev"]))
+    assert prove2me.choose_workspace(home, C5EA["mathlib_rev"]) == home
+    assert prove2me.choose_workspace(home, "0df444a" + "0" * 33) == tmp_path / "prove2me-0df444a"
+
+
+def test_pin_environment_writes_missing_files_and_never_repins(tmp_path: Path) -> None:
+    assert prove2me.pin_environment(tmp_path, C5EA) == ["lean-toolchain", "lakefile.lean"]
+    assert (tmp_path / "lean-toolchain").read_text() == "leanprover/lean4:v4.30.0\n"
+    assert prove2me.workspace_mathlib_rev(tmp_path) == C5EA["mathlib_rev"]
+    assert prove2me.pin_environment(tmp_path, C5EA) == []
+
+    with pytest.raises(Prove2MeError, match="pinned to Mathlib c5ea003"):
+        prove2me.pin_environment(tmp_path, ENVIRONMENTS["environments"][0])
+
+
+def _route_setup_client(monkeypatch, api: FakeApi) -> None:
+    real = prove2me.Client
+    monkeypatch.setattr(prove2me_cli.prove2me, "Client",
+                        lambda credentials, **kwargs: real(credentials, transport=httpx.MockTransport(api)))
+
+
+def test_setup_asks_for_a_key_only_in_a_terminal_and_saves_a_valid_one(
+    default_workspace: Path, monkeypatch, capsys
+) -> None:
+    _route_setup_client(monkeypatch, FakeApi({}))
+    monkeypatch.setattr(prove2me_cli.sys.stdin, "isatty", lambda: True)
+    entered = iter(["", "p2m_not.a.key", KEY])
+    monkeypatch.setattr(prove2me_cli.getpass, "getpass", lambda prompt: next(entered))
+
+    assert main(["prove2me", "setup"]) == 0
+
+    stored = json.loads((default_workspace / "credentials.json").read_text())
+    assert stored["api_key"] == KEY
+    output = capsys.readouterr()
+    assert "rejected" in output.err and "saved the key" in output.err
+    assert KEY not in output.out + output.err
+
+
+def test_setup_never_prompts_without_a_terminal(default_workspace: Path, monkeypatch, capsys) -> None:
+    _route_setup_client(monkeypatch, FakeApi({}))
+    monkeypatch.setattr(prove2me_cli.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(prove2me_cli.getpass, "getpass", lambda prompt: pytest.fail("prompted"))
+
+    assert main(["prove2me", "setup"]) == 1
+    assert "in a terminal" in capsys.readouterr().err
+
+
+def test_setup_for_a_mission_pins_a_checkout_for_its_environment(
+    default_workspace: Path, monkeypatch, capsys
+) -> None:
+    (default_workspace / "credentials.json").write_text(json.dumps({"api_key": KEY}))
+    (default_workspace / "lakefile.lean").write_text(prove2me._LAKEFILE.format(rev="777aaa6" + "0" * 33))
+    second = default_workspace.parent / "prove2me-c5ea003"
+    second.mkdir()
+    _route_setup_client(monkeypatch, FakeApi({
+        ("GET", "/missions"): {"missions": [{"id": "m", "name": "Weak Goldbach Conjecture",
+                                             "main_theorem": {"theorem_id": "goal"}}], "total": 1},
+        ("GET", "/theorems/goal"): {"theorem_id": "goal", "mathlib_rev": C5EA["mathlib_rev"]},
+        ("GET", "/environments"): ENVIRONMENTS,
+    }))
+
+    code = main(["prove2me", "setup", "--mission", "Weak_Goldbach_Conjecture", "--no-fetch", "--print-workspace"])
+
+    assert code == 0
+    output = capsys.readouterr()
+    assert output.out.strip() == str(second)
+    assert prove2me.workspace_mathlib_rev(second) == C5EA["mathlib_rev"]
+    assert (second / "lean-toolchain").read_text().strip() == "leanprover/lean4:v4.30.0"
+    assert prove2me.workspace_mathlib_rev(default_workspace).startswith("777aaa6")
+
+
+def _mission_api(rev: str) -> FakeApi:
+    return FakeApi({
+        ("GET", "/missions"): {"missions": [{"id": "m", "name": "Weak Goldbach Conjecture",
+                                             "main_theorem": {"theorem_id": "goal"}}], "total": 1},
+        ("GET", "/theorems/goal"): {"theorem_id": "goal", "mathlib_rev": rev},
+        ("GET", "/environments"): ENVIRONMENTS,
+    })
+
+
+def test_setup_refuses_to_clone_or_download_without_a_yes(default_workspace: Path, monkeypatch, capsys) -> None:
+    (default_workspace / "credentials.json").write_text(json.dumps({"api_key": KEY}))
+    (default_workspace / "lakefile.lean").write_text(prove2me._LAKEFILE.format(rev="777aaa6" + "0" * 33))
+    _route_setup_client(monkeypatch, _mission_api(C5EA["mathlib_rev"]))
+    monkeypatch.setattr(prove2me, "clone_workspace", lambda path: pytest.fail("cloned"))
+    monkeypatch.setattr(prove2me_cli.sys.stdin, "isatty", lambda: False)
+
+    assert main(["prove2me", "setup", "--mission", "Weak_Goldbach_Conjecture", "--no-fetch"]) == 1
+    output = capsys.readouterr().err
+    assert "clone the Prove2Me workspace into" in output and "pass --yes" in output
+    assert not (default_workspace.parent / "prove2me-c5ea003").exists()
+
+
+def test_setup_checks_free_space_before_downloading_mathlib(default_workspace: Path, monkeypatch, capsys) -> None:
+    (default_workspace / "credentials.json").write_text(json.dumps({"api_key": KEY}))
+    _route_setup_client(monkeypatch, _mission_api(C5EA["mathlib_rev"]))
+    monkeypatch.setattr(prove2me_cli.shutil, "disk_usage", lambda path: shutil_usage(free=1 * 1024**3))
+    monkeypatch.setattr(prove2me_cli.subprocess, "run", lambda *a, **k: pytest.fail("ran lake"))
+
+    assert main(["prove2me", "setup", "--mission", "Weak_Goldbach_Conjecture", "--yes"]) == 1
+    assert "only 1.0 GB is free" in capsys.readouterr().err
+
+
+def shutil_usage(free: int):
+    import shutil
+
+    return shutil._ntuple_diskusage(total=100 * 1024**3, used=0, free=free)

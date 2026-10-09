@@ -68,11 +68,14 @@ def load_credentials(workspace: Path) -> Credentials:
     if env_key:
         return Credentials(env_key, "PROVE2ME_API_KEY", expires_at=_key_expiry(env_key))
 
-    candidates = [workspace / "credentials.json", workspace_path() / "credentials.json"]
+    candidates = list(dict.fromkeys(
+        directory / "credentials.json"
+        for directory in (workspace, workspace_path(), DEFAULT_WORKSPACE.expanduser())
+    ))
     path = next((candidate for candidate in candidates if candidate.is_file()), None)
     if path is None:
         raise Prove2MeError(
-            f"no Prove2Me API key: set PROVE2ME_API_KEY or create {candidates[-1]} "
+            "no Prove2Me API key: run `autoform prove2me setup` in a terminal, or set PROVE2ME_API_KEY "
             "(see https://prove2.me/start.md)"
         )
     try:
@@ -617,3 +620,130 @@ def wait_for_job(
     clock: Callable[[], float] | None = None,
 ) -> dict:
     return _poll(client, f"/publish-jobs/{job_id}", {"PENDING", "COMPILING"}, timeout, sleep, clock)
+
+
+# --- Workspace setup ---------------------------------------------------------
+
+WORKSPACE_REPO = "https://github.com/prove2me/prove2me_workspace.git"
+_LAKEFILE = """import Lake
+open Lake DSL
+
+package «prove2me» where
+  leanOptions := #[⟨`autoImplicit, false⟩]
+
+require mathlib from git
+  "https://github.com/leanprover-community/mathlib4.git" @
+  "{rev}"
+
+lean_lib «Definitions» where
+lean_lib «Theorems» where
+@[default_target]
+lean_lib «Solutions» where
+"""
+
+
+def store_api_key(workspace: Path, key: str) -> Path:
+    """Save the key into the workspace's credentials.json, readable only by the user.
+
+    Other fields (username, email) are kept. The workspace repository
+    gitignores this file, so it is never committed.
+    """
+    path = workspace / "credentials.json"
+    stored: dict = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            stored = loaded if isinstance(loaded, dict) else {}
+        except json.JSONDecodeError:
+            stored = {}
+    stored["api_key"] = key
+    expires = _key_expiry(key)
+    if expires is not None:
+        stored["api_key_expires_at"] = int(expires.timestamp())
+    else:
+        stored.pop("api_key_expires_at", None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle, indent=2)
+    os.chmod(path, 0o600)
+    return path
+
+
+def environments(client: Client) -> list[dict]:
+    return list(client.get("/environments").get("environments", []))  # type: ignore[union-attr]
+
+
+def resolve_environment(client: Client, rev: str | None) -> dict:
+    """The platform environment for `rev` (a full or abbreviated mathlib_rev), or the default."""
+    envs = environments(client)
+    for env in envs:
+        if rev is None and env.get("is_default"):
+            return env
+        if rev is not None and str(env.get("mathlib_rev", "")).startswith(rev):
+            return env
+    known = ", ".join(str(env.get("mathlib_rev", ""))[:7] for env in envs)
+    raise Prove2MeError(f"no Prove2Me environment matches {rev or 'default'} (known: {known})")
+
+
+def mission_environment(client: Client, mission_ref: str) -> str:
+    mission = find_mission(client, mission_ref)
+    main = (mission.get("main_theorem") or {}).get("theorem_id")
+    if not main:
+        raise Prove2MeError(f"mission {mission.get('name')!r} has no goal theorem")
+    rev = client.get(f"/theorems/{main}").get("mathlib_rev")  # type: ignore[union-attr]
+    if not rev:
+        raise Prove2MeError(f"could not read the Mathlib environment of mission {mission.get('name')!r}")
+    return rev
+
+
+def choose_workspace(default: Path, rev: str) -> Path:
+    """Where to work on theorems in environment `rev`.
+
+    Prove2Me recommends one checkout per environment rather than re-pinning, so
+    the default workspace is used when it is unpinned or already pinned to
+    `rev`, and otherwise a sibling `prove2me-<rev7>` checkout.
+    """
+    pinned = workspace_mathlib_rev(default) if default.is_dir() else None
+    if pinned is None or pinned == rev:
+        return default
+    return default.parent / f"prove2me-{rev[:7]}"
+
+
+def clone_workspace(workspace: Path) -> None:
+    if workspace.exists():
+        return
+    run = subprocess.run(["git", "clone", "--quiet", WORKSPACE_REPO, str(workspace)], capture_output=True, text=True)
+    if run.returncode != 0:
+        raise Prove2MeError(f"could not clone {WORKSPACE_REPO}: {run.stderr.strip()}")
+
+
+def pin_environment(workspace: Path, env: dict) -> list[str]:
+    """Write lean-toolchain and lakefile.lean for `env` where they are missing.
+
+    The workspace repository gitignores both because they are per-environment.
+    An existing pin is never overwritten: a mismatch is an error, so a checkout
+    holding another environment's mirrored files is not silently re-pinned.
+    """
+    rev, toolchain = env["mathlib_rev"], env["toolchain"]
+    pinned = workspace_mathlib_rev(workspace)
+    if pinned is not None and pinned != rev:
+        raise Prove2MeError(
+            f"{workspace} is pinned to Mathlib {pinned[:7]}, not {rev[:7]}; use another workspace for this environment"
+        )
+    written = []
+    toolchain_file = workspace / "lean-toolchain"
+    if not toolchain_file.is_file():
+        toolchain_file.write_text(toolchain + "\n", encoding="utf-8")
+        written.append("lean-toolchain")
+    elif toolchain_file.read_text(encoding="utf-8").strip() != toolchain:
+        raise Prove2MeError(f"{toolchain_file} does not name {toolchain}; fix it or use another workspace")
+    lakefile = workspace / "lakefile.lean"
+    if not lakefile.is_file() and not (workspace / "lakefile.toml").is_file():
+        lakefile.write_text(_LAKEFILE.format(rev=rev), encoding="utf-8")
+        written.append("lakefile.lean")
+    return written
+
+
+def mathlib_ready(workspace: Path) -> bool:
+    return (workspace / ".lake" / "packages" / "mathlib" / ".lake" / "build").is_dir()

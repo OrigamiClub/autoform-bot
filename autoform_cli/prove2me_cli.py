@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -24,6 +28,18 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         )
         sub.add_argument("--json", action="store_true", help="write stable machine-readable output")
         return sub
+
+    setup = command("setup", "clone the workspace, ask for an API key if needed, and pin Mathlib for a mission")
+    target = setup.add_mutually_exclusive_group()
+    target.add_argument("--mission", help="pin the workspace to this mission's Mathlib environment")
+    target.add_argument("--env", help="pin to this mathlib_rev (or 'default') instead")
+    setup.add_argument("--no-fetch", action="store_true", help="do not download Mathlib after pinning")
+    setup.add_argument("--yes", action="store_true", help="clone and download without asking")
+    setup.add_argument(
+        "--print-workspace",
+        action="store_true",
+        help="print only the chosen workspace path on stdout (messages go to stderr)",
+    )
 
     command("auth", "check the API key and report the platform version; never prints the key")
 
@@ -74,6 +90,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.prove2me_command == "setup":
+        try:
+            return _setup(args)
+        except Prove2MeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     handler = {
         "auth": _auth,
         "mission": _mission,
@@ -94,6 +116,132 @@ def run(args: argparse.Namespace) -> int:
 
 def _emit(payload: object) -> None:
     print(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
+def _say(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def _setup(args: argparse.Namespace) -> int:
+    """Make a workspace ready to work on, asking only for what is missing.
+
+    Credentials live in the default workspace so every per-environment checkout
+    shares them. A key is requested only from an interactive terminal, with
+    hidden input, and is checked against the platform before it is saved.
+    """
+    home = prove2me.workspace_path()
+    if not home.exists():
+        _say(f"cloning the Prove2Me workspace into {home}")
+        prove2me.clone_workspace(home)
+
+    lookup = Path(args.workspace).expanduser() if args.workspace else home
+    with _authenticated_client(lookup, home) as client:
+        env = None
+        if args.mission:
+            env = prove2me.resolve_environment(client, prove2me.mission_environment(client, args.mission))
+        elif args.env:
+            env = prove2me.resolve_environment(client, None if args.env == "default" else args.env)
+
+    workspace = lookup if args.workspace else (prove2me.choose_workspace(home, env["mathlib_rev"]) if env else home)
+    needs_clone = not workspace.exists()
+    needs_fetch = bool(env) and not args.no_fetch and not prove2me.mathlib_ready(workspace)
+    if needs_clone or needs_fetch:
+        _confirm_heavy_work(args, workspace, env, needs_clone, needs_fetch)
+    if needs_clone:
+        _say(f"cloning {prove2me.WORKSPACE_REPO} into {workspace}")
+        prove2me.clone_workspace(workspace)
+
+    if env:
+        for name in prove2me.pin_environment(workspace, env):
+            _say(f"wrote {workspace / name} for {env.get('display_name') or env['mathlib_rev']}")
+        if needs_fetch:
+            steps = [["lake", "exe", "cache", "get"]]
+            if not (workspace / "lake-manifest.json").is_file():
+                steps.insert(0, ["lake", "update"])
+            if (workspace / "Solutions" / "SmokeTest.lean").is_file():
+                steps.append(["lake", "build", "Solutions.SmokeTest"])
+            for step in steps:
+                _say(f"$ {' '.join(step)}")
+                if subprocess.run(step, cwd=workspace, stdout=sys.stderr, stderr=sys.stderr).returncode != 0:
+                    raise Prove2MeError(
+                        f"`{' '.join(step)}` failed in {workspace}; delete that directory before retrying "
+                        "if it was created by this setup"
+                    )
+
+    pin = prove2me.workspace_mathlib_rev(workspace)
+    _say(f"OK: workspace {workspace}" + (f" pinned to Mathlib {pin[:7]}" if pin else " (no Mathlib pinned yet)"))
+    if args.json:
+        _emit({"workspace": str(workspace), "mathlib_rev": pin, "mathlib_ready": prove2me.mathlib_ready(workspace)})
+    elif args.print_workspace:
+        print(workspace)
+    return 0
+
+
+# A Mathlib checkout plus its unpacked cache; an existing one measured 15 GB.
+_FETCH_BYTES = 16 * 1024**3
+
+
+def _confirm_heavy_work(args: argparse.Namespace, workspace: Path, env: dict | None,
+                        needs_clone: bool, needs_fetch: bool) -> None:
+    """Show what setup is about to clone and download, check the disk, and ask.
+
+    Fetching Mathlib is a multi-gigabyte download per environment, so it never
+    starts without either a yes from a terminal or an explicit --yes, and never
+    on a disk that cannot hold it.
+    """
+    plan = []
+    if env:
+        plan.append(f"Mathlib environment: {env.get('display_name') or env['mathlib_rev']}")
+    if needs_clone:
+        plan.append(f"clone the Prove2Me workspace into {workspace}")
+    if needs_fetch:
+        plan.append(f"download Mathlib and its prebuilt cache into {workspace}/.lake (about 7-15 GB)")
+        existing = next(parent for parent in (workspace, *workspace.parents) if parent.exists())
+        free = shutil.disk_usage(existing).free
+        if free < _FETCH_BYTES:
+            raise Prove2MeError(
+                "setup would " + "; ".join(plan[1:]) + f", but only {free / 1024**3:.1f} GB is free "
+                f"(needs about {_FETCH_BYTES / 1024**3:.0f} GB). Free some space, or pass --no-fetch"
+            )
+    _say("setup will:\n  " + "\n  ".join(plan))
+    if args.yes:
+        return
+    if not sys.stdin.isatty():
+        raise Prove2MeError("not asking without a terminal; rerun in a terminal or pass --yes")
+    _say("Continue? [y/N] ")
+    if sys.stdin.readline().strip().lower() not in {"y", "yes"}:
+        raise Prove2MeError("setup cancelled")
+
+
+def _authenticated_client(lookup: Path, home: Path) -> prove2me.Client:
+    try:
+        client = prove2me.Client(prove2me.load_credentials(lookup))
+        client.authenticate()
+        return client
+    except Prove2MeError as exc:
+        problem = str(exc)
+    if os.environ.get("PROVE2ME_API_KEY", "").strip():
+        raise Prove2MeError(f"{problem}; fix or unset PROVE2ME_API_KEY")
+    if not sys.stdin.isatty():
+        raise Prove2MeError(f"{problem}; run `autoform prove2me setup` in a terminal to enter a key")
+
+    _say(problem)
+    _say("Mint a key at https://prove2.me (account menu, top right > API key). New accounts: "
+         "https://prove2.me/start.md")
+    for _ in range(3):
+        key = getpass.getpass("Prove2Me API key (input hidden): ").strip()
+        if not key:
+            continue
+        credentials = prove2me.Credentials(key, "the key you entered", expires_at=prove2me._key_expiry(key))
+        try:
+            client = prove2me.Client(credentials)
+            client.authenticate()
+        except Prove2MeError as exc:
+            _say(str(exc))
+            continue
+        _say(f"saved the key to {prove2me.store_api_key(home, key)} (readable only by you)")
+        return client
+    raise Prove2MeError("no valid API key entered")
 
 
 def _auth(client: prove2me.Client, args: argparse.Namespace, workspace: Path) -> int:

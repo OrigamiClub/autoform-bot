@@ -506,10 +506,27 @@ Prove2Me workspace: a Lake project with `Definitions/`, `Theorems/`, and
 `Solutions/` libraries, by default `$PROVE2ME_WORKSPACE` or
 `~/prove2me_workspace` (`--workspace` overrides it). The API key comes from
 `$PROVE2ME_API_KEY`, else the workspace's `credentials.json`, else the
-default workspace's, so a second checkout pinned to another Mathlib needs no
-copy of the key. It is exchanged
+default workspace's (`$PROVE2ME_WORKSPACE`, then `~/prove2me_workspace`), so a
+second checkout pinned to another Mathlib needs no copy of the key. It is exchanged
 for an access token in memory, never printed, and only ever sent to
 `https://prove2.me/api/v1`; no option changes that host.
+
+`setup` prepares a workspace and asks only for what is missing. It clones
+the workspace repository when absent and, from an interactive terminal, asks
+for an API key with hidden input, checks it against the platform, and saves it
+to the default workspace's `credentials.json` with owner-only permissions. With
+`--mission` (or `--env`) it also pins Mathlib: Prove2Me keeps one checkout per
+environment, so it uses the default workspace when that is unpinned or already
+matches, and otherwise a sibling `prove2me-<rev7>` checkout, writing the
+gitignored `lean-toolchain` and `lakefile.lean` and fetching Mathlib. An
+existing pin is never overwritten. Cloning and the multi-gigabyte Mathlib
+download are shown first and need a yes from the terminal or `--yes`, and the
+download is refused when less than about 16 GB is free. `--print-workspace`
+prints only the chosen path, for scripts:
+
+```bash
+autoform prove2me setup --mission Weak_Goldbach_Conjecture
+```
 
 Check the key and the platform version, then read a mission's milestones and
 open frontier. A mission is named by its URL, URL slug, name, or id:
