@@ -19,7 +19,6 @@ ROADMAP_ONLY=0
 MODEL=""
 PROVE2ME=""
 DRY_RUN=0
-PROVE2ME_WORKSPACE="${PROVE2ME_WORKSPACE:-$HOME/prove2me_workspace}"
 
 usage() {
   cat <<EOF
@@ -40,10 +39,10 @@ Prove2Me:
   --prove2me MISSION  Pick an open frontier theorem of this Prove2Me mission
                    (mission URL, URL slug, or name) and submit a proof or
                    proof sketch. An optional "<hint>" says which theorem or
-                   approach to prefer. Works in \$PROVE2ME_WORKSPACE
-                   (default: $PROVE2ME_WORKSPACE), which must already hold
-                   credentials.json or PROVE2ME_API_KEY; see
-                   https://prove2.me/start.md.
+                   approach to prefer. The first run clones the Prove2Me
+                   workspace, asks for your API key, and fetches the
+                   mission's Mathlib (one checkout per Mathlib version, under
+                   ~/prove2me_workspace or \$PROVE2ME_WORKSPACE).
   --dry-run        Prove2Me only: compile locally but do not submit.
   -h, --help       Show this help.
 EOF
@@ -110,14 +109,11 @@ run_claude() {  # run_claude <prompt> [extra allowed tools...]
 # The autoform:prove2me skill drives the work and `autoform prove2me` makes
 # every API call, so this session never handles the key or needs curl.
 if [[ -n "$PROVE2ME" ]]; then
-  if ! uv run --quiet --project "$ROOT" autoform prove2me auth --workspace "$PROVE2ME_WORKSPACE"; then
-    cat >&2 <<EOF
-Fix the Prove2Me key first: mint one at prove2.me (account menu > API key) and
-store it as api_key in $PROVE2ME_WORKSPACE/credentials.json, or export
-PROVE2ME_API_KEY. New accounts: claude "Fetch https://prove2.me/start.md and follow it"
-EOF
-    exit 1
-  fi
+  # Clone the workspace, ask for a key, and pin and fetch the mission's
+  # Mathlib, each only if missing. Prints the checkout to work in.
+  PROVE2ME_WORKSPACE="$(uv run --quiet --project "$ROOT" autoform prove2me setup \
+    --mission "$PROVE2ME" --print-workspace)" || exit 1
+  export PROVE2ME_WORKSPACE
 
   git -C "$PROVE2ME_WORKSPACE" pull -q --ff-only \
     || echo "warning: could not update $PROVE2ME_WORKSPACE; continuing with local copy" >&2
@@ -141,7 +137,8 @@ ${STATEMENT:+Hint from the user about what to target: "$STATEMENT"
 }
 You are running non-interactively, so nobody can answer questions; make
 reasonable choices and explain them at the end. The Prove2Me workspace is
-$PROVE2ME_WORKSPACE (pass --workspace or rely on its default). Run the CLI as
+$PROVE2ME_WORKSPACE, already pinned to this mission's Mathlib and exported as
+PROVE2ME_WORKSPACE, so the CLI uses it by default. Run the CLI as
 'uv run --project "$ROOT" autoform prove2me ...'.
 
 $SUBMIT
