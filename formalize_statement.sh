@@ -6,14 +6,14 @@
 #   ./formalize_statement.sh --project ~/my-lean-project "..."
 #   ./formalize_statement.sh --prove2me Positive_definite_matrix_integral_inequality
 #
-# Statements go into one shared Lean/Mathlib workspace (default: ./statements,
-# created on first use) so the Mathlib build cache is downloaded only once.
+# Statements go into one shared Lean/Mathlib workspace (default:
+# ~/autoform_statements, created on first use) so the Mathlib build cache is downloaded only once.
 # Each statement becomes one roadmap article plus one Lean file, driven by a
 # headless Claude Code session with this checkout loaded as the plugin.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT="${AUTOFORM_STATEMENTS_DIR:-$ROOT/statements}"
+PROJECT="${AUTOFORM_STATEMENTS_DIR:-$HOME/autoform_statements}"
 PACKAGE="Statements"
 ROADMAP_ONLY=0
 MODEL=""
@@ -169,6 +169,19 @@ if [[ ! -d "$PROJECT" ]]; then
   (cd "$PROJECT" && lake init "$PACKAGE" math)
 fi
 PROJECT="$(cd "$PROJECT" && pwd)"
+
+# This checkout is loaded with --plugin-dir, and Claude Code treats every file
+# under a plugin directory as sensitive: Write and Edit are refused there even
+# with acceptEdits, so the session would stop asking to "allow edits".
+case "$PROJECT/" in
+  "$ROOT/"*)
+    echo "error: the workspace $PROJECT is inside this checkout ($ROOT)." >&2
+    echo "  Claude Code will not edit files inside its plugin directory, so pick a" >&2
+    echo "  workspace elsewhere with --project DIR or AUTOFORM_STATEMENTS_DIR" >&2
+    echo "  (the default is ~/autoform_statements). An existing workspace can be moved:" >&2
+    echo "    mv \"$PROJECT\" ~/autoform_statements" >&2
+    exit 1 ;;
+esac
 
 if [[ "$ROADMAP_ONLY" -eq 0 ]]; then
   echo "==> Fetching Mathlib build cache"

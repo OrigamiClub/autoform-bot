@@ -327,7 +327,7 @@ expired-key error before reaching `claude`. The `git pull` of the workspace
 may wait on the network; it only warns on failure.
 
 Statement mode works the same way, but its first real run creates
-`./statements` and downloads Mathlib; use `--roadmap-only` or
+`~/autoform_statements` and downloads Mathlib; use `--roadmap-only` or
 `--project <existing Mathlib project>` to avoid that while testing the
 plumbing.
 
