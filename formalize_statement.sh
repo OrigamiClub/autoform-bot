@@ -4,6 +4,7 @@
 #   ./formalize_statement.sh "6 is not a prime number"
 #   ./formalize_statement.sh --roadmap-only "every finite group of prime order is cyclic"
 #   ./formalize_statement.sh --project ~/my-lean-project "..."
+#   ./formalize_statement.sh --propose --mission-title "Six is composite" "6 is not a prime number"
 #   ./formalize_statement.sh --prove2me Positive_definite_matrix_integral_inequality
 #
 # Statements go into one shared Lean/Mathlib workspace (default:
@@ -18,11 +19,15 @@ PACKAGE="Statements"
 ROADMAP_ONLY=0
 MODEL=""
 PROVE2ME=""
+PROPOSE=0
+MISSION_TYPE="OpenProblem"
+MISSION_TITLE=""
 DRY_RUN=0
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [options] "<statement>"
+       $(basename "$0") --propose [--mission-title T] [--dry-run] [options] "<statement>"
        $(basename "$0") --prove2me MISSION [--dry-run] ["<hint>"]
 
 Formalize and prove a single statement with AutoformBot, or contribute a
@@ -35,6 +40,16 @@ Options:
   --roadmap-only   Write the blueprint article only; do not touch Lean.
   --model MODEL    Claude model to use (default: Claude Code's default).
 
+Proposing a Prove2Me mission from the statement:
+  --propose        After formalizing, draft a Prove2Me mission proposal for
+                   the statement in the platform's default Mathlib: blind
+                   read-backs, a mission description, a local build, then
+                   'autoform prove2me propose'. The proposal stays a private
+                   draft until you confirm its items and click Submit
+                   Proposal on prove2.me (homepage > My missions).
+  --mission-type T OpenProblem (default), Textbook, or ResearchPaper.
+  --mission-title T  Mission name (default: Claude chooses one).
+
 Prove2Me:
   --prove2me MISSION  Pick an open frontier theorem of this Prove2Me mission
                    (mission URL, URL slug, or name) and submit a proof or
@@ -43,7 +58,8 @@ Prove2Me:
                    workspace, asks for your API key, and fetches the
                    mission's Mathlib (one checkout per Mathlib version, under
                    ~/prove2me_workspace or \$PROVE2ME_WORKSPACE).
-  --dry-run        Prove2Me only: compile locally but do not submit.
+  --dry-run        With --prove2me or --propose: check and compile locally,
+                   but do not submit or upload anything.
   -h, --help       Show this help.
 EOF
 }
@@ -55,6 +71,9 @@ while [[ $# -gt 0 ]]; do
     --roadmap-only) ROADMAP_ONLY=1; shift ;;
     --model) MODEL="$2"; shift 2 ;;
     --prove2me) PROVE2ME="$2"; shift 2 ;;
+    --propose) PROPOSE=1; shift ;;
+    --mission-type) MISSION_TYPE="$2"; shift 2 ;;
+    --mission-title) MISSION_TITLE="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; STATEMENT="$*"; break ;;
@@ -66,6 +85,15 @@ done
 if [[ -z "$STATEMENT" && -z "$PROVE2ME" ]]; then
   usage >&2
   exit 2
+fi
+
+if [[ "$PROPOSE" -eq 1 ]]; then
+  [[ -z "$PROVE2ME" ]] || { echo "error: --propose and --prove2me are separate modes" >&2; exit 2; }
+  [[ "$ROADMAP_ONLY" -eq 0 ]] || { echo "error: --propose needs the Lean statement; drop --roadmap-only" >&2; exit 2; }
+  case "$MISSION_TYPE" in
+    OpenProblem|Textbook|ResearchPaper) ;;
+    *) echo "error: --mission-type must be OpenProblem, Textbook, or ResearchPaper" >&2; exit 2 ;;
+  esac
 fi
 
 for tool in claude uv lake git; do
@@ -90,12 +118,14 @@ and 'autoform prove2me verify', in the foreground with a timeout of at least
 3600000 ms and wait for it to finish. Never run a command in the background and
 never end your reply while something is still running."
 
+EXTRA_DIRS=()  # more directories the session may read and edit
+
 run_claude() {  # run_claude <prompt> [extra allowed tools...]
   local prompt="$1"$'\n\n'"$FOREGROUND_NOTE"; shift
   local args=(
     -p "$prompt"
     --plugin-dir "$ROOT"
-    --add-dir "$ROOT"
+    --add-dir "$ROOT" ${EXTRA_DIRS[@]+"${EXTRA_DIRS[@]}"}
     --permission-mode acceptEdits
     --allowedTools "${ALLOWED_TOOLS[@]}" "$@"
   )
@@ -250,9 +280,56 @@ fix anything it reports, and commit the result in $PROJECT (do not push).
 Report the Lean statement you wrote, whether it is fully proved, and the paths
 you changed."
 
+# --- Mission proposal --------------------------------------------------------
+EXTRA_TOOLS=()
+if [[ "$PROPOSE" -eq 1 ]]; then
+  # Proposals are drafted and built in the platform's default environment,
+  # which is usually not the Mathlib this workspace got from 'lake init'.
+  PROVE2ME_WORKSPACE="$(autoform prove2me setup --env default --print-workspace)" || exit 1
+  export PROVE2ME_WORKSPACE
+  EXTRA_DIRS+=("$PROVE2ME_WORKSPACE")
+  # Agent runs the blind read-backs; the web tools find the literature.
+  EXTRA_TOOLS+=("Agent" "WebFetch" "WebSearch")
+
+  MISSION_NAME="a short descriptive name of your choice"
+  [[ -z "$MISSION_TITLE" ]] || MISSION_NAME="\"$MISSION_TITLE\""
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    UPLOAD="This is a dry run: take the proposal as far as passing
+   '$AUTOFORM_CMD prove2me propose prove2me/proposal.json --dry-run', then
+   stop. Do not upload anything to Prove2Me."
+  else
+    UPLOAD="Once the dry run passes, upload it with
+   '$AUTOFORM_CMD prove2me propose prove2me/proposal.json'. Do not create
+   fields, publish theorems, submit proofs, comment, or vote; submitting the
+   proposal is the user's step on the website."
+  fi
+  PROMPT+="
+
+4. After that commit, draft a Prove2Me mission proposal for this statement with the
+   autoform:prove2me skill, following its 'Propose a mission' section.
+   - Name: $MISSION_NAME.
+   - Type: $MISSION_TYPE, visibility public (it stays a private draft
+     until the user submits it). If $MISSION_TYPE does not describe the
+     statement (for example OpenProblem for a known result), keep it but
+     say so plainly in your report.
+   - The Prove2Me workspace is $PROVE2ME_WORKSPACE, pinned to the
+     platform's default Mathlib and exported as PROVE2ME_WORKSPACE. The goal
+     is the statement you formalized above, restated as a draft ending in
+     ':= by sorry' that builds there; do not include your proof.
+   - Write the spec to prove2me/proposal.json in $PROJECT and commit it.
+   $UPLOAD"
+  PROMPT+="
+   Report the proposal id and status (or the dry-run result), its items and
+   milestones, and what the user should check before submitting it."
+fi
+
 # --- Run ---------------------------------------------------------------------
 echo "==> Running AutoformBot on: $STATEMENT"
 echo "    article: $PROJECT/blueprint/roadmap/$SLUG.md"
 [[ "$ROADMAP_ONLY" -eq 1 ]] || echo "    lean:    $PROJECT/$LEAN_FILE"
+if [[ "$PROPOSE" -eq 1 ]]; then
+  echo "    proposal: Prove2Me $MISSION_TYPE draft, built in $PROVE2ME_WORKSPACE"
+  [[ "$DRY_RUN" -eq 0 ]] || echo "    dry run: nothing will be uploaded"
+fi
 cd "$PROJECT"
-run_claude "$PROMPT"
+run_claude "$PROMPT" ${EXTRA_TOOLS[@]+"${EXTRA_TOOLS[@]}"}

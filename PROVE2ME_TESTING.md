@@ -336,12 +336,20 @@ plumbing.
 ```bash
 ./formalize_statement.sh --prove2me Positive_definite_matrix_integral_inequality --dry-run
 ./formalize_statement.sh "6 is not a prime number"
+./formalize_statement.sh --propose --dry-run "6 is not a prime number"
 ```
 
 The first runs the skill unattended with a fixed permission list. Anything it
 needed but was not allowed shows up as a refused tool call in its final
 report. Drop `--dry-run` only once stages 4 and 5 look right: that run
 publishes under your account and the platform's Apache 2.0 terms.
+
+The third formalizes the statement, then drafts a mission proposal for it in
+the platform's default Mathlib and stops after `propose --dry-run`; the spec
+is left at `prove2me/proposal.json` in the statements workspace. Without
+`--dry-run` it uploads the proposal as a draft. Nothing in a draft is
+published until you confirm each item against its read-back under **My
+missions** on prove2.me and click **Submit Proposal**.
 
 ## Troubleshooting
 
@@ -357,4 +365,6 @@ publishes under your account and the platform's Apache 2.0 terms.
 | `No space left on device` during `lake update` | The disk filled mid-download. Delete the half-made checkout (it was created by that run) before retrying. |
 | `could not find platform module …` | An import names a theorem or definition the API could not resolve in that environment. |
 | `HTTP 429 … too many pending` | Wait for queued submissions or publish jobs to finish instead of resubmitting. |
+| `propose`: `… already exists and is not a local draft` | A mirrored platform module has that name in this environment; rename the draft item. |
+| `propose`: `can no longer be edited` | The proposal was submitted; after a moderator sends it back (`Changes requested`) it is editable again. |
 | `no visible Prove2Me mission matches` | The name differs from the URL slug, or the mission is private to someone else. |
