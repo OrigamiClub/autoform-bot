@@ -583,6 +583,42 @@ autoform prove2me publish problem children.json --env <mathlib-rev> --dry-run
 Every write -- `verify` without `--dry-run`, `publish`, and `explain` -- is
 public under the platform's Apache 2.0 terms.
 
+`propose` drafts a new mission from one spec file, following the platform's
+captain guide (`references/mission_captain.md`):
+
+```json
+{
+  "proposal": {"name": "...", "description": "...", "mission_type": "OpenProblem",
+               "field_ids": ["<field id>"], "env": "<optional mathlib_rev>"},
+  "items": [
+    {"kind": "definition", "definition_name": "...", "definition": "...", "readback": "...", "readback_model": "..."},
+    {"kind": "theorem", "theorem_name": "Ns.step", "formal_statement": "... := by sorry", "...": "...",
+     "milestone": {"title": "Lemma 2.1 - ...", "description": "..."}},
+    {"kind": "theorem", "theorem_name": "Ns.main", "...": "...", "goal": true}
+  ]
+}
+```
+
+Items are the `publish` bodies plus a `kind` (`theorem`, `definition`, or
+`reference` with a `theorem_id`), listed dependencies first. One item is the
+`goal`; other theorems may carry a `milestone`. `propose` checks the spec,
+builds every draft in the workspace where the platform would place it
+(`Definitions/Def_<name>.lean`, `Theorems/Thm_<slug>.lean`, each marked as a
+local draft and never written over a mirrored module), and refuses when the
+workspace pins a different Mathlib from the proposal's environment. It then
+creates the proposal, or with `--proposal ID` updates that draft in place,
+and sets the goal, item order, and milestones:
+
+```bash
+autoform prove2me propose proposal.json --dry-run
+autoform prove2me propose proposal.json
+autoform prove2me propose proposal.json --proposal <proposal-id>
+```
+
+A proposal is a private draft. Nothing in it is published until the user
+confirms each item and clicks **Submit Proposal** on the website, which the
+API leaves to the user.
+
 ## Validation
 
 `autoform check` rejects cycles, missing targets, escaping paths,

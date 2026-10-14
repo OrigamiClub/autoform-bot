@@ -622,6 +622,246 @@ def wait_for_job(
     return _poll(client, f"/publish-jobs/{job_id}", {"PENDING", "COMPILING"}, timeout, sleep, clock)
 
 
+# --- Mission proposals -------------------------------------------------------
+#
+# A proposal is a private draft of a new mission. Its items are stored text
+# until the user confirms each one and clicks Submit Proposal on the website;
+# only then are they compiled and published. That step is human-only, so
+# nothing here can make a proposal public.
+
+MISSION_TYPES = ("OpenProblem", "Textbook", "ResearchPaper")
+EDITABLE_PROPOSAL = frozenset({"Draft", "Changes requested"})
+_PROPOSAL_KEYS = frozenset({"name", "description", "mission_type", "field_ids", "env", "visibility"})
+# Keys of a spec item that steer the upload and are never sent as item fields.
+_LOCAL_ITEM_KEYS = ("kind", "goal", "milestone")
+DRAFT_MARKER = "-- autoform: local draft of a Prove2Me mission proposal item; not published\n"
+
+
+def item_name(item: dict) -> str:
+    if item.get("kind") == "reference":
+        return f"reference {item.get('theorem_id')}"
+    return str(item.get("theorem_name") or item.get("definition_name") or "<unnamed>")
+
+
+def _item_body(item: dict) -> dict:
+    return {key: value for key, value in item.items() if key not in _LOCAL_ITEM_KEYS}
+
+
+def _draft_module(item: dict) -> str:
+    if item["kind"] == "definition":
+        return f"Definitions.Def_{item['definition_name']}"
+    return f"Theorems.Thm_{theorem_slug(item['theorem_name'])}"
+
+
+def check_proposal(spec: object) -> tuple[list[str], list[str]]:
+    """(problems, warnings) for a proposal spec, before anything is compiled or sent.
+
+    The spec is {"proposal": {...metadata...}, "items": [...]}, where items are
+    in dependency order and each is a `theorem` or `definition` draft (the same
+    body as /submit-problem or /submit-definition) or a `reference` to a
+    published theorem. One item carries `"goal": true`; theorem items may carry
+    `"milestone": {"title", "description"}`.
+    """
+    if not isinstance(spec, dict) or not isinstance(spec.get("proposal"), dict) or not isinstance(
+        spec.get("items"), list
+    ):
+        return ['the spec must be {"proposal": {...}, "items": [...]}'], []
+    meta, items = spec["proposal"], spec["items"]
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    unknown = sorted(set(meta) - _PROPOSAL_KEYS)
+    if unknown:
+        problems.append(f"proposal: unknown field(s) {', '.join(unknown)}")
+    name = str(meta.get("name") or "").strip()
+    if not name:
+        problems.append("proposal: missing name")
+    elif len(name) > 200:
+        problems.append("proposal: name exceeds 200 characters")
+    if meta.get("mission_type") not in MISSION_TYPES:
+        problems.append(f"proposal: mission_type must be one of {', '.join(MISSION_TYPES)}")
+    if meta.get("visibility", "public") not in ("public", "private"):
+        problems.append("proposal: visibility must be public or private")
+    if not str(meta.get("description") or "").strip():
+        problems.append("proposal: missing description (the mission introduction)")
+    fields = meta.get("field_ids", [])
+    if not isinstance(fields, list) or not all(isinstance(f, str) and f for f in fields):
+        problems.append("proposal: field_ids must be a list of field ids")
+    elif not fields:
+        warnings.append("proposal: no field_ids; at least one is needed before the proposal can be submitted")
+
+    if not items:
+        problems.append("items: the proposal needs at least its goal theorem")
+    goals = [item for item in items if isinstance(item, dict) and item.get("goal")]
+    if len(goals) != 1:
+        problems.append(f"items: exactly one item must have \"goal\": true (found {len(goals)})")
+
+    position = {_draft_module(item): index for index, item in enumerate(items)
+                if isinstance(item, dict) and item.get("kind") in ("theorem", "definition")
+                and (item.get("theorem_name") or item.get("definition_name"))}
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            problems.append(f"items[{index}]: not an object")
+            continue
+        kind, label = item.get("kind"), item_name(item)
+        if kind not in ("theorem", "definition", "reference"):
+            problems.append(f"{label}: kind must be theorem, definition, or reference")
+            continue
+        if label in seen:
+            problems.append(f"{label}: appears twice")
+        seen.add(label)
+        if "env" in item or "private" in item:
+            problems.append(f"{label}: set env and visibility on the proposal, not on an item")
+            continue
+        if kind == "definition" and item.get("goal"):
+            problems.append(f"{label}: a definition cannot be the goal")
+        milestone = item.get("milestone")
+        if milestone is not None:
+            if kind == "definition" or item.get("goal"):
+                problems.append(f"{label}: only a non-goal theorem can be a milestone")
+            elif not isinstance(milestone, dict) or not all(
+                str(milestone.get(key) or "").strip() for key in ("title", "description")
+            ):
+                problems.append(f"{label}: milestone needs a title and a description")
+            elif len(milestone["title"]) > 200:
+                problems.append(f"{label}: milestone title exceeds 200 characters")
+        if kind == "reference":
+            if not str(item.get("theorem_id") or "").strip():
+                problems.append(f"{label}: a reference needs theorem_id")
+            extra = sorted(set(item) - {"kind", "theorem_id", "goal", "milestone"})
+            if extra:
+                problems.append(f"{label}: a reference carries only theorem_id (found {', '.join(extra)})")
+            continue
+
+        problems.extend(check_publish("problem" if kind == "theorem" else "definition", _item_body(item)))
+        if item.get("readback") and not item.get("readback_model"):
+            problems.append(f"{label}: readback_model is required with a readback")
+        if not item.get("readback"):
+            warnings.append(f"{label}: no read-back; the reviewer's audit page will show an empty placeholder")
+        source = item.get("preamble", "") if kind == "theorem" else item.get("definition", "")
+        for imported in _imports(source or ""):
+            if position.get(imported, -1) > index:
+                problems.append(f"{label}: imports {imported}, which is listed after it; put dependencies first")
+    return problems, warnings
+
+
+def compile_proposal(items: list[dict], workspace: Path, timeout: float) -> tuple[bool, str]:
+    """Build every draft item in the workspace exactly where the platform would put it.
+
+    Drafts are written to `Definitions/Def_<name>.lean` and
+    `Theorems/Thm_<slug>.lean` so later items can import earlier ones, as they
+    will after publishing. A file is only overwritten when it is absent or an
+    earlier draft written here, so a mirrored platform module is never clobbered:
+    a clash means the name is already taken in this environment.
+    """
+    modules = []
+    for item in items:
+        if item.get("kind") not in ("theorem", "definition"):
+            continue
+        module = _draft_module(item)
+        path = workspace / f"{module.replace('.', '/')}.lean"
+        if path.is_file() and not path.read_text(encoding="utf-8").startswith(DRAFT_MARKER):
+            return False, f"{path} already exists and is not a local draft; {item_name(item)} may be a taken name"
+        source = item["definition"] if item["kind"] == "definition" else _theorem_source(item)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(DRAFT_MARKER + source.strip("\n") + "\n", encoding="utf-8")
+        modules.append(module)
+    if not modules:
+        return True, "no draft items to build"
+    try:
+        run = subprocess.run(["lake", "build", *modules], cwd=workspace, capture_output=True, text=True,
+                             timeout=timeout)
+    except FileNotFoundError:
+        return False, "lake not found on PATH"
+    except subprocess.TimeoutExpired:
+        return False, f"lake build timed out after {timeout:g}s"
+    return run.returncode == 0, (run.stdout + run.stderr).strip()
+
+
+def upload_proposal(client: Client, spec: dict, proposal_id: str | None = None) -> dict:
+    """Create (or update) the draft proposal, its items, goal, order, and milestones.
+
+    Items are matched to an existing proposal's by name (references by
+    theorem_id) and patched in place, so re-running after a fix updates rather
+    than duplicates. Items already in the proposal but absent from the spec are
+    kept at the end of the order and reported, never deleted.
+    """
+    meta = spec["proposal"]
+    if proposal_id:
+        proposal = client.get(f"/mission-proposals/{proposal_id}")
+        if proposal.get("status") not in EDITABLE_PROPOSAL:  # type: ignore[union-attr]
+            raise Prove2MeError(
+                f"proposal {proposal_id} is {proposal.get('status')!r} and can no longer be edited"  # type: ignore[union-attr]
+            )
+        if meta.get("env") and not str(proposal.get("env") or "").startswith(meta["env"]):  # type: ignore[union-attr]
+            raise Prove2MeError(f"proposal {proposal_id} targets env {proposal.get('env')}, not {meta.get('env')}")  # type: ignore[union-attr]
+        patch = {key: meta[key] for key in ("description", "mission_type", "field_ids", "visibility") if key in meta}
+        if patch:
+            client.request("PATCH", f"/mission-proposals/{proposal_id}", json=patch)
+    else:
+        body = {key: meta[key] for key in _PROPOSAL_KEYS if meta.get(key) not in (None, "")}
+        proposal = client.request("POST", "/mission-proposals", json=body)
+        proposal_id = proposal["id"]  # type: ignore[index]
+
+    try:
+        return _fill_proposal(client, proposal_id, proposal, spec["items"])  # type: ignore[arg-type]
+    except Prove2MeError as exc:
+        raise Prove2MeError(f"{exc} (proposal {proposal_id} exists; fix the spec and re-run with "
+                            f"--proposal {proposal_id})") from None
+
+
+def _fill_proposal(client: Client, proposal_id: str, proposal: dict, items: list[dict]) -> dict:
+    existing = {}
+    for current in proposal.get("items") or []:
+        key = (f"reference {current.get('theorem_id')}" if current.get("kind") == "reference"
+               else str(current.get("theorem_name") or current.get("definition_name")))
+        existing[key] = current["id"]
+
+    base = f"/mission-proposals/{proposal_id}"
+    order, goal, report = [], None, []
+    for item in items:
+        label, body = item_name(item), _item_body(item)
+        if label in existing:
+            item_id = existing.pop(label)
+            if item["kind"] != "reference":
+                client.request("PATCH", f"{base}/items/{item_id}", json=body)
+            action = "updated" if item["kind"] != "reference" else "kept"
+        else:
+            created = client.request("POST", f"{base}/items", json={"kind": item["kind"], **body})
+            item_id, action = created["id"], "added"  # type: ignore[index]
+        order.append(item_id)
+        if item.get("goal"):
+            goal = item_id
+        report.append({"name": label, "kind": item["kind"], "item_id": item_id, "action": action})
+
+    leftover = list(existing.values())
+    client.request("PATCH", base, json={"main_item_id": goal, "item_order": order + leftover})
+
+    milestones = []
+    for item, entry in zip(items, report):
+        milestone = item.get("milestone")
+        if milestone:
+            client.request("POST", f"{base}/milestones", json={
+                "item_id": entry["item_id"],
+                "milestone_title": milestone["title"],
+                "milestone_description": milestone["description"],
+            })
+            milestones.append(milestone["title"])
+
+    final = client.get(base)
+    return {
+        "proposal_id": proposal_id,
+        "name": final.get("name"),  # type: ignore[union-attr]
+        "status": final.get("status"),  # type: ignore[union-attr]
+        "visibility": final.get("visibility"),  # type: ignore[union-attr]
+        "env": final.get("env"),  # type: ignore[union-attr]
+        "items": report,
+        "milestones": milestones,
+        "not_in_spec": list(existing),
+    }
+
+
 # --- Workspace setup ---------------------------------------------------------
 
 WORKSPACE_REPO = "https://github.com/prove2me/prove2me_workspace.git"

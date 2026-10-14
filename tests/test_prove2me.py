@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import datetime
 import json
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -492,6 +493,202 @@ def test_publish_dry_run_and_invalid_specs_never_post(cli_api, tmp_path: Path, c
     assert main(["prove2me", "publish", "problem", str(bad), "--env", "c5ea", "--workspace", str(tmp_path)]) == 1
     assert "must end with" in capsys.readouterr().out
     assert not any(request.method == "POST" and "submit" in request.url.path for request in api.requests)
+
+
+# --- mission proposals -------------------------------------------------------
+
+
+DEF_ITEM = {
+    "kind": "definition",
+    "definition_name": "P01_helper",
+    "definition_title": "Helper",
+    "definition": "import Mathlib\n\ndef P01.helper : Nat := 6",
+    "readback": "The natural number $6$.",
+    "readback_model": "m",
+}
+GOAL_ITEM = {
+    "kind": "theorem",
+    **CHILD,
+    "theorem_name": "P01.goal",
+    "formal_statement": "namespace P01\ntheorem goal : ¬ Nat.Prime helper := by sorry\nend P01",
+    "preamble": "import Definitions.Def_P01_helper",
+    "readback": "Six is not prime.",
+    "readback_model": "m",
+    "goal": True,
+}
+STEP_ITEM = {
+    "kind": "theorem",
+    **CHILD,
+    "readback": "True holds.",
+    "readback_model": "m",
+    "milestone": {"title": "Lemma 1 - truth", "description": "Truth holds."},
+}
+PROPOSAL = {
+    "proposal": {"name": "Six", "description": "## Motivation\n...", "mission_type": "OpenProblem",
+                 "field_ids": ["f1"]},
+    "items": [DEF_ITEM, STEP_ITEM, GOAL_ITEM],
+}
+
+
+def _with(items: list[dict] | None = None, **meta: object) -> dict:
+    return {"proposal": {**PROPOSAL["proposal"], **meta}, "items": items if items is not None else PROPOSAL["items"]}
+
+
+@pytest.mark.parametrize(
+    ("spec", "fragment"),
+    [
+        ({"items": []}, '{"proposal"'),
+        (_with(mission_type="Conjecture"), "mission_type"),
+        (_with(description=""), "missing description"),
+        (_with(campaign="x"), "unknown field"),
+        (_with([DEF_ITEM, STEP_ITEM, {**GOAL_ITEM, "goal": False}]), "exactly one"),
+        (_with([GOAL_ITEM, DEF_ITEM]), "listed after it"),
+        (_with([DEF_ITEM, {**GOAL_ITEM, "milestone": {"title": "t", "description": "d"}}]), "only a non-goal"),
+        (_with([DEF_ITEM, {**GOAL_ITEM, "env": "c5ea"}]), "on the proposal"),
+        (_with([DEF_ITEM, {**GOAL_ITEM, "readback_model": ""}]), "readback_model"),
+        (_with([DEF_ITEM, {**GOAL_ITEM, "formal_statement": "theorem P01.goal : True := trivial"}]), "must end with"),
+        (_with([{"kind": "reference", "theorem_id": "t", "goal": True, "preamble": "x"}]), "only theorem_id"),
+    ],
+)
+def test_check_proposal_rejects_malformed_specs(spec: dict, fragment: str) -> None:
+    assert prove2me.check_proposal(PROPOSAL) == ([], [])
+    problems, _ = prove2me.check_proposal(spec)
+    assert any(fragment in problem for problem in problems), problems
+
+
+def test_check_proposal_warns_about_what_blocks_submission_later() -> None:
+    bare = {key: value for key, value in GOAL_ITEM.items() if key not in ("readback", "readback_model")}
+    problems, warnings = prove2me.check_proposal(_with([DEF_ITEM, bare], field_ids=[]))
+
+    assert problems == []
+    assert any("field_ids" in warning for warning in warnings)
+    assert any("P01.goal: no read-back" in warning for warning in warnings)
+
+
+def test_compile_proposal_writes_drafts_where_imports_resolve_and_never_clobbers(tmp_path: Path, monkeypatch) -> None:
+    builds: list[list[str]] = []
+    monkeypatch.setattr(prove2me.subprocess, "run",
+                        lambda command, **kwargs: builds.append(command) or subprocess.CompletedProcess(command, 0, "", ""))
+
+    ok, _ = prove2me.compile_proposal(PROPOSAL["items"], tmp_path, 60)
+
+    assert ok
+    assert builds == [["lake", "build", "Definitions.Def_P01_helper", "Theorems.Thm_P01_child", "Theorems.Thm_P01_goal"]]
+    goal = (tmp_path / "Theorems" / "Thm_P01_goal.lean").read_text()
+    assert goal.startswith(prove2me.DRAFT_MARKER + "import Definitions.Def_P01_helper\n\nnamespace P01")
+    assert prove2me.compile_proposal(PROPOSAL["items"], tmp_path, 60)[0]  # an earlier draft is rewritten
+
+    (tmp_path / "Theorems" / "Thm_P01_goal.lean").write_text("theorem P01.goal : True := by sorry\n")
+    ok, output = prove2me.compile_proposal(PROPOSAL["items"], tmp_path, 60)
+    assert not ok and "not a local draft" in output
+    assert (tmp_path / "Theorems" / "Thm_P01_goal.lean").read_text() == "theorem P01.goal : True := by sorry\n"
+
+
+def _proposal_api(state: dict) -> FakeApi:
+    """A FakeApi that keeps one proposal in `state` and records write bodies."""
+    state.setdefault("writes", [])
+
+    def create(request: httpx.Request) -> httpx.Response:
+        state["writes"].append(("POST /mission-proposals", json.loads(request.content)))
+        state["proposal"] = {"id": "prop", "status": "Draft", "visibility": "public", "env": "0df444a",
+                             "items": [], **json.loads(request.content)}
+        return httpx.Response(201, json=state["proposal"])
+
+    def add_item(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        state["writes"].append(("POST items", body))
+        item = {"id": f"i{len(state['proposal']['items'])}", **body}
+        state["proposal"]["items"].append(item)
+        return httpx.Response(201, json=item)
+
+    def record(label: str):
+        def handle(request: httpx.Request) -> dict:
+            state["writes"].append((label, json.loads(request.content)))
+            return {}
+        return handle
+
+    routes = {
+        ("POST", "/mission-proposals"): create,
+        ("GET", "/mission-proposals/prop"): lambda request: state["proposal"],
+        ("PATCH", "/mission-proposals/prop"): record("PATCH proposal"),
+        ("POST", "/mission-proposals/prop/items"): add_item,
+        ("POST", "/mission-proposals/prop/milestones"): record("POST milestone"),
+        ("GET", "/environments"): ENVIRONMENTS,
+    }
+    for index in range(3):
+        routes[("PATCH", f"/mission-proposals/prop/items/i{index}")] = record(f"PATCH i{index}")
+    return FakeApi(routes)
+
+
+def test_propose_creates_a_draft_with_goal_order_and_milestones(cli_api, tmp_path: Path, capsys) -> None:
+    state: dict = {}
+    cli_api["api"] = _proposal_api(state)
+    spec = tmp_path / "proposal.json"
+    spec.write_text(json.dumps(PROPOSAL))
+
+    code = main(["prove2me", "propose", str(spec), "--skip-compile", "--workspace", str(tmp_path), "--json"])
+
+    assert code == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["proposal_id"] == "prop" and report["status"] == "Draft"
+    writes = state["writes"]
+    assert writes[0] == ("POST /mission-proposals", PROPOSAL["proposal"])
+    sent = [body for label, body in writes if label == "POST items"]
+    assert [body.get("theorem_name") or body.get("definition_name") for body in sent] == [
+        "P01_helper", "P01.child", "P01.goal"]
+    assert all("goal" not in body and "milestone" not in body for body in sent)
+    assert ("PATCH proposal", {"main_item_id": "i2", "item_order": ["i0", "i1", "i2"]}) in writes
+    assert ("POST milestone", {"item_id": "i1", "milestone_title": "Lemma 1 - truth",
+                               "milestone_description": "Truth holds."}) in writes
+    assert not any("submit" in request.url.path for request in cli_api["api"].requests)
+
+
+def test_propose_updates_an_existing_draft_in_place(cli_api, tmp_path: Path, capsys) -> None:
+    state: dict = {"proposal": {"id": "prop", "status": "Draft", "env": "0df444a", "items": [
+        {"id": "i0", "kind": "definition", "definition_name": "P01_helper"},
+        {"id": "i1", "kind": "theorem", "theorem_name": "P01.goal"},
+        {"id": "i2", "kind": "theorem", "theorem_name": "P01.dropped"},
+    ]}}
+    cli_api["api"] = _proposal_api(state)
+    spec = tmp_path / "proposal.json"
+    spec.write_text(json.dumps(_with([DEF_ITEM, GOAL_ITEM])))
+
+    code = main(["prove2me", "propose", str(spec), "--proposal", "prop", "--skip-compile",
+                 "--workspace", str(tmp_path)])
+
+    assert code == 0
+    labels = [label for label, _ in state["writes"]]
+    assert "POST items" not in labels and "POST /mission-proposals" not in labels
+    assert {"PATCH i0", "PATCH i1"} <= set(labels)
+    assert ("PATCH proposal", {"main_item_id": "i1", "item_order": ["i0", "i1", "i2"]}) in state["writes"]
+    assert "P01.dropped is in the proposal but not in the spec" in capsys.readouterr().out
+
+
+def test_propose_refuses_a_submitted_proposal(cli_api, tmp_path: Path, capsys) -> None:
+    state: dict = {"proposal": {"id": "prop", "status": "In review", "items": []}}
+    cli_api["api"] = _proposal_api(state)
+    spec = tmp_path / "proposal.json"
+    spec.write_text(json.dumps(PROPOSAL))
+
+    assert main(["prove2me", "propose", str(spec), "--proposal", "prop", "--skip-compile",
+                 "--workspace", str(tmp_path)]) == 1
+    assert "can no longer be edited" in capsys.readouterr().err
+    assert state["writes"] == []
+
+
+def test_propose_dry_run_and_env_mismatch_never_upload(cli_api, tmp_path: Path, capsys, monkeypatch) -> None:
+    state: dict = {}
+    cli_api["api"] = _proposal_api(state)
+    spec = tmp_path / "proposal.json"
+    spec.write_text(json.dumps(PROPOSAL))
+    monkeypatch.setattr(prove2me, "compile_proposal", lambda *a, **k: pytest.fail("compiled despite mismatch"))
+    (tmp_path / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": C5EA["mathlib_rev"]}]}))
+
+    assert main(["prove2me", "propose", str(spec), "--workspace", str(tmp_path)]) == 1
+    assert "setup --env 0df444a" in capsys.readouterr().out
+    assert main(["prove2me", "propose", str(spec), "--dry-run", "--skip-compile", "--workspace", str(tmp_path)]) == 0
+    assert "nothing uploaded" in capsys.readouterr().out
+    assert state["writes"] == []
 
 
 # --- setup -------------------------------------------------------------------

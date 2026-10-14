@@ -82,6 +82,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     publish.add_argument("--no-wait", action="store_true", help="return once the jobs are queued")
     publish.add_argument("--timeout", type=float, default=900, help="seconds to wait per job (default 900)")
 
+    propose = command(
+        "propose", "compile a mission proposal spec locally, then create or update it as a private draft"
+    )
+    propose.add_argument("spec", type=Path, help='JSON: {"proposal": {...}, "items": [...]}')
+    propose.add_argument("--proposal", metavar="ID", help="update this draft proposal instead of creating one")
+    propose.add_argument("--dry-run", action="store_true", help="run every local check, then stop before uploading")
+    propose.add_argument("--skip-compile", action="store_true", help="do not build the draft items with Lake first")
+    propose.add_argument("--compile-timeout", type=float, default=1800, help="seconds Lake may build (default 1800)")
+
     explain = command("explain", "replace or clear a submission's explanation")
     explain.add_argument("submission_id")
     source = explain.add_mutually_exclusive_group(required=True)
@@ -103,6 +112,7 @@ def run(args: argparse.Namespace) -> int:
         "get": _get,
         "verify": _verify,
         "publish": _publish,
+        "propose": _propose,
         "explain": _explain,
     }[args.prove2me_command]
     workspace = prove2me.workspace_path(args.workspace)
@@ -430,6 +440,70 @@ def _publish(client: prove2me.Client, args: argparse.Namespace, workspace: Path)
     if args.no_wait:
         return 0
     return 0 if all(job.get("status") == "PUBLISHED" for job in jobs) else 1
+
+
+def _propose(client: prove2me.Client, args: argparse.Namespace, workspace: Path) -> int:
+    """Check and build the spec locally, then upload it as a draft; never submits it.
+
+    Submitting a proposal publishes its items and asks for moderation, and the
+    platform leaves that to the user on the website.
+    """
+    try:
+        spec = json.loads(args.spec.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Prove2MeError(f"cannot read {args.spec}: {exc}") from None
+    problems, warnings = prove2me.check_proposal(spec)
+    report: dict = {"spec": str(args.spec), "warnings": warnings}
+
+    if not problems and not args.skip_compile:
+        env = prove2me.resolve_environment(client, spec["proposal"].get("env") or None)
+        pinned = prove2me.workspace_mathlib_rev(workspace)
+        if pinned != env["mathlib_rev"]:
+            problems.append(
+                f"workspace {workspace} pins Mathlib {(pinned or 'unknown')[:7]}, but the proposal targets "
+                f"{env['mathlib_rev'][:7]}; run `autoform prove2me setup --env {env['mathlib_rev'][:7]}` and "
+                "pass that checkout with --workspace"
+            )
+        else:
+            _say(f"building the draft items in {workspace} against Mathlib {pinned[:7]} with Lake")
+            ok, output = prove2me.compile_proposal(spec["items"], workspace, args.compile_timeout)
+            report["compile_output"] = output[-4000:]
+            if not ok:
+                problems.append("local build of the draft items failed")
+    report["problems"] = problems
+
+    if problems or args.dry_run:
+        report["uploaded"] = False
+        if args.json:
+            _emit(report)
+        else:
+            for warning in warnings:
+                print(f"warning: {warning}")
+            for problem in problems:
+                print(f"error: {problem}")
+            if problems and report.get("compile_output"):
+                print(report["compile_output"])
+            if not problems:
+                print(f"OK: {len(spec['items'])} item(s) pass the local checks; dry run, nothing uploaded")
+        return 1 if problems else 0
+
+    result = prove2me.upload_proposal(client, spec, args.proposal)
+    report.update(uploaded=True, **result)
+    if args.json:
+        _emit(report)
+        return 0
+    for warning in warnings:
+        print(f"warning: {warning}")
+    print(f"{result['name']}: proposal {result['proposal_id']} [{result['status']}, {result['visibility']}]")
+    for entry in result["items"]:
+        print(f"  {entry['action']} {entry['kind']} {entry['name']} -> item {entry['item_id']}")
+    for title in result["milestones"]:
+        print(f"  milestone: {title}")
+    for name in result["not_in_spec"]:
+        print(f"warning: {name} is in the proposal but not in the spec; left in place")
+    print("Next: open https://prove2.me (homepage > My missions), confirm each item against its read-back, "
+          "then click Submit Proposal. Nothing is published until then.")
+    return 0
 
 
 def _explain(client: prove2me.Client, args: argparse.Namespace, workspace: Path) -> int:

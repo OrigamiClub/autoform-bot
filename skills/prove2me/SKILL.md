@@ -4,9 +4,10 @@ description: >-
   Contribute proofs and proof sketches to Prove2Me (prove2.me) missions: find a
   mission's open frontier, mirror a target into the Prove2Me Lean workspace,
   prove it, gate it locally, submit it for server-side verification, and attach
-  an explanation. Use when asked to work on, prove, or submit to a Prove2Me
-  mission or theorem; do not use for setting up Prove2Me accounts, captaining
-  missions, or building an Autoform roadmap.
+  an explanation; or draft a new mission proposal from a formalized
+  statement. Use when asked to work on, prove, or submit to a Prove2Me mission
+  or theorem, or to propose a mission; do not use for setting up Prove2Me
+  accounts or building an Autoform roadmap.
 ---
 
 # Contribute to a Prove2Me mission
@@ -80,10 +81,46 @@ workspace's `SKILL.md`, update the workspace or read the live copies at
    reduction is valid. Fix and resubmit on `CE`, `WA`, `SORRY`, or `FAILED`
    while real progress is possible, and never resubmit an unchanged file.
 
+## Propose a mission
+
+Only when the user asks for a mission proposal. Read the workspace's
+`references/mission_captain.md`, `references/mission_description.md`, and
+`references/mission_auditor.md` first (or the live copies); they are
+authoritative, and this section only maps them onto `propose`.
+
+1. **Pin the environment.** Use the proposal's `env` (the platform default
+   unless the user names one) and a workspace from `setup --env`. Restate each
+   item for that Mathlib even when it was first formalized elsewhere.
+2. **Search before drafting.** Find fields with `get /fields --param q=...`
+   and existing statements with `get /theorems --param q=...`; use a faithful
+   published statement as a `reference` item instead of a duplicate. Never
+   create a field without the user's say-so.
+3. **Write the spec.** Draft theorems end in `:= by sorry` inside one
+   mission-wide namespace, with targeted imports in `preamble` and the
+   platform's rules for `natural_language_statement` and `source`. Mark the
+   goal, list dependencies first, and give each supporting theorem from the
+   source a `milestone` titled with the source's numbering. A proof found
+   earlier does not go into the proposal; it can be submitted once the
+   mission is live. The `description` follows `mission_description.md`; an
+   `OpenProblem` also needs the literature's key results as milestones and a
+   timeline, so search for them rather than writing from memory.
+4. **Get blind read-backs.** For every draft item, start a fresh sub-agent
+   given only the item's Lean code (preamble and statement, or the definition)
+   and `mission_auditor.md`, never the intent or the source. Attach its output
+   as `readback` with `readback_model` set to that sub-agent's model, and
+   re-run it whenever the Lean changes.
+5. **Gate, then upload.** Run `propose --dry-run` until it passes with no
+   warnings you can fix, then `propose` (or `propose --proposal ID` to revise).
+   Never ask the user to share credentials to submit it for them: confirming
+   each item and clicking **Submit Proposal** is theirs alone, on the website.
+
 ## Report
 
 Report the mission, the chosen theorem and why, each submission id with its
 final status and server message, children published, and what remains open.
+For a proposal, report its id and status, each item and milestone, any
+warnings left, and the user's next step: review each item against its
+read-back under **My missions** and submit it there.
 A Prove2Me verdict is the platform's check, not this project's: never record it
 as `proof: formalized` in an Autoform blueprint.
 
