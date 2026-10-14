@@ -26,40 +26,25 @@ its open leaf at the time of writing is
 
 ## 0. Set up the workspace
 
-One command clones the workspace, stores the key, and prepares Mathlib for a
-mission:
+One command clones the workspace, stores the key, and prepares the mission's
+Mathlib, each only if missing, so it is safe to rerun:
 
 ```bash
 uv run autoform prove2me setup --mission Positive_definite_matrix_integral_inequality
 ```
 
-It does each step only if it is missing, so it is safe to rerun:
-
-1. **Clone.** If `~/prove2me_workspace` (or `$PROVE2ME_WORKSPACE`) does not
-   exist, it clones <https://github.com/prove2me/prove2me_workspace> there.
-2. **Key.** If there is no working key, it says why and prompts:
-
-   ```text
-   no Prove2Me API key: run `autoform prove2me setup` in a terminal, or set PROVE2ME_API_KEY (...)
-   Mint a key at https://prove2.me (account menu, top right > API key). New accounts: https://prove2.me/start.md
-   Prove2Me API key (input hidden):
-   saved the key to /Users/you/prove2me_workspace/credentials.json (readable only by you)
-   ```
-
-   Paste the key at the prompt; nothing is echoed. A rejected key is
-   reported and asked for again, up to three times. The key is stored in the
-   default workspace, which every other checkout falls back to. To replace
-   an expired key, rerun `setup`: it notices and asks again.
-3. **Mathlib.** It looks up the mission's environment and picks a checkout:
-   the default workspace if it is unpinned or already on that environment,
-   otherwise a sibling `~/prove2me-<rev7>`, for example
-   `~/prove2me-c5ea003`. It writes that checkout's gitignored
-   `lean-toolchain` and `lakefile.lean`, then runs `lake update`,
-   `lake exe cache get`, and `lake build Solutions.SmokeTest`. An existing
-   pin is never changed.
-4. **Confirm.** Before cloning or downloading it lists what it will do and
-   asks `Continue? [y/N]`. It refuses the download outright when less than
-   about 16 GB is free.
+1. **Clone** <https://github.com/prove2me/prove2me_workspace> into
+   `~/prove2me_workspace` (or `$PROVE2ME_WORKSPACE`).
+2. **Key.** Prompts with hidden input (mint one under the account menu >
+   API key), checks it, and saves it to that workspace's `credentials.json`.
+   Rerun `setup` to replace an expired key.
+3. **Mathlib.** Uses the default workspace if it is unpinned or already on
+   the mission's environment, otherwise a sibling `prove2me-<rev7>` whose
+   `credentials.json` links back to the key. It writes the gitignored
+   `lean-toolchain` and `lakefile.lean`, then fetches the Mathlib cache and
+   builds the smoke test. An existing pin is never changed.
+4. **Confirm.** It asks before cloning or downloading, and refuses the
+   download when less than about 16 GB is free.
 
 Useful flags:
 
@@ -78,12 +63,9 @@ export PROVE2ME_WORKSPACE="$(uv run autoform prove2me setup \
   --mission Positive_definite_matrix_integral_inequality --print-workspace)"
 ```
 
-`formalize_statement.sh --prove2me` runs `setup --mission` itself, so on a
-fresh machine the script alone is enough.
-
-Missions use different environments: Weak Goldbach is on `0df444a`, the
-matrix inequality mission on `c5ea003`. Trying a mission in a new environment
-means a new multi-gigabyte checkout, so check free space first.
+`formalize_statement.sh` runs `setup` itself. Missions use different
+environments (Weak Goldbach is on `0df444a`, the matrix inequality mission on
+`c5ea003`), and each new one is another multi-gigabyte checkout.
 
 ## 1. Unit tests (offline)
 
@@ -91,26 +73,19 @@ means a new multi-gigabyte checkout, so check free space first.
 uv run pytest tests/test_prove2me.py -q
 ```
 
-These replace the platform with an in-process fake, so they need no network
-and no key. They cover key loading and expiry, re-authentication, the host
-restriction, mission lookup across pages, mirroring, the local gates, verdict
-and publish-job polling, and the `verify` and `publish` commands.
-
-The checks that tie the skill and CLI into the plugin:
+These use an in-process fake of the platform: no network, no key. They cover
+the key lookup, the host restriction, mirroring, the local gates, polling, and
+the `verify`, `publish`, `propose`, and `setup` commands. The plugin checks:
 
 ```bash
 uv run pytest tests/test_skill_examples.py tests/test_plugin_runtime.py tests/test_cli.py -q
 uv run ruff check autoform_cli servers tests
 ```
 
-About the full suite (`make test`):
-
-- `tests/test_skeleton.py` runs real Lean builds and can take over half an
-  hour. Skip it while iterating with `--ignore=tests/test_skeleton.py`.
-- Four `tests/test_scaffold.py` tests fail when `origin` uses an SSH alias
-  such as `org-…@github.com:facebookresearch/autoform-bot.git`: scaffolding
-  cannot derive a pinnable source from it and writes no CI. They fail the same
-  way without these changes.
+The full suite (`make test`) runs real Lean builds and takes over half an
+hour; skip them while iterating with `--ignore=tests/test_skeleton.py`. Four
+`tests/test_scaffold.py` tests fail when `origin` is an SSH alias
+(`org-…@github.com:…`), independently of Prove2Me.
 
 ## 2. Read-only commands against the live platform
 
@@ -161,59 +136,12 @@ pass. Passing here says nothing about the statement: that is the compile step.
 
 Without `--skip-compile`, `verify` refuses a Mathlib mismatch, re-mirrors the
 target, builds the solution, and checks
-`example : type_of% @<target> := @solution`. For this mission that needs a
-workspace pinned to `c5ea003`. Prove2Me's `references/lean-setup.md`
-recommends a second checkout rather than re-pinning the main one.
-
-Stage 0 prepares that checkout:
-
-```bash
-export PROVE2ME_WORKSPACE="$(uv run autoform prove2me setup \
-  --mission Positive_definite_matrix_integral_inequality --print-workspace)"
-```
-
-To confirm the pin resolved, `git -C "$PROVE2ME_WORKSPACE/.lake/packages/mathlib" rev-parse HEAD`
+`example : type_of% @<target> := @solution`. For this mission that needs the
+`c5ea003` checkout from stage 0 as `$PROVE2ME_WORKSPACE`. To confirm the pin
+resolved, `git -C "$PROVE2ME_WORKSPACE/.lake/packages/mathlib" rev-parse HEAD`
 must print `c5ea00351c28e24afc9f0f84379aa41082b1188f`. If
 `lake build Solutions.SmokeTest` ever starts compiling Mathlib modules one by
 one, the cache missed: stop it and rerun `lake exe cache get` in the checkout.
-
-<details>
-<summary>The same steps by hand</summary>
-
-The workspace repository does not ship `lean-toolchain` or `lakefile.lean`:
-both are gitignored and environment-specific, so a fresh clone has neither and
-`lake` fails with "no configuration file". The toolchain and `mathlib_rev`
-come from `uv run autoform prove2me get /environments`.
-
-```bash
-git clone https://github.com/prove2me/prove2me_workspace ~/prove2me-c5ea003
-cd ~/prove2me-c5ea003
-echo "leanprover/lean4:v4.30.0" > lean-toolchain
-cat > lakefile.lean <<'EOF'
-import Lake
-open Lake DSL
-
-package «prove2me» where
-  leanOptions := #[⟨`autoImplicit, false⟩]
-
-require mathlib from git
-  "https://github.com/leanprover-community/mathlib4.git" @
-  "c5ea00351c28e24afc9f0f84379aa41082b1188f"
-
-lean_lib «Definitions» where
-lean_lib «Theorems» where
-@[default_target]
-lean_lib «Solutions» where
-EOF
-lake update && lake exe cache get && lake build Solutions.SmokeTest
-cd -
-export PROVE2ME_WORKSPACE=~/prove2me-c5ea003
-```
-
-</details>
-
-Either way, the second checkout needs no copy of the key: without its own
-`credentials.json`, the CLI uses the one in `~/prove2me_workspace`.
 
 Then put solutions under `$PROVE2ME_WORKSPACE/Solutions/` and confirm each
 outcome:
@@ -278,7 +206,7 @@ Start Claude Code in the Prove2Me workspace with this checkout as the plugin:
 
 ```bash
 cd ~/prove2me_workspace
-claude --plugin-dir ~/Desktop/autoform-bot
+claude --plugin-dir /path/to/autoform-bot
 ```
 
 If autoform is also installed from the marketplace, disable that copy first
@@ -327,9 +255,9 @@ expired-key error before reaching `claude`. The `git pull` of the workspace
 may wait on the network; it only warns on failure.
 
 Statement mode works the same way, but its first real run creates
-`~/autoform_statements` and downloads Mathlib; use `--roadmap-only` or
-`--project <existing Mathlib project>` to avoid that while testing the
-plumbing.
+`~/autoform_statements` (or `$AUTOFORM_STATEMENTS_DIR`, which must be outside
+this checkout) and downloads Mathlib; use `--roadmap-only` or `--project` to
+avoid that.
 
 ## 7. The script, for real
 
@@ -344,12 +272,12 @@ needed but was not allowed shows up as a refused tool call in its final
 report. Drop `--dry-run` only once stages 4 and 5 look right: that run
 publishes under your account and the platform's Apache 2.0 terms.
 
-The third formalizes the statement, then drafts a mission proposal for it in
-the platform's default Mathlib and stops after `propose --dry-run`; the spec
-is left at `prove2me/proposal.json` in the statements workspace. Without
-`--dry-run` it uploads the proposal as a draft. Nothing in a draft is
-published until you confirm each item against its read-back under **My
-missions** on prove2.me and click **Submit Proposal**.
+The third also drafts a mission proposal in the platform's default Mathlib,
+choosing the type and fields itself (`--mission-type` overrides), and stops
+after `propose --dry-run` with the spec at `prove2me/proposal.json`. Without
+`--dry-run` it uploads a private draft; nothing is published until you
+confirm each item under **My missions** on prove2.me and click **Submit
+Proposal**.
 
 ## Troubleshooting
 
@@ -365,6 +293,8 @@ missions** on prove2.me and click **Submit Proposal**.
 | `No space left on device` during `lake update` | The disk filled mid-download. Delete the half-made checkout (it was created by that run) before retrying. |
 | `could not find platform module …` | An import names a theorem or definition the API could not resolve in that environment. |
 | `HTTP 429 … too many pending` | Wait for queued submissions or publish jobs to finish instead of resubmitting. |
+| `no Prove2Me API key` inside a script run | The session uses a per-environment checkout; rerun `setup` so it links the key there. |
+| Edits refused as "a sensitive file" | The statements workspace is inside this checkout (the plugin directory); move it out. |
 | `propose`: `… already exists and is not a local draft` | A mirrored platform module has that name in this environment; rename the draft item. |
 | `propose`: `can no longer be edited` | The proposal was submitted; after a moderator sends it back (`Changes requested`) it is editable again. |
 | `no visible Prove2Me mission matches` | The name differs from the URL slug, or the mission is private to someone else. |
