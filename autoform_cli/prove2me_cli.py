@@ -144,7 +144,7 @@ def _setup(args: argparse.Namespace) -> int:
         _say(f"cloning the Prove2Me workspace into {home}")
         prove2me.clone_workspace(home)
 
-    lookup = Path(args.workspace).expanduser() if args.workspace else home
+    lookup = prove2me.workspace_path(args.workspace) if args.workspace else home
     with _authenticated_client(lookup, home) as client:
         env = None
         if args.mission:
@@ -160,6 +160,9 @@ def _setup(args: argparse.Namespace) -> int:
     if needs_clone:
         _say(f"cloning {prove2me.WORKSPACE_REPO} into {workspace}")
         prove2me.clone_workspace(workspace)
+
+    if prove2me.share_credentials(workspace, home):
+        _say(f"linked {workspace / 'credentials.json'} to the key in {home}")
 
     if env:
         for name in prove2me.pin_environment(workspace, env):

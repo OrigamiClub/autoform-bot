@@ -53,8 +53,10 @@ class Credentials:
 
 
 def workspace_path(explicit: str | Path | None = None) -> Path:
+    # Absolute, so a path handed to another process still names the same
+    # directory after it changes directory.
     raw = explicit or os.environ.get("PROVE2ME_WORKSPACE") or DEFAULT_WORKSPACE
-    return Path(raw).expanduser()
+    return Path(os.path.abspath(Path(raw).expanduser()))
 
 
 def load_credentials(workspace: Path) -> Credentials:
@@ -983,6 +985,20 @@ def pin_environment(workspace: Path, env: dict) -> list[str]:
         lakefile.write_text(_LAKEFILE.format(rev=rev), encoding="utf-8")
         written.append("lakefile.lean")
     return written
+
+
+def share_credentials(workspace: Path, home: Path) -> bool:
+    """Link a per-environment checkout's credentials.json to the home workspace's.
+
+    A script that points PROVE2ME_WORKSPACE at the checkout hides the home
+    workspace from the key lookup. A symlink keeps one copy of the key, which
+    the workspace repository gitignores like the file itself.
+    """
+    target, link = home / "credentials.json", workspace / "credentials.json"
+    if workspace.resolve() == home.resolve() or not target.is_file() or link.exists() or link.is_symlink():
+        return False
+    link.symlink_to(target.resolve())
+    return True
 
 
 def mathlib_ready(workspace: Path) -> bool:

@@ -788,6 +788,31 @@ def test_setup_for_a_mission_pins_a_checkout_for_its_environment(
     assert prove2me.workspace_mathlib_rev(default_workspace).startswith("777aaa6")
 
 
+def test_a_checkout_set_up_from_a_relative_home_still_finds_the_key(
+    tmp_path: Path, default_workspace: Path, monkeypatch, capsys
+) -> None:
+    # formalize_statement.sh exports PROVE2ME_WORKSPACE as the checkout and then
+    # changes directory, so neither the relative home nor the env var reaches the key.
+    home = tmp_path / "volume" / "prove2me_workspace"
+    home.mkdir(parents=True)
+    (home / "credentials.json").write_text(json.dumps({"api_key": KEY}))
+    (home / "lakefile.lean").write_text(prove2me._LAKEFILE.format(rev="777aaa6" + "0" * 33))
+    (tmp_path / "volume" / "prove2me-c5ea003").mkdir()
+    monkeypatch.chdir(tmp_path / "volume")
+    monkeypatch.setenv("PROVE2ME_WORKSPACE", "prove2me_workspace")
+    _route_setup_client(monkeypatch, _mission_api(C5EA["mathlib_rev"]))
+
+    assert main(["prove2me", "setup", "--mission", "Weak_Goldbach_Conjecture", "--no-fetch", "--print-workspace"]) == 0
+    checkout = Path(capsys.readouterr().out.strip())
+
+    assert checkout == tmp_path / "volume" / "prove2me-c5ea003"
+    assert (checkout / "credentials.json").resolve() == (home / "credentials.json").resolve()
+    monkeypatch.setenv("PROVE2ME_WORKSPACE", str(checkout))
+    monkeypatch.chdir(tmp_path)
+    assert prove2me.load_credentials(prove2me.workspace_path()).api_key == KEY
+    assert prove2me.share_credentials(checkout, home) is False  # already linked
+
+
 def _mission_api(rev: str) -> FakeApi:
     return FakeApi({
         ("GET", "/missions"): {"missions": [{"id": "m", "name": "Weak Goldbach Conjecture",

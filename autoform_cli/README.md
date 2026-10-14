@@ -518,7 +518,9 @@ to the default workspace's `credentials.json` with owner-only permissions. With
 `--mission` (or `--env`) it also pins Mathlib: Prove2Me keeps one checkout per
 environment, so it uses the default workspace when that is unpinned or already
 matches, and otherwise a sibling `prove2me-<rev7>` checkout, writing the
-gitignored `lean-toolchain` and `lakefile.lean` and fetching Mathlib. An
+gitignored `lean-toolchain` and `lakefile.lean` and fetching Mathlib. Such a
+checkout gets a `credentials.json` symlink to the default workspace's key, so
+it still authenticates when `$PROVE2ME_WORKSPACE` points at it. An
 existing pin is never overwritten. Cloning and the multi-gigabyte Mathlib
 download are shown first and need a yes from the terminal or `--yes`, and the
 download is refused when less than about 16 GB is free. `--print-workspace`

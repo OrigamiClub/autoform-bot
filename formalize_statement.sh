@@ -144,6 +144,7 @@ if [[ -n "$PROVE2ME" ]]; then
   PROVE2ME_WORKSPACE="$(uv run --quiet --project "$ROOT" autoform prove2me setup \
     --mission "$PROVE2ME" --print-workspace)" || exit 1
   export PROVE2ME_WORKSPACE
+  uv run --quiet --project "$ROOT" autoform prove2me auth >/dev/null || exit 1
 
   git -C "$PROVE2ME_WORKSPACE" pull -q --ff-only \
     || echo "warning: could not update $PROVE2ME_WORKSPACE; continuing with local copy" >&2
@@ -287,6 +288,8 @@ if [[ "$PROPOSE" -eq 1 ]]; then
   # which is usually not the Mathlib this workspace got from 'lake init'.
   PROVE2ME_WORKSPACE="$(autoform prove2me setup --env default --print-workspace)" || exit 1
   export PROVE2ME_WORKSPACE
+  # Fail now, not after a long Claude run, if the session could not use the key.
+  autoform prove2me auth >/dev/null || exit 1
   EXTRA_DIRS+=("$PROVE2ME_WORKSPACE")
   # Agent runs the blind read-backs; the web tools find the literature.
   EXTRA_TOOLS+=("Agent" "WebFetch" "WebSearch")
