@@ -20,7 +20,7 @@ ROADMAP_ONLY=0
 MODEL=""
 PROVE2ME=""
 PROPOSE=0
-MISSION_TYPE="OpenProblem"
+MISSION_TYPE=""
 MISSION_TITLE=""
 DRY_RUN=0
 
@@ -47,7 +47,8 @@ Proposing a Prove2Me mission from the statement:
                    'autoform prove2me propose'. The proposal stays a private
                    draft until you confirm its items and click Submit
                    Proposal on prove2.me (homepage > My missions).
-  --mission-type T OpenProblem (default), Textbook, or ResearchPaper.
+  --mission-type T OpenProblem, Textbook, or ResearchPaper (default: Claude
+                   picks the one that fits the statement).
   --mission-title T  Mission name (default: Claude chooses one).
 
 Prove2Me:
@@ -91,7 +92,7 @@ if [[ "$PROPOSE" -eq 1 ]]; then
   [[ -z "$PROVE2ME" ]] || { echo "error: --propose and --prove2me are separate modes" >&2; exit 2; }
   [[ "$ROADMAP_ONLY" -eq 0 ]] || { echo "error: --propose needs the Lean statement; drop --roadmap-only" >&2; exit 2; }
   case "$MISSION_TYPE" in
-    OpenProblem|Textbook|ResearchPaper) ;;
+    ""|OpenProblem|Textbook|ResearchPaper) ;;
     *) echo "error: --mission-type must be OpenProblem, Textbook, or ResearchPaper" >&2; exit 2 ;;
   esac
 fi
@@ -294,6 +295,16 @@ if [[ "$PROPOSE" -eq 1 ]]; then
   # Agent runs the blind read-backs; the web tools find the literature.
   EXTRA_TOOLS+=("Agent" "WebFetch" "WebSearch")
 
+  if [[ -n "$MISSION_TYPE" ]]; then
+    TYPE_LINE="$MISSION_TYPE, as the user chose. If it does not describe the
+     statement (for example OpenProblem for a known result), keep it but say
+     so plainly in your report."
+  else
+    TYPE_LINE="choose the one that fits, as defined in the captain guide:
+     OpenProblem for a question that is genuinely unsolved, Textbook for a
+     known result or exercise, ResearchPaper for a result from a specific
+     paper. Give your reason in the report."
+  fi
   MISSION_NAME="a short descriptive name of your choice"
   [[ -z "$MISSION_TITLE" ]] || MISSION_NAME="\"$MISSION_TITLE\""
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -311,10 +322,13 @@ if [[ "$PROPOSE" -eq 1 ]]; then
 4. After that commit, draft a Prove2Me mission proposal for this statement with the
    autoform:prove2me skill, following its 'Propose a mission' section.
    - Name: $MISSION_NAME.
-   - Type: $MISSION_TYPE, visibility public (it stays a private draft
-     until the user submits it). If $MISSION_TYPE does not describe the
-     statement (for example OpenProblem for a known result), keep it but
-     say so plainly in your report.
+   - Type: $TYPE_LINE
+     Visibility public (it stays a private draft until the user submits it).
+   - Fields: tag it with the established Prove2Me field(s) that fit best,
+     found with 'prove2me get /fields --param q=...'. Do not create a field.
+   - Before drafting the goal, search for an existing published statement
+     ('prove2me get /theorems --param q=...') and use it as a reference item
+     if one is faithful.
    - The Prove2Me workspace is $PROVE2ME_WORKSPACE, pinned to the
      platform's default Mathlib and exported as PROVE2ME_WORKSPACE. The goal
      is the statement you formalized above, restated as a draft ending in
@@ -331,7 +345,7 @@ echo "==> Running AutoformBot on: $STATEMENT"
 echo "    article: $PROJECT/blueprint/roadmap/$SLUG.md"
 [[ "$ROADMAP_ONLY" -eq 1 ]] || echo "    lean:    $PROJECT/$LEAN_FILE"
 if [[ "$PROPOSE" -eq 1 ]]; then
-  echo "    proposal: Prove2Me $MISSION_TYPE draft, built in $PROVE2ME_WORKSPACE"
+  echo "    proposal: Prove2Me ${MISSION_TYPE:-mission} draft, built in $PROVE2ME_WORKSPACE"
   [[ "$DRY_RUN" -eq 0 ]] || echo "    dry run: nothing will be uploaded"
 fi
 cd "$PROJECT"
