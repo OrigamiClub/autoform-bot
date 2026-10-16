@@ -13,11 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote, urlsplit
 
-from .graph import Graph, load_graph
-from .lean import declaration_names, index_project
+from .graph import Graph, load_graph, roadmap_symlink_issues
+from .lean import LeanSourceError, declaration_names, index_failure_message, index_project, resolve_lean_root
 from .status import derive, is_definition
 
-RUNTIME_SCHEMA = "autoform-runtime/v1"
+RUNTIME_SCHEMA = "autoform-runtime/v3"
 RUNTIME_AUTHORITY = "markdown-articles"
 
 
@@ -42,6 +42,7 @@ class RuntimeAssertions:
     """Authored facts copied from article frontmatter."""
 
     statement_formalized: bool
+    statement_retracted: bool
     proof_formalized: bool
     not_ready: bool
 
@@ -50,6 +51,7 @@ class RuntimeAssertions:
             "not_ready": self.not_ready,
             "proof_formalized": self.proof_formalized,
             "statement_formalized": self.statement_formalized,
+            "statement_retracted": self.statement_retracted,
         }
 
 
@@ -64,9 +66,12 @@ class RuntimeStatus:
     proved: bool
     fully_proved: bool
     defined: bool
+    assumes: tuple[str, ...]
+    waiting_on: tuple[str, ...]
 
-    def as_dict(self) -> dict[str, bool | str]:
+    def as_dict(self) -> dict[str, bool | str | list[str]]:
         return {
+            "assumes": list(self.assumes),
             "can_prove": self.can_prove,
             "can_state": self.can_state,
             "defined": self.defined,
@@ -74,6 +79,7 @@ class RuntimeStatus:
             "proved": self.proved,
             "state": self.state,
             "stated": self.stated,
+            "waiting_on": list(self.waiting_on),
         }
 
 
@@ -96,6 +102,8 @@ class RuntimeNode:
     """One immutable article record exposed to runtime consumers."""
 
     id: str
+    article_id: str | None
+    source_sha256: str | None
     title: str
     article_path: str
     parent: str | None
@@ -117,6 +125,7 @@ class RuntimeNode:
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "article_id": self.article_id,
             "article_path": self.article_path,
             "assertions": self.assertions.as_dict(),
             "declaration": self.declaration,
@@ -133,6 +142,7 @@ class RuntimeNode:
             "parent": self.parent,
             "proof_dependencies": list(self.proof_dependencies),
             "source_targets": list(self.source_targets),
+            "source_sha256": self.source_sha256,
             "statement_dependencies": list(self.statement_dependencies),
             "status": self.status.as_dict(),
             "title": self.title,
@@ -153,6 +163,7 @@ class RuntimeGraph:
     dispatchable_count: int
     dependency_count: int
     maximum_depth: int
+    open_statements: bool = False
 
     def get(self, node_id: str) -> RuntimeNode | None:
         """Return a node without exposing mutable lookup state."""
@@ -171,6 +182,7 @@ class RuntimeGraph:
             "formalizable_count": self.formalizable_count,
             "maximum_depth": self.maximum_depth,
             "nodes": [node.as_dict() for node in self.nodes],
+            "open_statements": self.open_statements,
             "schema": self.schema,
             "source_revision": self.source_revision,
         }
@@ -234,7 +246,13 @@ def build_runtime_graph(
     project_root: str | Path,
     lean_root: str | Path | None = None,
 ) -> RuntimeGraph:
-    """Copy an already validated canonical graph into the runtime contract."""
+    """Copy an already validated canonical graph into the runtime contract.
+
+    Raises ``RuntimeProjectionError``, with a retry hint, when an article's
+    bytes no longer match the digest ``load_graph`` recorded. A hand-built
+    node without a digest is not checked; the source revision covers whatever
+    bytes its article holds when projected.
+    """
 
     project = Path(project_root).expanduser().resolve()
     blueprint = graph.blueprint_dir.resolve()
@@ -247,6 +265,7 @@ def build_runtime_graph(
     _reject_roadmap_symlinks(blueprint)
     node_ids = set(graph.nodes)
     article_paths: dict[str, str] = {}
+    seen_article_paths: set[str] = set()
     revision_paths: dict[str, str] = {}
     article_bytes: dict[str, bytes] = {}
 
@@ -281,18 +300,21 @@ def build_runtime_graph(
         except OSError:
             issues.append(f"{node.id}: article cannot be read")
             continue
+        # The source revision hashes these bytes, so they must be the bytes the
+        # node was parsed from. A hand-built node without a digest makes no
+        # snapshot claim, and the revision covers whatever bytes are read here.
+        if node.source_sha256 is not None and hashlib.sha256(content).hexdigest() != node.source_sha256:
+            issues.append(
+                f"{node.id}: the article changed after the graph was loaded; "
+                "load the graph again, or retry after the project is idle"
+            )
         article_path = relative_project.as_posix()
-        if article_path in article_paths.values():
+        if article_path in seen_article_paths:
             issues.append(f"{node.id}: article path is duplicated")
+        seen_article_paths.add(article_path)
         article_paths[node.id] = article_path
         revision_paths[node.id] = relative_blueprint.as_posix()
         article_bytes[node.id] = content
-
-        for target in node.sources:
-            if not _source_target_is_confined(node.path, target, blueprint):
-                issues.append(f"{node.id}: source target escapes the blueprint or uses an unsupported location")
-        if node.mathlib_file is not None and not _is_portable_relative_path(node.mathlib_file):
-            issues.append(f"{node.id}: mathlib file must be a portable relative path")
 
     _validate_depths(graph, issues)
     if issues:
@@ -301,63 +323,67 @@ def build_runtime_graph(
     statuses = derive(graph)
     lean_index = None
     if lean_root is not None:
-        root = Path(lean_root).expanduser().resolve()
-        if not root.is_dir():
-            raise RuntimeProjectionError(["Lean root does not exist or is not a directory"])
-        lean_index = index_project(root)
+        try:
+            root = resolve_lean_root(lean_root)
+        except LeanSourceError as error:
+            raise RuntimeProjectionError([str(error)]) from error
+        try:
+            lean_index = index_project(root)
+        except OSError as error:
+            raise RuntimeProjectionError([index_failure_message(error)]) from error
 
+    parents = {node.parent for node in graph.nodes.values() if node.parent is not None}
     runtime_nodes: list[RuntimeNode] = []
     for node_id in sorted(graph.nodes):
         node = graph.nodes[node_id]
         node_status = statuses[node_id]
-        can_state = all(statuses[dependency].stated for dependency in node.statement_dependencies)
-        can_prove = (
-            node_status.stated
-            and can_state
-            and all(statuses[dependency].proved for dependency in node.proof_dependencies)
-        )
-        children = graph.children(node_id)
         lean_targets: list[RuntimeLeanTarget] = []
         for name in declaration_names(node.lean or ""):
             declaration = lean_index.find(name) if lean_index is not None else None
             source_file = declaration.path.as_posix() if declaration is not None else None
-            if source_file is not None and not _is_portable_relative_path(source_file):
-                raise RuntimeProjectionError([f"{node.id}: Lean source file escapes the Lean root"])
             lean_targets.append(RuntimeLeanTarget(name, source_file))
-
         runtime_nodes.append(
             RuntimeNode(
                 id=node.id,
+                article_id=node.article_id,
+                source_sha256=node.source_sha256,
                 title=node.title,
                 article_path=article_paths[node.id],
                 parent=node.parent,
                 depth=node.depth,
                 declaration=node.declaration,
                 formalizable=node.formalizable,
-                dispatchable=node.formalizable and not children,
+                dispatchable=node.formalizable and node_id not in parents,
                 statement_dependencies=node.statement_dependencies,
                 proof_dependencies=node.proof_dependencies,
                 dependencies=node.dependencies,
                 assertions=RuntimeAssertions(
                     statement_formalized=node.statement_formalized,
+                    statement_retracted=node.statement_retracted,
                     proof_formalized=node.proof_formalized,
                     not_ready=node.not_ready,
                 ),
                 status=RuntimeStatus(
                     state=node_status.key,
-                    can_state=can_state,
-                    can_prove=can_prove,
+                    can_state=node_status.can_state,
+                    can_prove=node_status.can_prove,
                     stated=node_status.stated,
                     proved=node_status.proved,
                     fully_proved=node_status.fully_proved,
                     defined=is_definition(node) and node_status.stated,
+                    assumes=node_status.assumes,
+                    waiting_on=node_status.waiting_on,
                 ),
                 origin=node.origin,
-                source_targets=node.sources,
+                # Leave out a value the projection cannot represent instead of
+                # refusing the whole project.
+                source_targets=tuple(
+                    target for target in node.sources if _source_target_is_confined(node.path, target, blueprint)
+                ),
                 lean_targets=tuple(lean_targets),
                 mathlib=node.mathlib,
                 mathlib_declarations=tuple(declaration_names(node.mathlib_declaration or "")),
-                mathlib_file=node.mathlib_file.replace("\\", "/") if node.mathlib_file else None,
+                mathlib_file=_portable_mathlib_file(node.mathlib_file),
             )
         )
 
@@ -373,6 +399,7 @@ def build_runtime_graph(
         dispatchable_count=sum(node.dispatchable for node in nodes),
         dependency_count=sum(len(node.dependencies) for node in nodes),
         maximum_depth=max((node.depth for node in nodes), default=0),
+        open_statements=graph.open_statements,
     )
     _validate_runtime(runtime)
     return runtime
@@ -382,18 +409,18 @@ def _reject_roadmap_symlinks(blueprint: Path) -> None:
     roadmap = blueprint / "roadmap"
     if not roadmap.is_dir():
         raise RuntimeProjectionError(["roadmap directory does not exist"])
-    for path in (roadmap, *sorted(roadmap.rglob("*"))):
-        if path.is_symlink():
-            try:
-                label = path.relative_to(blueprint).as_posix()
-            except ValueError:
-                label = "roadmap"
-            raise RuntimeProjectionError([f"roadmap contains a symbolic link: {label}"])
+    symlink_issues = roadmap_symlink_issues(blueprint)
+    if symlink_issues:
+        raise RuntimeProjectionError(symlink_issues)
 
 
 def _ordered_union(first: tuple[str, ...], second: tuple[str, ...]) -> tuple[str, ...]:
     values = list(first)
-    values.extend(value for value in second if value not in values)
+    seen = set(values)
+    for value in second:
+        if value not in seen:
+            values.append(value)
+            seen.add(value)
     return tuple(values)
 
 
@@ -425,29 +452,75 @@ def _source_target_is_confined(article: Path, target: str, blueprint: Path) -> b
     return True
 
 
-def _is_portable_relative_path(value: str) -> bool:
-    path = Path(value)
-    windows = PureWindowsPath(value)
-    return (
-        not path.is_absolute()
-        and not windows.is_absolute()
-        and ".." not in path.parts
-        and ".." not in windows.parts
-    )
+def _portable_mathlib_file(value: str | None) -> str | None:
+    # A Windows anchor covers POSIX absolute paths too, and also the
+    # drive-relative C:x and rooted \x, which are not absolute but do not name
+    # a path inside the project either.
+    windows = PureWindowsPath(value or "")
+    if not value or windows.anchor or ".." in windows.parts:
+        return None
+    return value.replace("\\", "/")
+
+
+def projection_omissions(graph: Graph) -> list[str]:
+    """Name each value work and search leave out of the projection, for check to warn about."""
+    blueprint = graph.blueprint_dir.resolve()
+    omissions = []
+    for node in graph.nodes.values():
+        for target in node.sources:
+            if not _source_target_is_confined(node.path, target, blueprint):
+                omissions.append(
+                    f"{node.id}: work and search omit this source target, which is neither an http(s) link "
+                    f"nor a path inside the blueprint: {target!r}"
+                )
+        if node.mathlib_file and _portable_mathlib_file(node.mathlib_file) is None:
+            omissions.append(
+                f"{node.id}: search reports mathlib_file as null, since it is not a portable relative path: "
+                f"{node.mathlib_file!r}"
+            )
+    return omissions
 
 
 def _validate_depths(graph: Graph, issues: list[str]) -> None:
+    resolved: dict[str, int] = {}
     for node_id in sorted(graph.nodes):
         node = graph.nodes[node_id]
-        seen: set[str] = set()
-        parent = node.parent
-        depth = 0
-        while parent is not None:
-            if parent in seen or parent not in graph.nodes:
-                break
-            seen.add(parent)
-            depth += 1
-            parent = graph.nodes[parent].parent
+        if node_id not in resolved:
+            trail: list[str] = []
+            seen: set[str] = set()
+            current = node_id
+            valid = True
+            while current not in resolved:
+                if current in seen or current not in graph.nodes:
+                    valid = False
+                    break
+                seen.add(current)
+                trail.append(current)
+                parent = graph.nodes[current].parent
+                if parent is None:
+                    depth = -1
+                    break
+                current = parent
+            else:
+                depth = resolved[current]
+
+            if valid:
+                for candidate in reversed(trail):
+                    depth += 1
+                    resolved[candidate] = depth
+
+        if node_id in resolved:
+            depth = resolved[node_id]
+        else:
+            seen = set()
+            parent = node.parent
+            depth = 0
+            while parent is not None:
+                if parent in seen or parent not in graph.nodes:
+                    break
+                seen.add(parent)
+                depth += 1
+                parent = graph.nodes[parent].parent
         if node.depth != depth:
             issues.append(f"{node.id}: depth does not match the parent chain")
 
@@ -467,6 +540,9 @@ def _source_revision(article_paths: dict[str, str], article_bytes: dict[str, byt
 def _validate_runtime(runtime: RuntimeGraph) -> None:
     issues: list[str] = []
     nodes = {node.id: node for node in runtime.nodes}
+    parents_with_children = {
+        node.parent for node in runtime.nodes if node.parent is not None
+    }
     if len(nodes) != len(runtime.nodes):
         issues.append("runtime node ids are not unique")
     for node in runtime.nodes:
@@ -476,7 +552,7 @@ def _validate_runtime(runtime: RuntimeGraph) -> None:
             issues.append(f"{node.id}: runtime dependency union is inconsistent")
         if any(dependency not in nodes for dependency in node.dependencies):
             issues.append(f"{node.id}: runtime dependency does not resolve")
-        has_children = any(other.parent == node.id for other in runtime.nodes)
+        has_children = node.id in parents_with_children
         if node.dispatchable and (not node.formalizable or has_children):
             issues.append(f"{node.id}: dispatchable node is not a formalizable leaf")
         if Path(node.article_path).is_absolute() or PureWindowsPath(node.article_path).is_absolute():
@@ -507,5 +583,6 @@ __all__ = [
     "RuntimeStatus",
     "build_runtime_graph",
     "load_runtime_graph",
+    "projection_omissions",
     "resolve_runtime_paths",
 ]

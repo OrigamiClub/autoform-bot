@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from autoform_cli.graph import Graph, Node, load_graph
+from autoform_cli.lean import LeanSourceError
 from autoform_cli.runtime import (
     RUNTIME_AUTHORITY,
     RUNTIME_SCHEMA,
@@ -51,6 +52,7 @@ def _project(tmp_path: Path) -> Path:
         project,
         "chapter/section/base.md",
         title="Base",
+        article_id="af_000000000000000000000001",
         declaration="definition",
         statement="formalized",
         lean="Project.base",
@@ -60,6 +62,7 @@ def _project(tmp_path: Path) -> Path:
         project,
         "chapter/section/result.md",
         title="Result",
+        article_id="af_000000000000000000000002",
         declaration="theorem",
         statement="formalized",
         proof="formalized",
@@ -81,6 +84,7 @@ def test_loads_identical_runtime_from_project_or_blueprint(tmp_path: Path) -> No
     from_project = load_runtime_graph(project)
     from_blueprint = load_runtime_graph(project / "blueprint")
 
+    assert RUNTIME_SCHEMA == "autoform-runtime/v3"
     assert from_project == from_blueprint
     assert from_project.schema == RUNTIME_SCHEMA
     assert from_project.authority == RUNTIME_AUTHORITY
@@ -107,6 +111,8 @@ def test_preserves_hierarchy_typed_dependencies_and_dispatchability(tmp_path: Pa
 
     assert chapter is not None and not chapter.formalizable and not chapter.dispatchable
     assert base is not None and base.dispatchable
+    assert base.article_id == "af_000000000000000000000001"
+    assert len(base.source_sha256) == 64
     assert base.status.state == "fully_proved"
     assert base.status.defined
     assert result is not None
@@ -159,6 +165,9 @@ def test_serialization_is_deterministic_relative_and_deeply_immutable(tmp_path: 
 
     assert json.loads(runtime.to_json()) == payload
     assert runtime.to_json() == load_runtime_graph(project).to_json()
+    base = next(node for node in payload["nodes"] if node["id"] == "chapter/section/base")
+    assert base["article_id"] == "af_000000000000000000000001"
+    assert base["source_sha256"] == runtime.get("chapter/section/base").source_sha256
     assert str(tmp_path) not in runtime.to_json()
     assert all(not Path(node.article_path).is_absolute() for node in runtime.nodes)
     assert isinstance(runtime.nodes, tuple)
@@ -183,6 +192,22 @@ def test_revision_tracks_exact_articles_and_is_location_independent(tmp_path: Pa
 
     changed = load_runtime_graph(first_project)
     assert changed.source_revision != first.source_revision
+
+
+def test_runtime_refuses_an_article_edited_after_graph_load(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    graph = load_graph(project / "blueprint")
+    article = project / "blueprint" / "roadmap" / "chapter" / "section" / "result.md"
+    article.write_text(article.read_text(encoding="utf-8").replace("# Result", "# Edited"), encoding="utf-8")
+
+    with pytest.raises(RuntimeProjectionError) as error:
+        build_runtime_graph(graph, project_root=project)
+
+    assert error.value.issues == (
+        "chapter/section/result: the article changed after the graph was loaded; "
+        "load the graph again, or retry after the project is idle",
+    )
+    assert load_runtime_graph(project).get("chapter/section/result").title == "Edited"  # type: ignore[union-attr]
 
 
 def test_loading_is_read_only_and_never_creates_graph_json(tmp_path: Path) -> None:
@@ -218,7 +243,7 @@ def test_rejects_symlinked_roadmap_content_and_ambiguous_input(tmp_path: Path) -
         resolve_runtime_paths(ambiguous)
 
 
-def test_allows_confined_parent_relative_sources_and_rejects_escapes(tmp_path: Path) -> None:
+def test_keeps_confined_parent_relative_sources_and_omits_the_rest(tmp_path: Path) -> None:
     project = _project(tmp_path)
     source = project / "blueprint" / "sources" / "paper.md"
     source.parent.mkdir(parents=True)
@@ -233,24 +258,68 @@ def test_allows_confined_parent_relative_sources_and_rejects_escapes(tmp_path: P
     runtime = load_runtime_graph(project)
     assert runtime.get("chapter/section/result").source_targets == ("../../../sources/paper.md",)  # type: ignore[union-attr]
 
-    result.write_text(text.replace("../../../sources/paper.md", "../../../../outside.md"), encoding="utf-8")
-    with pytest.raises(RuntimeProjectionError, match="source target escapes") as error:
-        load_runtime_graph(project)
-    assert str(tmp_path) not in str(error.value)
+    # The projection leaves out each target it cannot represent and keeps the
+    # rest, instead of refusing the project.
+    mixed = "\n".join(
+        f"- [source]({target})"
+        for target in ("../../../../outside.md", "../../../sources/paper.md", "mailto:author@example.org")
+    )
+    result.write_text(text.replace("- [source](../../../sources/paper.md)", mixed), encoding="utf-8")
+    node = load_runtime_graph(project).get("chapter/section/result")
+    assert node is not None and node.source_targets == ("../../../sources/paper.md",)
 
 
-def test_rejects_nonportable_authored_file_paths(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (r"Mathlib\Result.lean", "Mathlib/Result.lean"),
+        (r"..\outside.lean", None),
+        ("../outside.lean", None),
+        ("/Mathlib/Result.lean", None),
+        ("C:/Mathlib/Result.lean", None),
+        # Neither is absolute on Windows, but neither names a path inside the project.
+        (r"\Mathlib\Result.lean", None),
+        ("C:Mathlib/Result.lean", None),
+    ],
+)
+def test_projects_mathlib_file_only_as_a_portable_relative_path(
+    value: str, expected: str | None, tmp_path: Path
+) -> None:
     project = _project(tmp_path)
     result = project / "blueprint" / "roadmap" / "chapter" / "section" / "result.md"
-    text = result.read_text(encoding="utf-8").replace(
-        "mathlib_file: Mathlib/Result.lean",
-        r"mathlib_file: ..\outside.lean",
-    )
+    text = result.read_text(encoding="utf-8").replace("mathlib_file: Mathlib/Result.lean", f"mathlib_file: {value}")
     result.write_text(text, encoding="utf-8")
 
-    with pytest.raises(RuntimeProjectionError, match="mathlib file must be a portable relative path") as error:
-        load_runtime_graph(project)
+    node = load_runtime_graph(project).get("chapter/section/result")
+    assert node is not None and node.mathlib_file == expected
 
+
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        (None, "Lean sources could not be indexed"),
+        (
+            "permission denied: Project/Secret.lean",
+            "Lean sources could not be indexed: permission denied: Project/Secret.lean",
+        ),
+    ],
+)
+def test_runtime_translates_source_index_io_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str | None, message: str
+) -> None:
+    project = _project(tmp_path)
+
+    def fail_index(root: Path):
+        if reason is not None:
+            raise LeanSourceError(reason)
+        raise OSError(f"private host detail: {root}")
+
+    monkeypatch.setattr("autoform_cli.runtime.index_project", fail_index)
+
+    with pytest.raises(RuntimeProjectionError) as error:
+        load_runtime_graph(project, lean_root=project)
+
+    assert error.value.issues == (message,)
     assert str(tmp_path) not in str(error.value)
 
 
@@ -277,3 +346,93 @@ def test_adapter_rejects_inconsistent_hand_built_graph_without_host_paths(tmp_pa
         "chapter/section/base: dependency union does not match typed dependencies",
     )
     assert str(tmp_path) not in str(error.value)
+
+
+def _policy_project(tmp_path: Path, policy: str | None) -> Path:
+    """`_project` plus an open theorem, a reduction proved from it, and a statement waiting on a gap."""
+    project = _project(tmp_path)
+    if policy is not None:
+        _article(project, "README.md", title="Roadmap", open_statements=policy)
+    theorem = {"declaration": "theorem", "statement": "formalized"}
+    _article(project, "chapter/section/open.md", title="Open", lean="Project.open_thm", **theorem)
+    _article(
+        project,
+        "chapter/section/reduction.md",
+        title="Reduction",
+        lean="Project.reduction",
+        proof="formalized",
+        proof_dependencies=("open.md",),
+        **theorem,
+    )
+    _article(project, "chapter/section/gap.md", title="Gap", declaration="theorem")
+    _article(
+        project,
+        "chapter/section/waiting.md",
+        title="Waiting",
+        lean="Project.waiting",
+        proof_dependencies=("gap.md",),
+        **theorem,
+    )
+    return project
+
+
+def _status_payloads(project: Path) -> tuple[bool, dict[str, dict[str, object]]]:
+    payload = json.loads(load_runtime_graph(project).to_json())
+    return payload["open_statements"], {
+        node["id"].removeprefix("chapter/section/"): node["status"] for node in payload["nodes"]
+    }
+
+
+def test_strict_runtime_readiness_comes_from_the_derived_status(tmp_path: Path) -> None:
+    """Runtime readiness once ignored proof prerequisites that `work list` enforced."""
+    open_statements, statuses = _status_payloads(_policy_project(tmp_path, None))
+
+    assert open_statements is False
+    reduction = statuses["reduction"]
+    assert (reduction["state"], reduction["can_state"], reduction["can_prove"]) == ("proved", False, False)
+    assert (reduction["assumes"], reduction["waiting_on"]) == ([], [])
+    waiting = statuses["waiting"]
+    assert (waiting["state"], waiting["can_state"], waiting["can_prove"]) == ("stated", False, False)
+    assert waiting["waiting_on"] == ["chapter/section/gap"]
+    assert all(status["assumes"] == [] for status in statuses.values())
+
+
+def test_open_runtime_records_the_policy_and_what_each_proof_assumes(tmp_path: Path) -> None:
+    open_statements, statuses = _status_payloads(_policy_project(tmp_path, "allowed"))
+
+    assert open_statements is True
+    reduction = statuses["reduction"]
+    assert (reduction["state"], reduction["can_state"], reduction["can_prove"]) == ("conditional", True, True)
+    assert reduction["assumes"] == ["chapter/section/open"]
+    assert reduction["waiting_on"] == []
+    assert not reduction["fully_proved"]
+    waiting = statuses["waiting"]
+    assert (waiting["state"], waiting["can_state"], waiting["can_prove"]) == ("stated", True, False)
+    assert (waiting["assumes"], waiting["waiting_on"]) == ([], ["chapter/section/gap"])
+    assert statuses["open"]["state"] == "can_prove"
+    assert statuses["open"]["assumes"] == []
+
+
+def test_runtime_assertions_record_a_retracted_statement(tmp_path: Path) -> None:
+    project = _policy_project(tmp_path, "allowed")
+    _article(
+        project,
+        "chapter/section/open.md",
+        title="Open",
+        declaration="theorem",
+        statement="retracted",
+        lean="Project.open_thm",
+    )
+
+    payload = json.loads(load_runtime_graph(project).to_json())
+    nodes = {node["id"].removeprefix("chapter/section/"): node for node in payload["nodes"]}
+
+    assert nodes["open"]["assertions"] == {
+        "not_ready": False,
+        "proof_formalized": False,
+        "statement_formalized": False,
+        "statement_retracted": True,
+    }
+    assert nodes["reduction"]["assertions"]["statement_retracted"] is False
+    # The old declaration stays in the build, so the reduction still rests on it.
+    assert nodes["reduction"]["status"]["assumes"] == ["chapter/section/open"]

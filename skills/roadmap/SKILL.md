@@ -1,168 +1,174 @@
 ---
 name: roadmap
 description: >-
-  Build, inspect, refine, or visualize the mathematical roadmap and theorem
-  dependency DAG in an existing Autoform Markdown blueprint. Use for discovering
-  prior work, choosing or drafting mathematical sources, confirming scope,
-  writing roadmap and coverage notes, decomposing mathematics into Markdown
-  article pages under blueprint/roadmap/, or
-  checking roadmap completeness; do not install repository infrastructure or
-  prove Lean declarations.
+  Build, continue, inspect, or visualize a source-grounded mathematical roadmap
+  and theorem DAG in an existing Autoform Markdown blueprint. Use for source
+  research, scope, coverage, milestones, and roadmap articles; do not create
+  repository infrastructure or prove Lean declarations.
 ---
 
 # Build an Autoform roadmap
 
-Turn an agreed mathematical specification into a human-editable roadmap and a
-DAG of pull-request-sized formalization units. Keep Markdown as the sole source
-of truth. Use `internal/runbooks/planning.md` for the preserved detailed planning
-workflow when this concise skill needs deeper operational guidance.
+Maintain an ordered mathematical book whose formalizable leaves form a
+dependency DAG of coherent, pull-request-sized units. Markdown under
+`blueprint/` is the source of truth. Consult the
+[format and command reference](../../autoform_cli/README.md) only when exact
+syntax or CLI usage is needed, and the
+[worked example](references/cabannes-thesis-roadmap.md) only when a concrete
+source-to-DAG pattern would help.
 
-## Discover prior work and sources
+There is no `autoform` on `PATH` in a Lean project. Run every `autoform`
+command, from the Lean project root, as
+`uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform` followed by its arguments,
+where `<AUTOFORM_PLUGIN_ROOT>` is the absolute plugin root: the directory that
+holds this skill's `skills/` folder, along with `pyproject.toml` and
+`autoform_cli/`. Give a subagent that root and this prefix with its task.
 
-Before fixing the architecture, search the pinned Mathlib checkout for existing
-primitives and gaps. When network access is available, also make targeted,
-read-only searches of relevant GitHub pull requests and issues, Zulip topics,
-and authoritative mathematical literature. Report overlapping work, active
-contributors, design rationale, and candidate references; never contact people
-or post externally without explicit user approval.
+## Own the whole pass
 
-For Zulip discovery or project coordination, follow Setup's
-[shared opt-in Zulip workflow](../setup/references/zulip.md).
+Honor a request explicitly limited to inspection, audit, status, or
+visualization. Otherwise, a direct user invocation of Roadmap requests one
+complete planning pass over the source boundary named by the user or already
+adopted by the vault.
 
-Distinguish implementation prior art from mathematical sources. Let the user
-choose whether to adopt a reference, ask the agent to locate one, or develop a
-project-authored specification collaboratively. For the last option, brainstorm
-the representation and downstream API first, then record explicit definitions,
-assumptions, intended equivalences, and unresolved choices under
-`blueprint/sources/`; label this material as project-authored rather than
-implying external provenance. Do not expand a fine DAG until its statements are
-grounded in an adopted reference or this agreed specification.
+That direct invocation explicitly requests persistent execution. When the
+runtime exposes a model-callable Goal lifecycle, use it before other work:
+continue a compatible active Goal or create one for a complete, validated,
+reconciled, and committed roadmap of that source boundary. Do not set a token
+budget unless the user supplied one, and never replace an unrelated active
+Goal. Do not ask the user to invoke another command, shell out to a host's
+interactive goal command, or substitute todos or repository files for native
+continuation. If no compatible Goal can be used, complete the same pass in the
+current run and leave any unrelated Goal unchanged.
 
-## Establish the planning boundary
+Treat source discovery, coarse coverage, chapter boundaries, fine
+decomposition, and validation as internal checkpoints. Do not pause for
+approval unless the user requested staged review. Make reversible choices and
+record assumptions. Ask one concise question only after inspection cannot
+identify or access the source, or when incompatible scope choices remain and
+choosing one would discard accepted work.
 
-Inspect the Lean repository and existing `blueprint/` before writing. Require
-the vault, ignore rules, and site configuration to exist; if they do not, hand
-the task to Setup rather than creating repository infrastructure here.
+## Ground and decompose
 
-State the exact source files, requested chapters or sections, current roadmap
-state, and files that may change. Do not infer missing scope or silently reset
-existing notes. Preserve accepted material and ask before replacing it.
+Inspect the repository and existing vault before writing. Preserve accepted
+material and unrelated changes; send missing infrastructure to Setup. Formalize
+owns Lean execution after this skill produces a validated ready frontier.
 
-Read the concise [Cabannes thesis roadmap](references/cabannes-thesis-roadmap.md)
-when a concrete source-to-DAG pattern is useful. Adapt its method, never its
-mathematics.
+Work from exact source passages. Record stable source locations, assumptions,
+and uncovered prerequisites under `blueprint/sources/`; label project-authored
+specifications honestly. Search the pinned Mathlib checkout and every usable
+shared library before planning a replacement. External research is read-only,
+and contacting people requires permission. Read [Setup's Zulip workflow](../setup/references/zulip.md) only for
+requested Zulip work.
 
-## Build from coarse to fine
+Before adding a formalizable article, run `autoform search` over the blueprint
+for its result, by a few distinctive words of the statement and by a Lean name
+when one is known; the
+[search contract](../../autoform_cli/README.md#search-contract) says what is
+matched. Read each hit's statement, and narrow a query whose listing the limit
+cut short. Matching is literal, so the result is new only when retries with
+fewer words, and under other usual names for its objects, also show no article
+stating it. Search the project's usable shared libraries in the same call: run
+`autoform library list .` once, and pass each package it reports as usable to
+every search as `--library NAME --lean-root .`, even while the blueprint is
+empty, since a library may already prove the result. The
+[library search rules](../formalize/references/library-search.md) give the
+details.
+If a library already proves a result, reuse that proof instead of proving the
+result again: the result keeps its article, and its proof cites the library
+declaration. If a proof needs a library result that has no article yet, add an
+article for it, proved from the library, and link it under `## Proof depends
+on`. A refusal (exit 2) is not an empty result: resolve what it reports without
+adding the article, and search again, except that a refusal naming a library is
+handled as the library search rules say. A dependency link to a page not yet
+written causes one, so search for a batch of articles before writing the first.
+When another formalizable article already states the result, link to it from
+each article that needs it, under `## Depends on` or `## Proof depends on`, and
+from the coverage row, instead of adding a node. A hit that is more general, a
+special case, or only similar does not replace the result: add the article,
+depending on the hit where it is used. Search reads only the checkout it is
+given, so the owner of global consistency repeats it for what parallel agents
+added.
 
-1. Record source notes under `blueprint/sources/`, including stable locations
-   for every definition or theorem used in the plan. Work from the source text;
-   for large sources, use targeted lookups for a named result or definition and
-   record the exact passage rather than relying on memory. Surface prerequisites
-   not covered by the confirmed sources instead of inventing them. These notes
-   are vault material, not chapters: the site does not publish them, and a
-   statement's `## Sources` list is rewritten to the file in the repository, so
-   write them for a reader with the repository open.
-2. Write the high-level direction and milestones under `blueprint/roadmap/`.
-   Group milestones by coherent mathematical significance, not by source
-   section size.
-   A chapter page needs no frontmatter at all: its H1 is the title and its
-   position in the tree is its identity. Write it as
-   `roadmap/<chapter>/README.md`, never as a Markdown file beside the
-   directory: containment is inferred from nested READMEs, so a sibling
-   chapter page leaves every article in that directory hanging off the root
-   and publishes a book with no chapters. `autoform check` refuses a chapter
-   directory with no chapter page, so a vault in that shape never renders.
-   Treat `blueprint/README.md` and the roadmap pages it
-   links as an ordered mathematical book: link meaningful chapter pages in
-   their intended reading order. The renderer derives bottom-of-page previous
-   and next chapter links from this Markdown structure, so do not maintain a
-   second navigation manifest.
-3. Define project-specific coverage targets and completion rules in
-   `blueprint/coverage/README.md`. Include exactly one
-   `Area | Coverage | Evidence` table. Use `MAPPED` when an area is known but
-   not yet dispositioned, `DECOMPOSED` when it is represented by roadmap
-   nodes, `DEFERRED` for an explicit later milestone, and `OUT` for material
-   outside formalization scope. Evidence may link to current roadmap paths;
-   optional `article_id` metadata is not required. Never report whole-source
-   completion while any row remains `MAPPED`.
+Enumerate the entire adopted boundary in `blueprint/coverage/README.md`.
+`MAPPED` is unfinished, `DECOMPOSED` links to roadmap nodes, `DEFERRED` records
+an explicit user decision or concrete external blocker, and `OUT` explains an
+exclusion. Treat every other `DEFERRED` row as queued work; never defer merely
+to shorten the run. Because `coverage.complete` only checks declared rows,
+compare the table with the source structure yourself.
 
-   Only published Markdown is read as the contract, so a table hidden in an
-   HTML comment or an indented or fenced block is ignored rather than trusted.
-   Keep comments and code blocks out of the table body: hidden content ends a
-   table for every renderer, so a row written below one is reported rather than
-   quietly dropped, even when written without its outer pipes. Leave a blank
-   line above the table: a paragraph running into the header publishes no table
-   at all, and neither does a comment that breaks the separator.
-   Write evidence a reader can act on, judged on what it renders as: a bare
-   `TODO`, a lone code span, an empty link such as `[ ](notes.md)`, text a browser
-   hides, and a marker such as `TBD - pick a milestone` are all rejected, while
-   "Pending Mathlib PR 1234" is fine because it names a
-   real dependency. `DECOMPOSED` requires at least one complete link to an
-   existing roadmap article, and every link in that cell must resolve, fragments
-   included.
+Write milestone pages under `blueprint/roadmap/` by mathematical significance,
+then one fine article per coherent unit with one unique main result. Ground each
+statement and proof sketch in the source. Put genuine statement prerequisites
+under `## Depends on` and proof-only prerequisites under `## Proof depends on`.
+Assign durable `article_id` metadata to new articles; run
+`autoform migrate article-ids blueprint --write` after creating the pages to
+add deterministic IDs.
+Articles hold only frontmatter and informal mathematics; put Lean-side findings
+such as Mathlib gaps, prior art, and declaration names in
+`blueprint/.implementation-notes/<article_id>.md`, never a transcript, a secret,
+or a machine-local path. The hidden per-article file
+stays out of the mathematical wiki and remains valid when the article moves.
+Never link it from an article. Delete it when the article is proved or marked
+`mathlib: true`; delete a container's note when every formalizable descendant,
+and every leaf marked `not_ready` beneath it, is proved and there is at least
+one. To move an article, move its file, which keeps its `article_id` line and
+so its note; a page written afresh must take that line in the same edit that
+deletes the old page. When a commit deletes or merges an article,
+move anything still useful from its note into a surviving article's note and
+delete the note in that commit; an orphaned note blocks every command that loads
+the graph, and any worker may repair one the same way, or by restoring the
+`article_id` line of an article that still exists but lost it.
+Assert formalization or `mathlib: true` only after exact verification. Before
+revising a formalizable leaf, acquire the `claim_target` that `autoform work
+context` reports for it, passing your own `--worker-id`; renew it while editing
+and release it once the committed revision is on the branch Formalize works
+from. A refused acquire means another agent owns the article: leave it and
+report it. Claims write refs to the board's remote, which is outward-facing, so
+make sure the request covers them. When a revision changes a statement whose
+article has `lean:`, retract it: replace `statement: formalized` with
+`statement: retracted`, remove `proof: formalized`, and keep `lean:`, which
+Formalize needs to run `autoform work impact`; an article without `lean:` just
+loses `statement` and `proof`. When the project's CI pins an `AUTOFORM_REF`
+older than the marker, its `autoform check` rejects `statement: retracted`:
+remove `statement` and `proof` and keep `lean:` until the pin moves, and report
+the old pin. Under the open policy a retracted theorem stays
+an open statement, so whatever rests on it stays conditionally proved. Retract
+only that article and the dependents whose Markdown text the revision rewrites,
+claiming them all in one acquire; the Lean-side impact decides every other
+dependent. For a Lean revision requested in Human Review, record the decision in
+the article's `blueprint/.implementation-notes/<article_id>.md` and retract the
+article the same way, so it returns to the frontier as a statement phase flagged
+as a revision, and leave the Lean change to Formalize, which follows the
+[revision contract](../../autoform_cli/README.md#revision-contract); this skill
+edits only Markdown. For a large source, divide independent sections among
+available agents while retaining one owner for global coverage and dependency
+consistency.
 
-   `coverage.complete` means only that no declared row is still `MAPPED`. It is
-   not a claim that the table covers the source exhaustively, nor that the
-   linked articles are formalized or proved. Deciding the table is exhaustive is
-   the author's judgement and cannot be checked locally, so state what the rows
-   are meant to span rather than implying the tool verified it.
-4. Present this coarse roadmap and coverage contract for user approval before
-   expanding it into a fine DAG.
-5. After approval, create one file per pull-request-sized unit beside its
-   milestone under `blueprint/roadmap/**/*.md`. A node may contain several
-   supporting definitions or statements when they should land and be reviewed
-   together, but it must identify one unique main result that determines when
-   the node is complete. Nothing authored in an article predicts how much Lean
-   it will take, so "pull-request-sized" cannot be checked up front;
-   `autoform audit --lean-root` reports `node-too-large` afterwards, against
-   the project's own median. Read that finding as a decomposition bug in this
-   roadmap rather than a Lean problem, and split the node. Its path relative to
-   `roadmap/`, without `.md`, is its current graph ID; add optional durable
-   `article_id` metadata only when a long-lived external artifact needs stable
-   identity. Give it exactly one H1, a `declaration` naming the kind of Lean
-   artifact, a source-grounded statement or proof sketch, and a `## Depends on`
-   section.
-6. Put only genuine prerequisite links under `## Depends on`; those relative
-   Markdown links are the machine-read DAG edges. Use `## Proof depends on` for
-   a prerequisite the proof needs but the statement does not. Keep roadmap,
-   coverage, and source links under other headings.
-7. Search the pinned Mathlib checkout before planning new work. Set
-   `mathlib: true` only for an exact verified upstream result; record partial or
-   uncertain candidates as notes, never as formalization status.
-8. Reconcile every page whose claims this work has just invalidated. That means
-   the coarse milestone pages and the coverage contract, and also the two
-   landing pages Setup wrote before any scope existed: `blueprint/README.md`
-   and the repository `README.md`. Setup states there that no chapters exist
-   and nothing is planned. The moment a chapter exists that is false, and it is
-   the first thing a visitor to the published site reads. Newly discovered
-   prerequisites, moved units, and deferred scope must not leave any of these
-   stale either.
+`open_statements` in `roadmap/README.md` is a project policy; absent means
+strict. `allowed` lets a theorem's statement land with a `sorry` proof, so
+dependents can be stated and proved before it is; the cost is conditionally
+proved results that stay incomplete until those proofs land. Change it only on
+the user's request and only once CI meets the
+[open statements](../../autoform_cli/README.md#open-statements) requirements.
+Turn it back off only once no open statement remains: the strict audit rejects
+every `sorry`, and strict status shows a proof resting on one as proved.
 
-Assert only what is checked: `statement: formalized`, `proof: formalized`,
-`mathlib: true`, `not_ready: true`, and the compiled name in `lean`. Ready,
-blocked, and fully-proved are derived from the DAG — never hand-write them, and
-never start proof workers merely to advance a state. The
-[blueprint format reference](../../autoform_cli/README.md) has the full table.
+Reconcile every affected source and milestone page, the coverage contract,
+`blueprint/README.md`, and the repository `README.md`.
 
-## Validate and report
+## Finish
 
-Validate `<PROJECT>/blueprint` and refresh its Mermaid graph before handing
-off. Rendering and the strict site build belong to Setup and Human Review; here
-only the first two steps of the publication sequence in the
-[CLI reference](../../autoform_cli/README.md#commands) apply.
+After the final edit, use the CLI reference to run `autoform check` and
+`autoform audit`, refresh the Mermaid graph, and resolve every finding introduced
+by this work or inside the adopted boundary. Report unrelated pre-existing
+findings instead of silently widening scope. Commit the vault and refreshed
+graph only after this final validation; pushing is outward-facing and requires
+a user request.
 
-Fix missing targets, escaping links, self-dependencies, cycles, and unresolved
-`lean:` names before handoff.
-
-Commit the vault once `autoform check` passes. CI renders and publishes from
-the repository, not from your working tree, so roadmap work left uncommitted
-leaves the site advertising a project with no chapters. Pushing is
-outward-facing: report the command and let the user run it, unless they have
-already asked you to push.
-
-Report roadmap and coverage status, node and edge
-counts, the derived state summary, unresolved source questions, and the
-vault/graph paths. Hand nodes that are ready to state or prove to Orchestrate;
-hand the draft to Agent Review for mathematical-plan judgment or Human Review
-for visual inspection; hand CI, Pages, Lean-project, or vault infrastructure
-changes back to Setup.
+Finish only when the adopted boundary has no `MAPPED` rows, every `DECOMPOSED`
+area links to a source-grounded fine DAG, affected pages and the graph agree,
+and the latest commit contains every change from the pass. Do not stop after
+discovery, a coarse proposal, one chapter, or unchanged validation. Report the
+material delta, evidence, remaining explicit blockers, and next execution
+frontier. Mark an active Goal complete only after these conditions hold.

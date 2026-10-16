@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
+from autoform_cli import claims
 from autoform_cli.__main__ import main
-from autoform_cli.claims import CLAIM_REF_PREFIX, author_claim_key
+from autoform_cli.claims import CLAIM_REF_PREFIX, ClaimBoard, author_claim_key
 
 
 def _bare_repo(tmp_path: Path) -> Path:
@@ -102,3 +104,138 @@ def test_claim_cli_refuses_malformed_remote_lease(tmp_path: Path, capsys) -> Non
 
     assert main(_args(repo, tmp_path / "scratch", "acquire", node_id)) == 1
     assert "invalid lease JSON" in capsys.readouterr().out
+
+
+def _claim_refs(repo: Path) -> list[str]:
+    listing = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname)", CLAIM_REF_PREFIX],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return sorted(listing.split())
+
+
+def _peer_args(repo: Path, scratch: Path, *command: str) -> list[str]:
+    return ["claim", *command, "--repo", str(repo), "--worker-id", "worker-b", "--scratch", str(scratch)]
+
+
+def test_claim_cli_single_node_output_is_unchanged(tmp_path: Path, capsys, monkeypatch) -> None:
+    def batch_path(*args: object, **kwargs: object) -> None:
+        raise AssertionError("one target must take the single-key path")
+
+    for name in ("acquire_many", "renew_many", "release_many"):
+        monkeypatch.setattr(ClaimBoard, name, batch_path)
+    repo = _bare_repo(tmp_path)
+    scratch = tmp_path / "scratch"
+    key = author_claim_key("node")
+
+    assert main(_args(repo, scratch, "acquire", "node", "--ttl", "600")) == 0
+    assert capsys.readouterr().out == f"acquired node ({key})\n"
+    assert main(_args(repo, scratch, "renew", "node", "--ttl", "600")) == 0
+    assert capsys.readouterr().out == f"renewed node ({key})\n"
+    assert main(_peer_args(repo, tmp_path / "peer", "acquire", "node")) == 1
+    assert capsys.readouterr().out == "error: could not acquire node; ownership is held or unverifiable\n"
+    assert main(_args(repo, scratch, "release", "node")) == 0
+    assert capsys.readouterr().out == f"released node ({key})\n"
+
+
+def test_claim_cli_multi_node_round_trip_prints_one_line_per_target(tmp_path: Path, capsys) -> None:
+    repo = _bare_repo(tmp_path)
+    scratch = tmp_path / "scratch"
+    nodes = ["chapter/main theorem", "chapter/helper"]
+
+    def expected(past_tense: str) -> str:
+        return "".join(f"{past_tense} {node} ({author_claim_key(node)})\n" for node in nodes)
+
+    assert main(_args(repo, scratch, "acquire", *nodes, "--ttl", "600", "--note", "revision")) == 0
+    assert capsys.readouterr().out == expected("acquired")
+    assert main(_args(repo, scratch, "renew", *nodes, "--ttl", "600")) == 0
+    assert capsys.readouterr().out == expected("renewed")
+    assert main(_args(repo, scratch, "list")) == 0
+    leases = json.loads(capsys.readouterr().out)
+    assert sorted(lease["_key"] for lease in leases) == sorted(author_claim_key(node) for node in nodes)
+    assert {(lease["owner"], lease["note"]) for lease in leases} == {("worker-a", "revision")}
+    assert main(_args(repo, scratch, "release", *nodes)) == 0
+    assert capsys.readouterr().out == expected("released")
+    assert _claim_refs(repo) == []
+
+
+def test_claim_cli_multi_node_failure_changes_no_claim(tmp_path: Path, capsys) -> None:
+    repo = _bare_repo(tmp_path)
+    scratch = tmp_path / "scratch"
+    assert main(_peer_args(repo, tmp_path / "peer", "acquire", "b")) == 0
+    capsys.readouterr()
+
+    assert main(_args(repo, scratch, "acquire", "a", "b", "c")) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "error: could not acquire a, b, c; no claim was acquired: held by another worker: b\n"
+    assert captured.err == ""
+    assert _claim_refs(repo) == [CLAIM_REF_PREFIX + author_claim_key("b")]
+
+    assert main(_args(repo, scratch, "acquire", "a")) == 0
+    capsys.readouterr()
+    assert main(_args(repo, scratch, "renew", "a", "b")) == 1
+    assert capsys.readouterr().out == (
+        "error: could not renew a, b; no claim was renewed: not held by this worker: b\n"
+    )
+    assert main(_args(repo, scratch, "release", "a", "b")) == 1
+    assert capsys.readouterr().out == (
+        "error: could not release a, b; no claim was released: not held by this worker: b\n"
+    )
+    assert _claim_refs(repo) == sorted(CLAIM_REF_PREFIX + author_claim_key(node) for node in ("a", "b"))
+
+
+def test_claim_cli_multi_node_names_a_malformed_claim(tmp_path: Path, capsys) -> None:
+    repo = _bare_repo(tmp_path)
+    _plant_message(repo, author_claim_key("b"), "not json")
+
+    assert main(_args(repo, tmp_path / "scratch", "acquire", "a", "b")) == 1
+    assert capsys.readouterr().out == "error: could not acquire a, b; no claim was acquired: malformed lease: b\n"
+    assert _claim_refs(repo) == [CLAIM_REF_PREFIX + author_claim_key("b")]
+
+
+def test_claim_cli_rejects_duplicate_targets_before_touching_the_board(tmp_path: Path, capsys) -> None:
+    repo = _bare_repo(tmp_path)
+    scratch = tmp_path / "scratch"
+
+    assert main(_args(repo, scratch, "acquire", "a", "b", "a")) == 2
+    captured = capsys.readouterr()
+    assert captured.err == "error: duplicate claim target: a\n"
+    assert captured.out == ""
+    assert _claim_refs(repo) == []
+    assert not scratch.exists()
+
+
+def test_claim_cli_multi_node_transport_failure_is_nonzero(tmp_path: Path, capsys) -> None:
+    missing = tmp_path / "missing" / "claims.git"
+    assert main(_args(missing, tmp_path / "scratch", "acquire", "a", "b")) == 1
+    assert capsys.readouterr().out.startswith("error: ")
+
+
+def test_claim_cli_names_a_stale_ref_lock_and_list_and_cleanup_warn_about_it(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    monkeypatch.setattr(claims, "_LOCK_GRACE_S", 0.1)
+    repo = _bare_repo(tmp_path)
+    scratch = tmp_path / "scratch"
+    ref = CLAIM_REF_PREFIX + author_claim_key("a")
+    lock = repo / f"{ref}.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text("")
+    os.utime(lock, (1_700_000_000, 1_700_000_000))
+    described = f"Git lock file {lock.resolve()} (modified 2023-11-14T22:13:20Z) blocks updates of {ref}"
+
+    assert main(_args(repo, scratch, "acquire", "a")) == 1
+    assert capsys.readouterr().out == (
+        f"error: {described}. Git leaves a lock file behind when a process stops while updating a ref; "
+        "if no Git process is using the claim board, delete it and retry\n"
+    )
+
+    for command, stdout in (("list", "[]\n"), ("cleanup", "removed 0 expired claim(s)\n")):
+        assert main(_args(repo, scratch, command)) == 0
+        captured = capsys.readouterr()
+        assert captured.out == stdout
+        assert captured.err == f"warning: {described}; if no Git process is using the claim board, delete it\n"
+    assert lock.exists()

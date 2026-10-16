@@ -16,6 +16,13 @@ Prove2Me verifies a top-level `theorem solution` against an open theorem's exact
 formal statement on its own toolchain. This skill owns Autoform's side of that
 loop; the platform's own guide stays authoritative for everything else.
 
+There is no `autoform` on `PATH` outside the plugin checkout. Run every
+`autoform` command as
+`uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform` followed by its arguments,
+where `<AUTOFORM_PLUGIN_ROOT>` is the absolute plugin root: the directory that
+holds this skill's `skills/` folder, along with `pyproject.toml` and
+`autoform_cli/`. Give a subagent that root and this prefix with its task.
+
 ## Ground rules
 
 Submitting is outward-facing. `verify` without `--dry-run`, `publish`, and
@@ -29,7 +36,7 @@ Use the `autoform prove2me` commands for every API call. They hold the API key,
 refuse any host but the platform's, and never print the key. Never read
 `credentials.json` aloud, pass the key on a command line, or call the API with
 a hand-written HTTP client. If the key is missing or expired, stop and ask the
-user to run `autoform prove2me setup` in their own terminal, which prompts for
+user to run `autoform prove2me setup`, with that prefix, in their own terminal, which prompts for
 it with hidden input; never ask them to paste a key into the conversation.
 Registration needs their email, so it is never done headlessly.
 

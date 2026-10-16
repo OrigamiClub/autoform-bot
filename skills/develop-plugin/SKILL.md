@@ -1,31 +1,36 @@
 ---
 name: develop-plugin
-description: >-
-  Develop AutoformBot's CLI, servers, skills, manifests, tests, example, or
-  installation for consumer-project defects.
+description: Maintain AutoformBot's code, skills, tests, examples, and installation.
 ---
 
-# Develop Autoform from consumer nudges
+# Develop Autoform
 
-Treat Autoform as an example-based plugin installed in an
-independent formalization repository. Use the Cabannes thesis as an executable consumer example.
+Treat Autoform as an example-based plugin for an independent formalization
+repository. State a consumer scenario and invariant. Treat user nudges as
+product evidence; preserve insight, not the transcript, in a focused test so
+future agents need less steering.
 
-Inspect the worktree, state a consumer scenario, and observe installed behavior.
-Name a refactor's invariant.
+Keep Cabannes-specific facts in examples; keep plugin and formalization roots
+distinct. Agents can infer routine details; keep shared agent entrypoints concise
+and link on-demand references.
 
-Treat user nudges during real work as product evidence. Distill reusable ones
-into the owning skill as a trigger, decision rule, and action.
-Ensure future agents need less steering.
-Preserve the insight, not the transcript or consumer choice.
-Add a focused test and acceptance assertion in `tests/test_skill_examples.py`.
+Keep imports permissive: consumer Lean uses Formalize's
+`autoform work import-impact`; plugin changes preserve it.
 
-Implement reusable plugin behavior. Keep Cabannes-specific facts in the example
-and references; demonstrate outcomes without special-casing them.
+For each Lean/Mathlib release, regenerate `production_module_roots` from Lake
+package configs. Update the private creation bundle, catalog identity, and
+complete `lake update` manifest together; run `lake build`.
+A direct-Mathlib-only manifest is invalid.
 
-Keep plugin and formalization roots distinct. Agents can infer routine details;
-keep skills to non-obvious constraints and fragile domain steps.
+Retain descriptors for source indexes, revisions, and links: repeated pathname
+reads are not a generation boundary (Windows render omits code links).
+Read bounded outputs before descendants, keep each marker schema in its owning
+feature, and require links to match the blob at the stable detected commit.
 
-Run focused checks, then normally run:
+For claims/views/mirrors/pins/releases, read
+[repository contracts](references/repository-contracts.md).
+
+Run:
 
 ```bash
 make lint
@@ -33,8 +38,8 @@ make test
 make check-example
 ```
 
-Run `lake build` when example Lean results change. Validate edited skills and
-the manifest with skill-creator and plugin-creator. Use cachebuster and reinstall
-only to test installed discovery in a new thread. Report outcome and checks.
+Validate skills and manifests with skill-creator and plugin-creator. Test
+cachebuster/reinstall discovery only in a new thread.
+
 Treat rewritten private declaration safety as fail-closed evidence: correlate
 the official user name to its lexical declaration by source coordinates.

@@ -1,0 +1,15 @@
+name = "fix"
+version = "0.1.0"
+defaultTargets = ["Fix"]
+
+[leanOptions]
+pp.explicit = true
+
+[[require]]
+name = "batteries"
+git = "https://github.com/leanprover-community/batteries"
+rev = "f2effa3d803fda822b1f97b806c47cf2adfbcbc2"
+
+[[lean_lib]]
+name = "Fix"
+globs = ["Fix.+"]

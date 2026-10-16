@@ -29,4 +29,5 @@ The [Full Supervision chapter](../roadmap/full-supervision/README.md) separates
 the Lean definition `CabannesThesis.supervision` and its elementary
 non-ambiguity lemma from the stronger source-level supervision-recovery target.
 These are implementation support nodes, not additional claims about the thesis
-source.
+source. Both are in
+[src/CabannesThesis/Basic.lean](../../src/CabannesThesis/Basic.lean#L20).

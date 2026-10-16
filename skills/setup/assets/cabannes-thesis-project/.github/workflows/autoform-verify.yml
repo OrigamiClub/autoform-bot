@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 env:
-  AUTOFORM_SOURCE: "https://github.com/VivienCabannes/autoform-bot.git"
-  AUTOFORM_REF: "43097b2c07e68df899d6b8bca7849d091c294754"
+  AUTOFORM_SOURCE: "https://github.com/facebookresearch/autoform-bot.git"
+  AUTOFORM_REF: "c994d83f9fab1f40d69b2f279d4c62ca937a0186"
 
 concurrency:
   group: autoform-verify-${{ github.ref }}
@@ -91,11 +91,48 @@ jobs:
           set -euo pipefail
           archive="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-root-build.XXXXXX.tgz")"
           probe="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-axiom-probe.XXXXXX.lean")"
-          trap 'rm -f "$archive" "$probe"' EXIT
+          contract="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-assumptions.XXXXXX.json")"
+          errors="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-assumptions.XXXXXX.err")"
+          output="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-axiom-probe.XXXXXX.out")"
+          trap 'rm -f "$archive" "$probe" "$contract" "$errors" "$output"' EXIT
           # Lake resolves both manifest languages and package/custom buildDir.
           # `lake pack` archives only the root package's actual build directory,
           # leaving dependency package artifacts outside the audit boundary.
           lake pack "$archive"
-          python3 .github/autoform_audit.py \
-            "$AUTOFORM_ROOT_PACKAGE" "$archive" "$probe"
-          lake env lean "$probe"
+          # roadmap/README.md may opt in to open statements (theorems whose proof
+          # is still sorry). Only then does the audit accept sorry, and only in
+          # the statements the Markdown declares open. Under either policy every
+          # article's lean: name must be a declaration the build compiled.
+          policy="$(python3 .github/autoform_audit.py --policy blueprint)"
+          autoform="git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}"
+          old_ref=""
+          if uvx --from "$autoform" autoform work assumptions --help > /dev/null 2> "$errors"; then
+            uvx --from "$autoform" autoform work assumptions blueprint --json > "$contract"
+          elif [ "$policy" != "allowed" ] && grep -Fq "invalid choice: 'assumptions'" "$errors"; then
+            # This AUTOFORM_REF predates `work assumptions`, so it cannot write
+            # the contract. Any other failure, such as a failed fetch, stops here.
+            echo "::warning::AUTOFORM_REF predates autoform work assumptions, so this audit cannot check that every lean: name was compiled. Move AUTOFORM_REF to a newer commit."
+            old_ref=1
+          else
+            cat "$errors" >&2
+            exit 1
+          fi
+          if [ "$policy" = "allowed" ]; then
+            python3 .github/autoform_audit.py --open-statements "$contract" \
+              "$AUTOFORM_ROOT_PACKAGE" "$archive" "$probe"
+          elif [ -z "$old_ref" ]; then
+            python3 .github/autoform_audit.py --targets "$contract" \
+              "$AUTOFORM_ROOT_PACKAGE" "$archive" "$probe"
+          else
+            python3 .github/autoform_audit.py "$AUTOFORM_ROOT_PACKAGE" "$archive" "$probe"
+          fi
+          # Plain lean, so the probe's own imports are the toolchain's. The probe
+          # loads the build itself, from the search path Lake reports.
+          lean_path="$(lake env printenv LEAN_PATH)"
+          # A panic in the probe aborts it instead of continuing with a default value.
+          AUTOFORM_AUDIT_LEAN_PATH="$lean_path" LEAN_ABORT_ON_PANIC=1 lean "$probe" | tee "$output"
+          # Exit status 0 alone does not show that every check ran.
+          if ! tail -n 1 "$output" | grep -Eq '^kernel trust clean( except declared open statements)? \('; then
+            echo "the audit probe did not end with its success line" >&2
+            exit 1
+          fi

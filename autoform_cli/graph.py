@@ -10,16 +10,19 @@ a second graph file that could drift from the book.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from .lean import declaration_names
+from .markdown import mask_code_and_comments
+
 
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _LINK = re.compile(r"(?<!!)\[[^\]]+\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
-_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
 _INLINE_CODE = re.compile(r"(`+).*?\1")
 ARTICLE_ID_PATTERN = re.compile(r"af_[0-9a-f]{24}\Z")
 _FRONTMATTER_KEYS = frozenset(
@@ -35,9 +38,11 @@ _FRONTMATTER_KEYS = frozenset(
         "not_ready",
         "origin",
         "discussion",
+        "open_statements",
     }
 )
 _FORMALIZED = "formalized"
+_RETRACTED = "retracted"
 _TRUE = frozenset({"true", "yes"})
 _FALSE = frozenset({"false", "no"})
 
@@ -47,6 +52,7 @@ _FALSE = frozenset({"false", "no"})
 _STATEMENT_SECTION = "depends on"
 _PROOF_SECTION = "proof depends on"
 _SOURCES_SECTION = "sources"
+IMPLEMENTATION_NOTES_DIR = ".implementation-notes"
 
 
 class GraphValidationError(ValueError):
@@ -77,6 +83,10 @@ class Node:
     lean: str | None = None
     declaration: str | None = None
     statement_formalized: bool = False
+    #: ``statement: retracted``: a revision retracted the statement while
+    #: ``lean:`` still names the old declaration, which stays in the build
+    #: until Formalize restates the article.
+    statement_retracted: bool = False
     proof_formalized: bool = False
     mathlib: bool = False
     mathlib_declaration: str | None = None
@@ -102,6 +112,10 @@ class Graph:
 
     blueprint_dir: Path
     nodes: dict[str, Node]
+    #: ``open_statements: allowed`` in ``roadmap/README.md``: a theorem's
+    #: statement may land with a ``sorry`` proof. Absent or ``forbidden`` keeps
+    #: the strict policy, where CI rejects every ``sorry``.
+    open_statements: bool = False
 
     @property
     def edge_count(self) -> int:
@@ -146,6 +160,8 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
     issues.extend(discovery_issues)
     article_ids: dict[str, str] = {}
     source_hashes = {source.id: source.source_sha256 for source in sources}
+    policy_page = (blueprint / "roadmap" / "README.md").resolve()
+    open_statements = False
 
     for source in sources:
         canonical = source.path.resolve()
@@ -154,6 +170,10 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
             continue
         if source.id in node_ids:
             issues.append(f"{source.id}: duplicate node id also used by {node_ids[source.id]}")
+            continue
+        if ARTICLE_ID_PATTERN.fullmatch(source.id):
+            # Selectors and claim keys accept either form, so the two must not overlap.
+            issues.append(f"{source.id}: node id has the form of an article_id; rename its file or directory")
             continue
         canonical_ids[canonical] = source.id
         node_ids[source.id] = canonical
@@ -169,12 +189,25 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
                     )
                 else:
                     article_ids[article_id] = node.id
+            policy = node.metadata.get("open_statements")
+            if policy is not None:
+                if canonical != policy_page:
+                    issues.append(
+                        f"{node.id}: open_statements is a project policy; set it only in roadmap/README.md"
+                    )
+                else:
+                    open_statements = policy == "allowed"
             parsed.append(node)
 
+    if not issues:
+        issues.extend(_implementation_note_issues(blueprint, article_ids))
     if issues:
         raise GraphValidationError(issues)
 
-    parents = _article_parents(parsed)
+    parents = _article_parents(parsed, blueprint / "roadmap")
+    issues.extend(_containment_cycles(parents))
+    if issues:
+        raise GraphValidationError(issues)
     nodes: dict[str, Node] = {}
     for parsed_node in parsed:
 
@@ -208,6 +241,7 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
             declaration=metadata.get("declaration"),
             lean=metadata.get("lean"),
             statement_formalized=metadata.get("statement") == _FORMALIZED,
+            statement_retracted=metadata.get("statement") == _RETRACTED,
             proof_formalized=metadata.get("proof") == _FORMALIZED,
             mathlib=metadata.get("mathlib") in _TRUE,
             mathlib_declaration=metadata.get("mathlib_declaration"),
@@ -228,7 +262,7 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
         issues.extend(_find_rollup_cycles(nodes))
     if issues:
         raise GraphValidationError(issues)
-    return Graph(blueprint_dir=blueprint, nodes=nodes)
+    return Graph(blueprint_dir=blueprint, nodes=nodes, open_statements=open_statements)
 
 
 def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
@@ -236,26 +270,43 @@ def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
     if not roadmap_root.is_dir():
         return [], [f"roadmap directory does not exist: {roadmap_root}"]
 
+    symlink_issues = roadmap_symlink_issues(blueprint)
+    if symlink_issues:
+        # Containment and ids are read from paths, so one symbolic link can make two
+        # pages each other's parent; refuse the layout before anything is read.
+        return [], symlink_issues
+
     issues: list[str] = []
     sources: list[_NodeSource] = []
     roadmap_root = roadmap_root.resolve()
-    entries = sorted(roadmap_root.rglob("*"))
-    for path in entries:
-        if path.is_file() and path.name.casefold() == "readme.md" and path.name != "README.md":
-            relative = path.relative_to(roadmap_root).as_posix()
-            issues.append(
-                f"{relative}: noncanonical README filename; container pages must be named exactly README.md "
-                "for portable behavior on case-sensitive filesystems"
-            )
 
+    def unlistable(exc: OSError) -> None:
+        issues.append(f"cannot list roadmap directory {exc.filename}: {exc.strerror}")
+
+    # Unlike a glob, a walk reports each directory it cannot list.
+    entries = sorted(
+        Path(directory, name) for directory, _, files in os.walk(roadmap_root, onerror=unlistable) for name in files
+    )
+    issues.sort()  # a walk visits directories in arbitrary order
     for path in entries:
-        if not path.is_file() or path.suffix != ".md":
+        if path.suffix != ".md" and path.name.casefold() != "readme.md":
             continue
+        relative = path.relative_to(roadmap_root).as_posix()
         try:
+            if not stat.S_ISREG(path.stat().st_mode):
+                continue
+            if path.name.casefold() == "readme.md" and path.name != "README.md":
+                issues.append(
+                    f"{relative}: noncanonical README filename; container pages must be named exactly README.md "
+                    "for portable behavior on case-sensitive filesystems"
+                )
+            if path.suffix != ".md":
+                continue
             content = path.read_bytes()
             text = content.decode("utf-8")
+        except FileNotFoundError:
+            continue  # removed since the walk
         except (OSError, UnicodeError) as exc:
-            relative = path.relative_to(roadmap_root).as_posix()
             issues.append(f"{relative}: cannot read roadmap page: {exc}")
             continue
         node_id = _article_id(path, roadmap_root)
@@ -269,6 +320,20 @@ def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
 
     issues.extend(_chapter_issues(roadmap_root))
     return sources, issues
+
+
+def roadmap_symlink_issues(blueprint: Path) -> list[str]:
+    """Report the symbolic links among ``roadmap/`` and every path beneath it.
+
+    Graph loading and runtime projection share this policy, so ``autoform check``
+    accepts exactly the roadmaps the runtime does.
+    """
+
+    roadmap = blueprint / "roadmap"
+    # os.path.islink is False for a path it cannot stat, which discovery then reports; Path.is_symlink raises
+    # before 3.14.
+    paths = [roadmap] if roadmap.is_symlink() else [path for path in sorted(roadmap.rglob("*")) if os.path.islink(path)]
+    return [f"roadmap contains a symbolic link: {path.relative_to(blueprint).as_posix()}" for path in paths]
 
 
 def _chapter_issues(roadmap_root: Path) -> list[str]:
@@ -304,10 +369,10 @@ def _chapter_issues(roadmap_root: Path) -> list[str]:
         return []
     issues = []
     for chapter in chapters:
-        articles = [path for path in chapter.rglob("*.md") if path.is_file()]
+        articles = [path for path in chapter.rglob("*.md") if os.path.isfile(path)]
         if not articles:
             continue
-        if (chapter / "README.md").is_file():
+        if os.path.isfile(chapter / "README.md"):
             continue
         names = articles
         issues.append(
@@ -315,6 +380,86 @@ def _chapter_issues(roadmap_root: Path) -> list[str]:
             f"README.md, so they attach to the roadmap root instead of a chapter; "
             f"add {chapter.name}/README.md with the chapter's H1 title"
         )
+    return issues
+
+
+def _implementation_note_issues(
+    blueprint: Path, article_ids: dict[str, str]
+) -> list[str]:
+    """Validate hidden, per-article implementation notes.
+
+    Notes are keyed by durable ``article_id`` rather than roadmap paths, so an
+    article move does not orphan its handoff and independent articles never
+    share a file. The hidden directory is already omitted by old and current
+    renderers, keeping the format backward-compatible with pinned projects.
+    """
+    issues: list[str] = []
+    try:
+        aliases = [
+            path.name
+            for path in blueprint.iterdir()
+            if path.name.casefold() == IMPLEMENTATION_NOTES_DIR.casefold()
+            and path.name != IMPLEMENTATION_NOTES_DIR
+        ]
+    except OSError as error:
+        return [f"cannot inspect implementation notes: {error}"]
+    for alias in sorted(aliases):
+        issues.append(
+            f"{alias}: noncanonical implementation notes directory; "
+            f"use exactly {IMPLEMENTATION_NOTES_DIR}"
+        )
+
+    root = blueprint / IMPLEMENTATION_NOTES_DIR
+    if root.is_symlink():
+        issues.append(
+            f"{IMPLEMENTATION_NOTES_DIR}: implementation notes directory must not be a symlink"
+        )
+        return issues
+    if not root.exists():
+        return issues
+    if not root.is_dir():
+        issues.append(
+            f"{IMPLEMENTATION_NOTES_DIR}: implementation notes path must be a directory"
+        )
+        return issues
+
+    try:
+        entries = sorted(root.iterdir())
+    except OSError as error:
+        issues.append(f"{IMPLEMENTATION_NOTES_DIR}: cannot read directory: {error}")
+        return issues
+    for path in entries:
+        relative = f"{IMPLEMENTATION_NOTES_DIR}/{path.name}"
+        # Hidden entries, such as an editor's lock symlink, are never notes.
+        if path.name.startswith("."):
+            continue
+        if path.is_symlink():
+            issues.append(f"{relative}: implementation note must be a regular file")
+            continue
+        if not path.is_file():
+            issues.append(f"{relative}: implementation note must be a regular file")
+            continue
+        if path.suffix != ".md" or not ARTICLE_ID_PATTERN.fullmatch(path.stem):
+            issues.append(
+                f"{relative}: implementation note must be named <article_id>.md"
+            )
+            continue
+        if path.stem not in article_ids:
+            issues.append(
+                f"{relative}: implementation note names no roadmap article; restore the "
+                "article_id of an article that still exists, or delete the note after "
+                "moving anything still useful to a surviving article's note"
+            )
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            issues.append(f"{relative}: cannot read implementation note: {error}")
+            continue
+        if not text.replace("\ufeff", "").replace("\u200b", "").strip():
+            issues.append(
+                f"{relative}: empty implementation note; delete it instead"
+            )
     return issues
 
 
@@ -326,7 +471,7 @@ def _article_id(path: Path, roadmap_root: Path) -> str:
     return relative.with_suffix("").as_posix()
 
 
-def _article_parents(parsed: list[_ParsedNode]) -> dict[str, str | None]:
+def _article_parents(parsed: list[_ParsedNode], roadmap_root: Path) -> dict[str, str | None]:
     """Infer strict single-parent containment from nested README articles."""
     by_path = {node.path.resolve(): node.id for node in parsed}
     parents: dict[str, str | None] = {}
@@ -335,7 +480,7 @@ def _article_parents(parsed: list[_ParsedNode]) -> dict[str, str | None]:
         if node.path.name == "README.md":
             candidate = candidate.parent
         parent: str | None = None
-        while candidate != candidate.parent:
+        while _is_within(candidate, roadmap_root):
             readme = (candidate / "README.md").resolve()
             if readme in by_path:
                 parent = by_path[readme]
@@ -343,6 +488,22 @@ def _article_parents(parsed: list[_ParsedNode]) -> dict[str, str | None]:
             candidate = candidate.parent
         parents[node.id] = parent
     return parents
+
+
+def _containment_cycles(parents: dict[str, str | None]) -> list[str]:
+    """Report each cycle of containing READMEs once, before depths are computed."""
+    issues: list[str] = []
+    for node_id in sorted(parents):
+        chain = [node_id]
+        seen = {node_id}
+        parent = parents[node_id]
+        while parent is not None and parent not in seen:
+            chain.append(parent)
+            seen.add(parent)
+            parent = parents[parent]
+        if parent == node_id and node_id == min(chain):
+            issues.append(f"{node_id}: containment cycle: {' -> '.join([*chain, node_id])}")
+    return issues
 
 
 def _article_depth(node_id: str, parents: dict[str, str | None]) -> int:
@@ -365,22 +526,11 @@ def _parse_node(node_id: str, path: Path, text: str) -> tuple[_ParsedNode | None
         _SOURCES_SECTION: [],
     }
     section: str | None = None
-    fence: tuple[str, int] | None = None
-    body = _HTML_COMMENT.sub("", "\n".join(lines[body_start:]))
 
-    for line in body.splitlines():
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            marker_kind = marker[0]
-            if fence is None:
-                fence = (marker_kind, len(marker))
-            elif marker_kind == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-
+    # Fences, comments and indented code are read as the page and the audit
+    # read them, so a section a reader sees never loses its links here, and a
+    # link the page shows as code is not read as one.
+    for line in mask_code_and_comments(lines[body_start:]):
         heading = _HEADING.match(line)
         if heading:
             level = len(heading.group(1))
@@ -453,6 +603,24 @@ def _parse_frontmatter(node_id: str, lines: list[str]) -> tuple[dict[str, str], 
             continue
         metadata[key] = value
 
+    if metadata.get("statement") == _RETRACTED:
+        if "lean" not in metadata:
+            issues.append(
+                f"{node_id}: statement: retracted needs the lean: declaration it retracts;"
+                " without lean:, omit statement"
+            )
+        if metadata.get("proof") == _FORMALIZED:
+            issues.append(f"{node_id}: proof: formalized needs statement: formalized, not retracted")
+        if metadata.get("mathlib") in _TRUE:
+            issues.append(f"{node_id}: a mathlib: true article cannot record statement: retracted")
+    # Load errors rather than audit findings: the generated workflows never run
+    # the audit, so either state would otherwise publish as proved with no Lean
+    # statement behind it. `mathlib: true` exempts neither.
+    if metadata.get("proof") == _FORMALIZED and metadata.get("statement") not in {_FORMALIZED, _RETRACTED}:
+        issues.append(f"{node_id}: proof: formalized needs statement: formalized")
+    formalized = [key for key in ("statement", "proof") if metadata.get(key) == _FORMALIZED]
+    if formalized and not declaration_names(metadata.get("lean", "")):
+        issues.append(f"{node_id}: {formalized[0]}: formalized needs the lean: declaration that formalizes it")
     return metadata, end + 1, issues
 
 
@@ -464,7 +632,13 @@ def _normalize_value(node_id: str, line_number: int, key: str, value: str) -> tu
         if not ARTICLE_ID_PATTERN.fullmatch(value):
             return value, f"{location}: malformed article_id {value!r}"
         return value, None
-    if key in {"statement", "proof"}:
+    if key == "statement":
+        if folded not in {_FORMALIZED, _RETRACTED}:
+            return value, (
+                f"{location}: 'statement' accepts only {_FORMALIZED!r} or {_RETRACTED!r}; omit the key otherwise"
+            )
+        return folded, None
+    if key == "proof":
         if folded != _FORMALIZED:
             return value, f"{location}: {key!r} accepts only {_FORMALIZED!r}; omit the key otherwise"
         return folded, None
@@ -475,6 +649,10 @@ def _normalize_value(node_id: str, line_number: int, key: str, value: str) -> tu
     if key == "origin":
         if folded not in {"cited", "bridged", "background"}:
             return value, f"{location}: 'origin' accepts cited, bridged, or background"
+        return folded, None
+    if key == "open_statements":
+        if folded not in {"allowed", "forbidden"}:
+            return value, f"{location}: 'open_statements' accepts allowed or forbidden"
         return folded, None
     return value, None
 
@@ -491,20 +669,32 @@ def _resolve_target(
     blueprint: Path,
     canonical_ids: dict[Path, str],
 ) -> tuple[str | None, str | None]:
-    split = urlsplit(target)
+    try:
+        split = urlsplit(target)
+    except ValueError:
+        return None, f"{node.id}: dependency target must be a relative Markdown path: {target!r}"
     if split.scheme or split.netloc or split.query:
         return None, f"{node.id}: dependency target must be a relative Markdown path: {target!r}"
     raw_path = unquote(split.path)
     if not raw_path:
         return None, f"{node.id}: dependency target must name a Markdown file: {target!r}"
+    if "\x00" in raw_path:
+        return None, f"{node.id}: dependency target contains an invalid path: {target!r}"
     relative = Path(raw_path)
     if relative.is_absolute() or relative.suffix != ".md":
         return None, f"{node.id}: dependency target must be a relative .md file: {target!r}"
 
-    resolved = (node.path.parent / relative).resolve()
+    try:
+        resolved = (node.path.parent / relative).resolve()
+    except (OSError, RuntimeError, ValueError):
+        # Before Python 3.13 a symlink loop raises RuntimeError here. From 3.13 resolve
+        # returns the looping path, so the lexical one stands in, and the checks below
+        # report it as on 3.13.
+        resolved = Path(os.path.abspath(node.path.parent / relative))
     if not _is_within(resolved, blueprint):
         return None, f"{node.id}: dependency target escapes the blueprint directory: {target!r}"
-    if not resolved.is_file():
+    # Before Python 3.14, `Path.is_file` raises under an unreadable directory.
+    if not os.path.isfile(resolved):
         return None, f"{node.id}: dependency target does not exist: {target!r}"
     dependency = canonical_ids.get(resolved)
     if dependency is None:
@@ -515,79 +705,173 @@ def _resolve_target(
 def _find_cycles(nodes: dict[str, Node]) -> list[str]:
     state: dict[str, int] = {}
     stack: list[str] = []
+    stack_indexes: dict[str, int] = {}
     issues: list[str] = []
+    seen_issues: set[str] = set()
 
-    def visit(node_id: str) -> None:
-        state[node_id] = 1
-        stack.append(node_id)
-        for dependency in nodes[node_id].dependencies:
-            if state.get(dependency, 0) == 0:
-                visit(dependency)
-            elif state.get(dependency) == 1:
-                start = stack.index(dependency)
-                cycle = stack[start:] + [dependency]
+    for root_id in sorted(nodes):
+        if state.get(root_id, 0) != 0:
+            continue
+        state[root_id] = 1
+        stack_indexes[root_id] = len(stack)
+        stack.append(root_id)
+        frames = [(root_id, 0)]
+        while frames:
+            node_id, dependency_index = frames[-1]
+            dependencies = nodes[node_id].dependencies
+            if dependency_index == len(dependencies):
+                frames.pop()
+                stack.pop()
+                stack_indexes.pop(node_id)
+                state[node_id] = 2
+                continue
+
+            dependency = dependencies[dependency_index]
+            frames[-1] = (node_id, dependency_index + 1)
+            dependency_state = state.get(dependency, 0)
+            if dependency_state == 0:
+                state[dependency] = 1
+                stack_indexes[dependency] = len(stack)
+                stack.append(dependency)
+                frames.append((dependency, 0))
+            elif dependency_state == 1:
+                cycle = stack[stack_indexes[dependency] :] + [dependency]
                 message = f"dependency cycle: {' -> '.join(cycle)}"
-                if message not in issues:
+                if message not in seen_issues:
+                    seen_issues.add(message)
                     issues.append(message)
-        stack.pop()
-        state[node_id] = 2
-
-    for node_id in sorted(nodes):
-        if state.get(node_id, 0) == 0:
-            visit(node_id)
     return issues
 
 
 def _find_rollup_cycles(nodes: dict[str, Node]) -> list[str]:
     """Reject cycles introduced by contracting articles at any hierarchy level."""
     children: dict[str | None, list[str]] = {}
+    parents: dict[str, str | None] = {}
     for node in nodes.values():
         children.setdefault(node.parent, []).append(node.id)
+        parents[node.id] = node.parent
 
-    def direct_child(scope: str | None, node_id: str) -> str | None:
-        current = node_id
-        while nodes[current].parent != scope:
-            parent = nodes[current].parent
-            if parent is None:
-                return None
-            current = parent
-        return current
+    depths: dict[str, int] = {}
+    roots: dict[str, str] = {}
+    for node_id in nodes:
+        if node_id in depths:
+            continue
+        trail: list[str] = []
+        seen: set[str] = set()
+        current: str | None = node_id
+        while current is not None and current not in depths:
+            if current in seen or current not in parents:
+                raise ValueError("article containment is not a forest")
+            seen.add(current)
+            trail.append(current)
+            current = parents[current]
+        depth = depths[current] if current is not None else -1
+        root = roots[current] if current is not None else trail[-1]
+        for descendant in reversed(trail):
+            depth += 1
+            depths[descendant] = depth
+            roots[descendant] = root
+
+    ancestors: list[dict[str, str | None]] = [parents]
+    maximum_depth = max(depths.values(), default=0)
+    while 1 << len(ancestors) <= maximum_depth:
+        previous = ancestors[-1]
+        ancestors.append(
+            {node_id: previous[parent] if parent is not None else None for node_id, parent in previous.items()}
+        )
+
+    def lift(node_id: str, distance: int) -> str:
+        level = 0
+        while distance:
+            if distance & 1:
+                parent = ancestors[level][node_id]
+                if parent is None:
+                    raise ValueError("article containment depth is inconsistent")
+                node_id = parent
+            distance >>= 1
+            level += 1
+        return node_id
+
+    def lowest_common_ancestor(first: str, second: str) -> str | None:
+        if roots[first] != roots[second]:
+            return None
+        if depths[first] < depths[second]:
+            first, second = second, first
+        first = lift(first, depths[first] - depths[second])
+        if first == second:
+            return first
+        for level in range(len(ancestors) - 1, -1, -1):
+            first_parent = ancestors[level][first]
+            second_parent = ancestors[level][second]
+            if first_parent != second_parent:
+                if first_parent is None or second_parent is None:
+                    continue
+                first = first_parent
+                second = second_parent
+        return parents[first]
+
+    def direct_child(scope: str | None, node_id: str) -> str:
+        scope_depth = depths[scope] if scope is not None else -1
+        return lift(node_id, depths[node_id] - scope_depth - 1)
+
+    projections: dict[str | None, dict[str, set[str]]] = {}
+    for target in nodes.values():
+        for dependency in target.dependencies:
+            scope = lowest_common_ancestor(target.id, dependency)
+            if scope == target.id or scope == dependency:
+                continue
+            target_child = direct_child(scope, target.id)
+            source_child = direct_child(scope, dependency)
+            projections.setdefault(scope, {}).setdefault(target_child, set()).add(source_child)
 
     issues: list[str] = []
+    seen_issues: set[str] = set()
     for scope, siblings in children.items():
         if len(siblings) < 2:
             continue
-        dependencies = {sibling: set() for sibling in siblings}
-        for target in nodes.values():
-            target_child = direct_child(scope, target.id)
-            if target_child not in dependencies:
-                continue
-            for dependency in target.dependencies:
-                source_child = direct_child(scope, dependency)
-                if source_child in dependencies and source_child != target_child:
-                    dependencies[target_child].add(source_child)
+        projected = projections.get(scope)
+        if not projected:
+            continue
+        dependencies = {sibling: projected.get(sibling, set()) for sibling in siblings}
         state: dict[str, int] = {}
         stack: list[str] = []
+        stack_indexes: dict[str, int] = {}
+        ordered_dependencies = {
+            article_id: tuple(sorted(prerequisites)) for article_id, prerequisites in dependencies.items()
+        }
 
-        def visit(article_id: str) -> None:
-            state[article_id] = 1
-            stack.append(article_id)
-            for prerequisite in sorted(dependencies[article_id]):
-                if state.get(prerequisite, 0) == 0:
-                    visit(prerequisite)
-                elif state.get(prerequisite) == 1:
-                    start = stack.index(prerequisite)
-                    cycle = stack[start:] + [prerequisite]
+        for root_id in sorted(dependencies):
+            if state.get(root_id, 0) != 0:
+                continue
+            state[root_id] = 1
+            stack_indexes[root_id] = len(stack)
+            stack.append(root_id)
+            frames = [(root_id, 0)]
+            while frames:
+                article_id, dependency_index = frames[-1]
+                prerequisites = ordered_dependencies[article_id]
+                if dependency_index == len(prerequisites):
+                    frames.pop()
+                    stack.pop()
+                    stack_indexes.pop(article_id)
+                    state[article_id] = 2
+                    continue
+
+                prerequisite = prerequisites[dependency_index]
+                frames[-1] = (article_id, dependency_index + 1)
+                prerequisite_state = state.get(prerequisite, 0)
+                if prerequisite_state == 0:
+                    state[prerequisite] = 1
+                    stack_indexes[prerequisite] = len(stack)
+                    stack.append(prerequisite)
+                    frames.append((prerequisite, 0))
+                elif prerequisite_state == 1:
+                    cycle = stack[stack_indexes[prerequisite] :] + [prerequisite]
                     label = scope or "root"
                     message = f"rolled-up dependency cycle in {label}: {' -> '.join(cycle)}"
-                    if message not in issues:
+                    if message not in seen_issues:
+                        seen_issues.add(message)
                         issues.append(message)
-            stack.pop()
-            state[article_id] = 2
-
-        for article_id in sorted(dependencies):
-            if state.get(article_id, 0) == 0:
-                visit(article_id)
     return issues
 
 

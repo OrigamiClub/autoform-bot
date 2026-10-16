@@ -17,7 +17,17 @@ import pytest
 import psutil
 
 from autoform_cli.__main__ import main
-from autoform_cli.lean import PACKET_SCHEMA, PASSAGE_SCHEMA, index_project
+from autoform_cli.graph import load_graph
+from autoform_cli.lean import (
+    PACKET_SCHEMA,
+    PASSAGE_SCHEMA,
+    Declaration,
+    LeanSourceError,
+    SourceIndex,
+    _is_managed_output_manifest_bytes,
+    index_project,
+    snapshot_project_sources,
+)
 from autoform_cli.skeleton import (
     DeclarationSkeleton,
     NodeSkeleton,
@@ -43,9 +53,12 @@ from autoform_cli.skeleton import (
     _hash_module_files,
     _local_safety_issue,
     _process_is_alive,
+    _remember_tagged_processes,
     _project_control_snapshot,
     _without_comments,
     _probe_record_issue,
+    _read_probe_records,
+    extract_graph_skeletons,
     extract_skeletons,
     format_report,
     lean_libraries,
@@ -59,6 +72,7 @@ from autoform_cli.skeleton import (
     write_packets,
     write_skeleton_report,
 )
+from tests.undecodable_json import UNDECODABLE_JSON
 
 _FIXTURE = Path(__file__).resolve().parent / "fixtures" / "skeleton-project"
 
@@ -247,6 +261,26 @@ def _fake_report(tmp_path: Path, output: str | None = None) -> SkeletonReport:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
     output = _fake_probe_output() if output is None else output
+    if os.name == "nt":
+        declaration = Declaration(
+            "Skel.observation_determined",
+            Path("Skel/Main.lean"),
+            15,
+            "theorem",
+        )
+        index = SourceIndex(
+            root=project,
+            declarations={declaration.name: declaration},
+            source_digest="windows-publication-fixture",
+            line_counts={Path("Skel/Main.lean"): 21},
+        )
+        return extract_graph_skeletons(
+            load_graph(blueprint),
+            lean_root=project,
+            libraries=lean_libraries(project),
+            index=index,
+            runner=lambda _probe, _root: output,
+        )
     return extract_skeletons(blueprint, lean_root=project, runner=lambda probe, root: output)
 
 
@@ -269,7 +303,7 @@ def test_probe_spells_names_without_trusting_lean_to_parse_them() -> None:
     )
 
     assert probe.startswith("import Skel.Defs\nimport Skel.Main\n")
-    assert 'Name.str (Name.str (Name.anonymous) "Skel") "observation_determined"' in probe
+    assert _requested(probe) == [["Skel.observation_determined", ["Skel", "observation_determined"]]]
     assert f'"{PROBE_MARKER}' in probe
     assert "def probeOutputLimit : Nat := 67108864" in probe
     assert 'Name.str (Name.anonymous) "Init"' in probe
@@ -280,13 +314,24 @@ def test_probe_spells_names_without_trusting_lean_to_parse_them() -> None:
 def test_probe_transports_quoted_and_numeric_name_components_structurally() -> None:
     probe = render_probe(
         imports=("Skel.Main",),
-        roots=("Skel.«quoted.name with space».2",),
-        project_roots=("Skel",),
+        roots=("Skel.«quoted.name with space».2", "Skel.«2»", "Skel.٢"),
+        project_roots=("Skel.«quoted».2",),
     )
 
-    assert '"Skel.«quoted.name with space».2"' in probe
-    assert 'Name.str (Name.str (Name.anonymous) "Skel") "quoted.name with space"' in probe
-    assert "Name.num (Name.str" in probe
+    assert _requested(probe, "let projectRoots :=") == [["Skel.«quoted».2", ["Skel", "quoted", 2]]]
+    assert _requested(probe) == [
+        ["Skel.«quoted.name with space».2", ["Skel", "quoted.name with space", 2]],
+        ["Skel.«2»", ["Skel", "2"]],
+        ["Skel.٢", ["Skel", "٢"]],
+    ]
+
+
+def _requested(probe: str, binding: str = "for (request, root) in") -> object:
+    """The JSON names a rendered probe decodes for ``binding``, by default the roots it requests."""
+
+    literal = re.search(re.escape(binding) + r' \(← AutoformSkeleton\.requestedRoots ("(?:[^"\\]|\\.)*")', probe)
+    assert literal is not None
+    return json.loads(json.loads(literal.group(1)))
 
 
 def test_probe_refuses_to_render_nothing() -> None:
@@ -312,7 +357,7 @@ def test_probe_refuses_stale_artifacts_before_executing_lean(tmp_path: Path, mon
 
     monkeypatch.setattr("autoform_cli.skeleton._run_bounded_command", fake_run)
 
-    with pytest.raises(SkeletonError, match="build artifacts are stale"):
+    with pytest.raises(SkeletonError, match=r"run `lake build Skel.Main`"):
         run_probe(probe, tmp_path)
 
     assert calls == [["/bin/lake", "--rehash", "--no-build", "build", "Skel.Main"]]
@@ -401,25 +446,243 @@ def test_bounded_command_rejects_a_successful_parent_with_a_live_descendant(
     _assert_dies(int(child_pid.read_text(encoding="utf-8")), "descendant", "successful parent exit")
 
 
+_OUTLIVED_BY_A_CHILD = (
+    "import subprocess, sys; "
+    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+    "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-specific")
+@pytest.mark.parametrize("sigchld", ["default", "ignored"])
+@pytest.mark.parametrize("waitid", [True, False], ids=["waitid", "zombie-status"])
+@pytest.mark.parametrize(
+    ("program", "refusal"),
+    [("pass", None), (_OUTLIVED_BY_A_CHILD, "descendant processes"), ("import time; time.sleep(30)", "timed out")],
+    ids=["exits", "outlived", "timed-out"],
+)
+def test_bounded_command_signals_its_group_only_while_the_leader_is_unreaped(
+    tmp_path: Path, monkeypatch, program: str, refusal: str | None, waitid: bool, sigchld: str
+) -> None:
+    # A reaped leader's process group id can pass to an unrelated group, which
+    # a later killpg would then signal. Python before 3.13 has no os.waitid on
+    # macOS, where psutil's zombie status stands in, and a launcher that ignores
+    # SIGCHLD has the kernel reap every child as it exits.
+    leaders: dict[int, subprocess.Popen[bytes]] = {}
+    popen, killpg = subprocess.Popen, os.killpg
+
+    def remember(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        leaders[process.pid] = process
+        return process
+
+    def unreaped(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)  # a zombie still answers; a reaped process does not
+        except ProcessLookupError:
+            return False
+        return True
+
+    def checked_killpg(pid: int, signal_number: int) -> None:
+        assert pid not in leaders or (leaders[pid].returncode is None and unreaped(pid)), (
+            "signalled a reaped leader's group"
+        )
+        killpg(pid, signal_number)
+
+    monkeypatch.setattr("autoform_cli.skeleton.subprocess.Popen", remember)
+    monkeypatch.setattr("autoform_cli.skeleton.os.killpg", checked_killpg)
+    if not waitid:
+        monkeypatch.delattr(os, "waitid", raising=False)
+    previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN if sigchld == "ignored" else signal.SIG_DFL)
+    try:
+        if refusal is None:
+            assert _bounded(tmp_path, program).returncode == 0
+        else:
+            with pytest.raises(SkeletonError, match=refusal):
+                _bounded(tmp_path, program, **({"timeout": 1} if refusal == "timed out" else {}))
+    finally:
+        signal.signal(signal.SIGCHLD, previous)
+    assert all(leader.returncode is not None for leader in leaders.values())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-specific")
+def test_bounded_command_defers_a_signal_that_arrives_while_the_leader_is_reaped(tmp_path: Path, monkeypatch) -> None:
+    # A signal between waitpid's reap and Popen's recorded status must not reach
+    # cleanup while the leader still looks unreaped, or cleanup would signal its
+    # freed group id. The signal is handled once the reap is recorded.
+    reaped: set[int] = set()
+    waitpid, killpg = os.waitpid, os.killpg
+
+    def signalled_waitpid(pid: int, options: int) -> tuple[int, int]:
+        result = waitpid(pid, options)
+        if result[0]:
+            reaped.add(result[0])
+            signal.raise_signal(signal.SIGTERM)
+        return result
+
+    def checked_killpg(pid: int, signal_number: int) -> None:
+        assert pid not in reaped, "signalled a reaped leader's group"
+        killpg(pid, signal_number)
+
+    delivered: list[int] = []
+    previous = signal.signal(signal.SIGTERM, lambda signum, frame: delivered.append(signum))
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr("autoform_cli.skeleton.os.waitpid", signalled_waitpid)
+            patch.setattr("autoform_cli.skeleton.os.killpg", checked_killpg)
+            with pytest.raises(SkeletonError, match="interrupted by SIGTERM"):
+                _bounded(tmp_path, "pass")
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert reaped
+    assert delivered == [signal.SIGTERM]
+
+
 @pytest.mark.skipif(os.name != "posix", reason="detached-session assertion is POSIX-specific")
 def test_bounded_command_finds_a_descendant_that_escapes_its_process_group(
     tmp_path: Path,
 ) -> None:
     child_pid = tmp_path / "detached-child.pid"
     child_program = (
-        "import os, pathlib, time; os.setsid(); "
-        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid())); time.sleep(30)"
+        "import os, pathlib, sys, time; os.setsid(); time.sleep(0.1); "
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid())); "
+        "ready_fd = int(sys.argv[1]); os.write(ready_fd, b'1'); "
+        "os.close(ready_fd); time.sleep(30)"
     )
     parent_program = (
-        "import subprocess, sys; "
-        f"subprocess.Popen([sys.executable, '-c', {child_program!r}], "
-        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+        "import os, subprocess, sys\n"
+        "read_fd, write_fd = os.pipe()\n"
+        "try:\n"
+        f"    subprocess.Popen([sys.executable, '-c', {child_program!r}, str(write_fd)], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(write_fd,))\n"
+        "finally:\n"
+        "    os.close(write_fd)\n"
+        "try:\n"
+        "    ready = os.read(read_fd, 1)\n"
+        "finally:\n"
+        "    os.close(read_fd)\n"
+        "if ready != b'1':\n"
+        "    raise RuntimeError('detached child did not become ready')\n"
     )
 
     with pytest.raises(SkeletonError, match="descendant processes"):
         _bounded(tmp_path, parent_program)
 
     _assert_dies(int(child_pid.read_text(encoding="utf-8")), "detached descendant", "cleanup")
+
+
+def test_tagged_process_scan_retries_a_transient_system_error(monkeypatch) -> None:
+    class Candidate:
+        pid = 123456
+
+        def environ(self):
+            return {"_AUTOFORM_PROCESS_TOKEN": "owned"}
+
+        def create_time(self):
+            return 7.0
+
+    calls = 0
+
+    def process_iter():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise SystemError("transient Darwin process state")
+        return [Candidate()]
+
+    monkeypatch.setattr(psutil, "process_iter", process_iter)
+    descendants = {}
+
+    _remember_tagged_processes("owned", descendants, root_pid=654321)
+
+    assert calls == 2
+    assert list(descendants) == [(123456, 7.0)]
+
+
+def test_tagged_process_scan_fails_closed_after_repeated_system_errors(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        psutil,
+        "process_iter",
+        lambda: (_ for _ in ()).throw(SystemError("persistent failure")),
+    )
+
+    with pytest.raises(SkeletonError, match="cannot safely inspect"):
+        _remember_tagged_processes("owned", {}, root_pid=654321)
+
+    # Cleanup mode must still reach process-group termination rather than
+    # allowing a flaky process-table read to mask the original failure.
+    _remember_tagged_processes("owned", {}, root_pid=654321, strict=False)
+
+
+@pytest.mark.parametrize("error", [OSError("scan failed"), psutil.Error("scan failed")])
+def test_tagged_process_scan_fails_closed_when_enumeration_remains_unreadable(
+    monkeypatch,
+    error: BaseException,
+) -> None:
+    monkeypatch.setattr(
+        psutil,
+        "process_iter",
+        lambda: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(SkeletonError, match="repeated process-table errors"):
+        _remember_tagged_processes("owned", {}, root_pid=654321)
+
+    _remember_tagged_processes("owned", {}, root_pid=654321, strict=False)
+
+
+def test_tagged_process_scan_does_not_treat_mixed_failures_as_success(
+    monkeypatch,
+) -> None:
+    errors = iter((SystemError("transient state"), OSError("table unreadable")))
+    monkeypatch.setattr(
+        psutil,
+        "process_iter",
+        lambda: (_ for _ in ()).throw(next(errors)),
+    )
+
+    with pytest.raises(SkeletonError, match="repeated process-table errors"):
+        _remember_tagged_processes("owned", {}, root_pid=654321)
+
+
+def test_tagged_process_scan_retries_a_candidate_system_error(monkeypatch) -> None:
+    calls = 0
+
+    class Candidate:
+        pid = 123456
+
+        def environ(self):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise SystemError("transient process state")
+            return {"_AUTOFORM_PROCESS_TOKEN": "owned"}
+
+        def create_time(self):
+            return 7.0
+
+    monkeypatch.setattr(psutil, "process_iter", lambda: [Candidate()])
+    descendants = {}
+
+    _remember_tagged_processes("owned", descendants, root_pid=654321)
+
+    assert calls == 2
+    assert list(descendants) == [(123456, 7.0)]
+
+
+def test_process_liveness_fails_closed_on_inspection_uncertainty() -> None:
+    class Uncertain:
+        def is_running(self):
+            raise SystemError("transient process state")
+
+    class Gone:
+        def is_running(self):
+            raise psutil.NoSuchProcess(123456)
+
+    assert _process_is_alive(Uncertain()) is True
+    assert _process_is_alive(Gone()) is False
 
 
 def test_bounded_command_interruption_kills_the_process(tmp_path: Path, monkeypatch) -> None:
@@ -505,6 +768,17 @@ def test_bounded_command_termination_signal_kills_the_process_group(
         survivors = [pid for pid in survivors if _pid_is_live(pid)]
         time.sleep(0.01)
     assert not survivors
+
+
+def test_unreadable_probe_records_are_refused(tmp_path: Path) -> None:
+    records = tmp_path / "records.out"
+    records.write_bytes(PROBE_MARKER.encode() + b"\xff\n")
+    with pytest.raises(SkeletonError, match="^the skeleton probe's records are not valid UTF-8$"):
+        _read_probe_records(records, "skeleton probe")
+    records.unlink()
+    records.mkdir()
+    with pytest.raises(SkeletonError, match="^the unused-hypotheses probe's records could not be read: "):
+        _read_probe_records(records, "unused-hypotheses probe")
 
 
 def _pid_is_live(pid: int) -> bool:
@@ -661,6 +935,16 @@ def test_parse_probe_output_keys_records_by_root_and_ignores_noise() -> None:
     assert records["Skel.ghost"] == {"root": "Skel.ghost", "found": False}
 
 
+def test_parse_probe_output_breaks_lines_only_at_newlines() -> None:
+    # Lean's JSON printer leaves U+0085, U+2028 and U+2029 unescaped, and
+    # `str.splitlines` would split a record at each of them.
+    root = "Skel.«a\x85b\u2028c\u2029d»"
+
+    records = parse_probe_output(PROBE_MARKER + json.dumps({"root": root, "found": False}, ensure_ascii=False) + "\n")
+
+    assert records == {root: {"root": root, "found": False}}
+
+
 def test_parse_probe_output_rejects_malformed_records() -> None:
     with pytest.raises(SkeletonError):
         parse_probe_output(PROBE_MARKER + "{not json")
@@ -753,6 +1037,10 @@ def _ambiguous_companion(record: dict[str, object]) -> None:
     [
         (lambda record: record.update(semantic_schema="unknown"), "unsupported semantic schema"),
         (lambda record: record.update(semantic="not JSON"), "invalid elaborated semantic material"),
+        (
+            lambda record: record.update(semantic=UNDECODABLE_JSON["a-number-too-long"]),
+            "invalid elaborated semantic material",
+        ),
         (_unknown_safety, "invalid elaborated semantic material"),
         (_ambiguous_companion, "invalid elaborated semantic material"),
         (lambda record: record["trusted"][0].update(depends=[False]), "invalid depends"),
@@ -865,6 +1153,140 @@ def test_a_package_without_library_targets_is_its_own_library(tmp_path: Path) ->
 
     assert (library.name, library.roots) == ("Solo", ("Solo",))
     assert library.src_dir == project.resolve()
+
+
+@pytest.mark.parametrize(
+    ("lakefile", "src_dir"),
+    [
+        pytest.param(
+            'name = "proj"\nsrcDir = "pkgsrc"\n\n[[lean_lib]]\nname = "Proj"\nsrcDir = "lib"\n',
+            "pkgsrc/lib",
+            id="library",
+        ),
+        pytest.param('name = "Proj"\nsrcDir = "pkgsrc"\n', "pkgsrc", id="package-only"),
+    ],
+)
+def test_libraries_nest_under_the_package_source_directory(tmp_path: Path, lakefile: str, src_dir: str) -> None:
+    project = tmp_path / "project"
+    (project / src_dir).mkdir(parents=True)
+    (project / "lakefile.toml").write_text(lakefile, encoding="utf-8")
+    (project / src_dir / "Proj.lean").write_text("", encoding="utf-8")
+
+    libraries = lean_libraries(project)
+
+    # Lake joins a library's srcDir onto the package's srcDir, not onto the project root.
+    assert libraries[0].src_dir == (project / src_dir).resolve()
+    assert module_of(project / src_dir / "Proj.lean", libraries) == "Proj"
+    assert path_of("Proj", libraries, project) == f"{src_dir}/Proj.lean"
+
+
+@pytest.mark.parametrize(
+    "toml_11",
+    [
+        pytest.param('leanOptions = { autoImplicit = false, }\n', id="inline-trailing-comma"),
+        pytest.param('leanOptions = {\n  autoImplicit = false\n}\n', id="inline-multiline"),
+        pytest.param('note = "\\e"\n', id="escape-e"),
+        pytest.param('note = "\\x41"\n', id="escape-x"),
+    ],
+)
+def test_lake_toml_1_1_extensions_are_rejected_on_every_python(tmp_path: Path, toml_11: str) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "lakefile.toml").write_text('name = "Solo"\n' + toml_11, encoding="utf-8")
+
+    # Lake 4.32.2 reads TOML 1.0 and rejects every spelling in this matrix.
+    with pytest.raises(SkeletonError, match="cannot parse the Lake configuration"):
+        lean_libraries(project)
+
+
+def test_lake_toml_parser_limits_fail_closed(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "lakefile.toml").write_text(
+        f'name = "Solo"\nunknown = {"9" * 5_000}\n', encoding="utf-8"
+    )
+
+    with pytest.raises(SkeletonError, match="cannot safely parse.*exceeds the parser's limits"):
+        lean_libraries(project)
+
+
+def _project_with_both_lakefiles(tmp_path: Path) -> Path:
+    """lakefile.toml builds ``Skel`` from ``src``; lakefile.lean builds a differently laid out library."""
+
+    project = _project(tmp_path, src_dir="src")
+    (project / "lakefile.lean").write_text(
+        "import Lake\nopen Lake DSL\n\npackage fromlean\n\n"
+        'lean_lib FromLean where\n  srcDir := "lean-src"\n  roots := #[`LeanRoot]\n',
+        encoding="utf-8",
+    )
+    return project
+
+
+def test_lakefile_lean_wins_when_both_lakefiles_exist(tmp_path: Path, monkeypatch) -> None:
+    project = _project_with_both_lakefiles(tmp_path)
+    translated: list[Path] = []
+
+    def translate(root: Path) -> bytes:
+        translated.append(root)
+        return b'name = "fromlean"\n\n[[lean_lib]]\nname = "FromLean"\nsrcDir = "lean-src"\nroots = ["LeanRoot"]\n'
+
+    monkeypatch.setattr("autoform_cli.skeleton._translate_lakefile", translate)
+
+    (library,) = lean_libraries(project)
+
+    # Lake builds from lakefile.lean when both exist, so its libraries are the project's.
+    assert translated == [project.resolve()]
+    assert (library.name, library.src_dir, library.roots) == ("FromLean", project.resolve() / "lean-src", ("LeanRoot",))
+
+
+def test_a_project_with_both_lakefiles_is_refused_without_lake(tmp_path: Path, monkeypatch) -> None:
+    project = _project_with_both_lakefiles(tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    # Lake ignores lakefile.toml here, so reading it instead would describe the wrong build.
+    with pytest.raises(SkeletonError, match="lake is not on PATH"):
+        lean_libraries(project)
+
+
+def test_a_failed_translation_reports_the_error_rather_than_lakes_info_line(tmp_path: Path, monkeypatch) -> None:
+    project = _project_with_both_lakefiles(tmp_path)
+    error = f"error: {project / 'lakefile.lean'}:7:12: Unknown identifier `nonsense`"
+    stderr = "info: [root]: lakefile.lean and lakefile.toml are both present; using lakefile.lean\n" + error + "\n"
+    monkeypatch.setattr(shutil, "which", lambda _name: "lake")
+    monkeypatch.setattr(
+        "autoform_cli.skeleton._run_bounded_command",
+        lambda command, **_options: subprocess.CompletedProcess(command, 1, "", stderr),
+    )
+
+    with pytest.raises(SkeletonError) as caught:
+        lean_libraries(project)
+
+    assert caught.value.issues == (f"lake translate-config failed: {error}",)
+
+
+def _project_with_a_package_source_directory(tmp_path: Path) -> Path:
+    """lakefile.lean puts the package's sources under ``pkgsrc`` and gives its library no srcDir of its own."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    shutil.copy(_FIXTURE / "lean-toolchain", project / "lean-toolchain")
+    (project / "lakefile.lean").write_text(
+        'import Lake\nopen Lake DSL\n\npackage proj where\n  srcDir := "pkgsrc"\n\nlean_lib Proj\n', encoding="utf-8"
+    )
+    return project
+
+
+def test_lakefile_lean_libraries_nest_under_the_package_source_directory(tmp_path: Path, monkeypatch) -> None:
+    project = _project_with_a_package_source_directory(tmp_path)
+    # lake translate-config writes the package's srcDir as a top-level key.
+    monkeypatch.setattr(
+        "autoform_cli.skeleton._translate_lakefile",
+        lambda _root: b'name = "proj"\nsrcDir = "pkgsrc"\n\n[[lean_lib]]\nname = "Proj"\n',
+    )
+
+    (library,) = lean_libraries(project)
+
+    assert (library.name, library.src_dir) == ("Proj", project.resolve() / "pkgsrc")
 
 
 def test_a_project_without_a_lakefile_is_refused(tmp_path: Path) -> None:
@@ -1122,7 +1544,8 @@ def test_extraction_reports_names_the_sources_and_the_environment_lack(tmp_path:
 
     assert not report.clean
     assert tuple(issue.message for issue in report.unresolved) == (
-        "basics/ghost: Skel.ghost: not in the built environment; run `lake build`",
+        "basics/ghost: Skel.ghost: not in the built environment after importing "
+        "Skel.Main; check the `lean:` target and declaring source",
         "basics/phantom: Skel.doesNotExist: declaration not found in the Lean sources",
     )
     assert [node.node_id for node in report.nodes] == ["basics/determined", "basics/ghost", "basics/phantom"]
@@ -1209,6 +1632,48 @@ def test_custom_runner_rejects_sources_changed_during_probe(tmp_path: Path) -> N
 
     with pytest.raises(SkeletonError, match="Lean sources changed"):
         extract_skeletons(blueprint, lean_root=project, runner=changing_runner)
+
+
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        (None, "Lean sources could not be indexed"),
+        (
+            "permission denied: Project/Secret.lean",
+            "Lean sources could not be indexed: permission denied: Project/Secret.lean",
+        ),
+    ],
+)
+@pytest.mark.parametrize("failure_call", (1, 2))
+def test_extraction_translates_source_index_io_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_call: int, reason: str | None, message: str
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    real_index_project = index_project
+    calls = 0
+
+    def fail_index(root: Path):
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            if reason is not None:
+                raise LeanSourceError(reason)
+            raise OSError(f"private host detail: {root}")
+        return real_index_project(root)
+
+    monkeypatch.setattr("autoform_cli.skeleton.index_project", fail_index)
+
+    with pytest.raises(SkeletonError) as error:
+        extract_skeletons(
+            blueprint,
+            lean_root=project,
+            runner=lambda probe, root: _fake_probe_output(),
+        )
+
+    assert error.value.issues == (message,)
+    assert str(tmp_path) not in str(error.value)
+    assert calls == failure_call
 
 
 def test_extraction_rejects_configuration_changed_while_reading_libraries(tmp_path: Path, monkeypatch) -> None:
@@ -1330,6 +1795,11 @@ def test_probe_comment_ranges_must_cover_comments(tmp_path: Path, ranges: object
         ("../../sources/missing.tex#L1-L1", "names a missing file"),
         ("../../sources/binary.tex#L1-L1", "not readable UTF-8 text"),
         ("../../../outside.tex#L1-L1", "points outside the blueprint"),
+        ("../../sources/loop.txt#L1-L1", "names a path that cannot be resolved"),
+        ("../../sources/loopdir/book.tex#L1-L1", "names a path that cannot be resolved"),
+        pytest.param("../../sources/" + "a" * 300 + ".tex#L1-L1", "names a path that cannot be resolved", id="long-name"),
+        ("../../sources/bo\x00ok.tex#L1-L1", "contains an invalid path"),
+        pytest.param("../../sources/book.tex#L" + "1" * 5000, "names no lines of its file", id="5000-digits"),
     ],
 )
 def test_extraction_reports_a_locator_that_names_no_passage(tmp_path: Path, link: str, why: str) -> None:
@@ -1340,6 +1810,12 @@ def test_extraction_reports_a_locator_that_names_no_passage(tmp_path: Path, link
     (sources / "book.tex").write_text("one\ntwo\nthree\n", encoding="utf-8")
     (sources / "empty.tex").write_text("", encoding="utf-8")
     (sources / "binary.tex").write_bytes(b"\xff\xfe\n")
+    try:
+        (sources / "loop.txt").symlink_to("loop.txt")
+        (sources / "loopdir").symlink_to("loopdir")
+    except OSError:
+        if "loop" in link:
+            pytest.skip("symlinks are unavailable")
     (tmp_path / "outside.tex").write_text("outside\n", encoding="utf-8")
     article = blueprint / "roadmap" / "basics" / "determined.md"
     _replace_source(article, "## Depends on", f"## Sources\n\n- [book]({link})\n\n## Depends on")
@@ -1353,6 +1829,22 @@ def test_extraction_reports_a_locator_that_names_no_passage(tmp_path: Path, link
 
     _replace_source(article, link, "../../sources/book.tex#L2-L3")
     report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+    assert report.clean
+    assert report.nodes[0].passage == "two\nthree"
+
+
+def test_extraction_skips_a_sources_link_it_cannot_parse(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    sources = blueprint / "sources"
+    sources.mkdir()
+    (sources / "book.tex").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    article = blueprint / "roadmap" / "basics" / "determined.md"
+    links = "- [host](http://[oops/book.tex#L1-L1)\n- [book](../../sources/book.tex#L2-L3)"
+    _replace_source(article, "## Depends on", f"## Sources\n\n{links}\n\n## Depends on")
+
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+
     assert report.clean
     assert report.nodes[0].passage == "two\nthree"
 
@@ -1424,6 +1916,36 @@ def test_report_distinguishes_full_and_filtered_blueprint_scope(tmp_path: Path) 
     assert filtered.selection == "filtered"
     assert filtered.selected_nodes == ("basics/first",)
     assert full.to_json() != filtered.to_json()
+
+
+@pytest.mark.parametrize("passage", ["found", "broken"])
+def test_a_root_several_files_declare_fails_closed_naming_every_file(tmp_path: Path, passage: str) -> None:
+    # Lean accepts a private declaration beside a public one of the same name
+    # in another module, and two unrelated modules may each declare it; the
+    # lexical index cannot tell which one a probe would bind.
+    project = _project(tmp_path)
+    for module, prefix, value in (("Cdup", "", "2 = 2"), ("Adup", "private ", "True"), ("Bdup", "", "1 = 1")):
+        (project / "Skel" / f"{module}.lean").write_text(
+            f"namespace Skel\n{prefix}theorem dup : {value} := sorry\nend Skel\n", encoding="utf-8"
+        )
+    blueprint = _blueprint(tmp_path, lean={"dup": "Skel.dup"})
+    if passage == "broken":
+        article = blueprint / "roadmap" / "basics" / "dup.md"
+        article.write_text(
+            article.read_text(encoding="utf-8").replace(
+                "## Depends on", "## Sources\n\n- [book](../../sources/missing.tex#L1-L1)\n\n## Depends on"
+            ),
+            encoding="utf-8",
+        )
+    def runner(probe: str, root: Path) -> str:
+        raise AssertionError("the probe must not run")
+
+    report = extract_skeletons(blueprint, lean_root=project, runner=runner)
+
+    assert report.nodes[0].declarations == ()
+    (issue,) = report.unresolved
+    assert issue.reason.endswith("several source files declare it: Skel/Adup.lean, Skel/Bdup.lean, Skel/Cdup.lean")
+    assert issue.reason.startswith("source locator ") == (passage == "broken")
 
 
 def test_report_is_identical_across_checkout_roots(tmp_path: Path) -> None:
@@ -1507,6 +2029,32 @@ def test_report_states_shared_material_once(tmp_path: Path) -> None:
     payload = json.loads(first)
     payload["trusted"]["Skel.Eligible"]["name"] = "Skel.NonAmbiguous"
     _assert_load_rejects(path, payload, "mismatched shared trusted declaration")
+
+
+@pytest.mark.parametrize("damage", ["nested", "a-number-too-long"])
+def test_a_report_or_packet_manifest_that_cannot_be_decoded_is_refused(tmp_path: Path, damage: str) -> None:
+    text = UNDECODABLE_JSON[damage]
+    path = tmp_path / "skeleton.json"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(SkeletonError, match=f"^cannot read skeleton report {re.escape(str(path))}: "):
+        load_skeleton_report(path)
+
+    packets = tmp_path / "packets"
+    packets.mkdir()
+    (packets / PACKET_MANIFEST).write_text(text, encoding="utf-8")
+    with pytest.raises(SkeletonError, match="refusing to overwrite non-Autoform packet output"):
+        write_packets(_fake_report(tmp_path), packets)
+    assert (packets / PACKET_MANIFEST).read_text(encoding="utf-8") == text
+
+
+def test_report_loader_refuses_a_lone_surrogate_as_unreadable(tmp_path: Path) -> None:
+    text = _fake_report(tmp_path).to_json()
+    assert '"lean_version":"' in text
+    path = tmp_path / "skeleton.json"
+    path.write_text(text.replace('"lean_version":"', '"lean_version":"\\ud800', 1), encoding="utf-8")
+
+    with pytest.raises(SkeletonError, match="surrogates not allowed"):
+        load_skeleton_report(path)
 
 
 def test_report_loader_rejects_scope_tampering(tmp_path: Path) -> None:
@@ -1644,7 +2192,7 @@ def test_cli_reports_extraction_failures_on_stderr(tmp_path: Path, capsys) -> No
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err.startswith("error: no lakefile.toml or lakefile.lean in ")
+    assert captured.err == "error: Lean root does not exist or is not a directory\n"
 
 
 def test_cli_reports_an_invalid_report_output_without_a_traceback(
@@ -1930,6 +2478,24 @@ def _lean_toolchain_available() -> bool:
         return unavailable("elan toolchain discovery failed")
     available = any(line.split()[:1] == [pinned] for line in listed.stdout.splitlines())
     return available or unavailable(f"{pinned} is not installed")
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_lakefile_lean_wins_through_lake_translate_config(tmp_path: Path) -> None:
+    project = _project_with_both_lakefiles(tmp_path)
+
+    (library,) = lean_libraries(project)
+
+    assert (library.name, library.src_dir, library.roots) == ("FromLean", project.resolve() / "lean-src", ("LeanRoot",))
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_package_source_directory_nests_libraries_through_lake_translate_config(tmp_path: Path) -> None:
+    project = _project_with_a_package_source_directory(tmp_path)
+
+    (library,) = lean_libraries(project)
+
+    assert (library.name, library.src_dir) == ("Proj", project.resolve() / "pkgsrc")
 
 
 def test_required_real_lean_tests_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2608,6 +3174,33 @@ def _probe_records(
     return parse_probe_output(run_probe(probe, project))
 
 
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_probe_reads_more_roots_than_lean_compiles_in_a_list(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build(project, "Skel.Semantics")
+    # Found roots with a quoted, a needlessly quoted and a numeric component;
+    # absent ones with characters a Lean string literal must escape, and with
+    # control characters and line breaks that Lean's JSON printer escapes or not.
+    found = (
+        "Skel.Semantics.«quoted.helper»",
+        "Skel.Semantics.«usesQuoted»",
+        "_private.Skel.Semantics.0.Skel.Semantics.privateUnsafeValue",
+    )
+    absent = (
+        "Skel.«a\\b\"c»",
+        "Skel.𝔸",
+        "Skel.«a\nb\bc\x7fd\x85e\u2028f»",
+        *(f"Skel.Semantics.absent{i}" for i in range(3000)),
+    )
+    # The library roots reach the probe the same way.
+    project_roots = ("Skel.Semantics", *(f"Absent{i}" for i in range(3000)))
+
+    probe = render_probe(imports=("Skel.Semantics",), roots=(*found, *absent), project_roots=project_roots)
+    records = parse_probe_output(run_probe(probe, project))
+
+    assert [records[root]["found"] for root in (*found, *absent)] == [True] * 3 + [False] * 3003
+
+
 def _declaration_of(project: Path, record: dict[str, object]):
     return _declaration(
         record,
@@ -3150,6 +3743,119 @@ def test_packet_publication_rolls_back_both_trees_on_commit_failure(
 
     assert (packets / "old-marker").read_text(encoding="utf-8") == "old packets\n"
     assert (passages / "old-marker").read_text(encoding="utf-8") == "old passages\n"
+
+
+class _ManifestFirstListing:
+    """A directory listing that yields ``manifest.json`` first, the order that exposed packets."""
+
+    def __init__(self, listing) -> None:
+        with listing:
+            self._entries = iter(sorted(listing, key=lambda entry: entry.name.casefold() != PACKET_MANIFEST))
+
+    # Iterated with ``next`` by ``os.walk``, which ``shutil.rmtree`` uses without descriptor functions.
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._entries)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        return None
+
+
+def test_packet_publication_never_shows_lean_capture_an_unmarked_packet(tmp_path: Path, monkeypatch) -> None:
+    """After every filesystem step, each folder under the Lean root holds no folder or Lean file
+    unless it also holds its whole, recognized manifest, so a Lean capture never indexes a packet."""
+
+    report = _fake_report(tmp_path / "fixture")
+    # Each node gets a passage, so the passage stage also holds folders that need its manifest.
+    report = replace(report, nodes=tuple(replace(node, passage="source") for node in report.nodes))
+    lean_root = tmp_path / "lean"
+    packets, passages = lean_root / "packets", lean_root / "passages"
+    write_packets(report, packets, passages=passages)
+    (packets / "old-marker").write_text("old packets\n", encoding="utf-8")
+    assert snapshot_project_sources(lean_root).source_files == ()
+    exposed: list[str] = []
+
+    def check(event: str) -> None:
+        for folder in lean_root.iterdir():
+            # An install preflight probe holds only empty folders, never packets.
+            if "autoform-preflight" in folder.name:
+                continue
+            manifest = folder / PACKET_MANIFEST
+            recognized = manifest.is_file() and _is_managed_output_manifest_bytes(manifest.read_bytes())
+            if manifest.exists() and not recognized:
+                exposed.append(f"after {event}: {folder.name} shows an incomplete marker")
+            # A capture descends only into folders and indexes only Lean files.
+            others = [
+                name
+                for name in os.listdir(folder)
+                if name != PACKET_MANIFEST and ((folder / name).is_dir() or name.endswith(".lean"))
+            ]
+            if others and not recognized:
+                exposed.append(f"after {event}: {folder.name} holds {sorted(others)} without its marker")
+
+    def observed(owner, name: str) -> None:
+        original = getattr(owner, name)
+
+        def call(*args, **kwargs):
+            result = original(*args, **kwargs)
+            check(name)
+            return result
+
+        monkeypatch.setattr(owner, name, call)
+
+    for owner, name in ((Path, "mkdir"), (os, "unlink"), (os, "rmdir"), (os, "replace"), (os, "rename")):
+        observed(owner, name)
+    path_open = Path.open
+
+    def open_and_check(self, mode: str = "r", *args, **kwargs):
+        stream = path_open(self, mode, *args, **kwargs)
+        # A file opened for writing is visible, still empty, until the write lands.
+        if not set(mode).isdisjoint("wxa+"):
+            check("open")
+        return stream
+
+    monkeypatch.setattr(Path, "open", open_and_check)
+    scandir = os.scandir
+    monkeypatch.setattr(os, "scandir", lambda *args, **kwargs: _ManifestFirstListing(scandir(*args, **kwargs)))
+
+    write_packets(report, packets, passages=passages)
+    monkeypatch.undo()
+
+    assert exposed == []
+    assert not (packets / "old-marker").exists()
+    assert (packets / "basics" / "determined" / "article.lean").is_file()
+    assert (passages / "basics" / "determined" / "passage.txt").is_file()
+    assert sorted(path.name for path in lean_root.iterdir()) == ["packets", "passages"]
+
+
+# Lean capture matches the marker by folded name, so a differently cased one hides the folder too.
+def test_removing_output_deletes_its_manifest_last(tmp_path: Path, monkeypatch) -> None:
+    output = tmp_path / "output"
+    (output / "nested").mkdir(parents=True)
+    (output / "Manifest.json").write_text("{}\n", encoding="utf-8")
+    (output / "nested" / "packet.lean").write_text("theorem t : True := trivial\n", encoding="utf-8")
+    (output / "article.lean").write_text("theorem u : True := trivial\n", encoding="utf-8")
+    removed: list[str] = []
+    unlink = os.unlink
+
+    def record(path, *args, **kwargs) -> None:
+        removed.append(Path(os.fsdecode(path)).name)
+        unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", record)
+    scandir = os.scandir
+    monkeypatch.setattr(os, "scandir", lambda *args, **kwargs: _ManifestFirstListing(scandir(*args, **kwargs)))
+
+    _remove_output(output)
+
+    assert not output.exists()
+    assert sorted(removed) == ["Manifest.json", "article.lean", "packet.lean"]
+    assert removed[-1] == "Manifest.json"
 
 
 def test_packet_publication_rolls_back_both_trees_when_interrupted(

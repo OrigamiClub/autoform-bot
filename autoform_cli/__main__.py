@@ -6,21 +6,40 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
 from . import prove2me_cli, status
-from .article_identity import plan_article_ids
+from .article_identity import ArticleIdWriteError, plan_article_ids, write_article_ids
 from .audit import audit_blueprint
 from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_key
 from .doctor import diagnose_project
-from .graph import GraphValidationError, load_graph
-from .lean import build_linker, declaration_names
+from .dashboard import publication_bound_live_state, serve_dashboard
+from .graph import Graph, GraphValidationError, load_graph
+from .impact import (
+    ImpactError,
+    format_impact,
+    format_module_import_impact,
+    module_import_impact,
+    revision_impact,
+)
+from .lean import build_linker, declaration_names, index_failure_message
+from .library.generate import GenerateError, check_index, generate_index, write_index
+from .library.index import INDEX_FILE
+from .library.listing import indexed_packages, list_libraries
+from .library.locate import LibraryError, WorkspaceError
+from .library.search import LibraryResult, library_argument, search_with_libraries
+from .markdown import local_target_issue
+from .project import ProjectCatalogError, ProjectCreateError, create_project, inspect_project, load_release_catalog
 from .render import PublicationError, render_site
+from .runtime import RuntimeProjectionError, projection_omissions, resolve_runtime_paths
 from .scaffold import ScaffoldError, scaffold_project
+from .search import SearchError, search_blueprint, statement_preview
 from .skeleton import (
     DEFAULT_PROBE_TIMEOUT,
     SkeletonError,
@@ -30,6 +49,8 @@ from .skeleton import (
     write_packets,
     write_skeleton_report,
 )
+from .unused_hypotheses import find_unused_hypotheses, format_unused_hypotheses
+from .work import WORK_SCHEMA, WorkError, assumption_contract, list_ready_work, work_context
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -43,7 +64,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     init.add_argument(
         "--autoform-source",
         default="",
-        help="Autoform Git source the generated workflows install from (default: this checkout's origin)",
+        help=(
+            "Autoform Git source the generated workflows install from "
+            "(default: a safe remote locally known to contain this checkout's HEAD)"
+        ),
     )
     init.add_argument(
         "--autoform-ref",
@@ -71,11 +95,233 @@ def main(argv: Sequence[str] | None = None) -> int:
     doctor.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
     doctor.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
+    dashboard = subparsers.add_parser(
+        "dashboard",
+        help="serve the built publication with a loopback-only live claim overlay",
+    )
+    dashboard.add_argument(
+        "target",
+        nargs="?",
+        default=".",
+        help="project root or blueprint directory (default: current directory)",
+    )
+    dashboard.add_argument("--site-dir", default="site", help="built MkDocs site directory")
+    dashboard.add_argument("--repo", help="claim-board Git repository; defaults to project origin")
+    dashboard.add_argument("--scratch", type=Path, help="local bare Git object cache")
+    dashboard.add_argument("--host", default="127.0.0.1", help="loopback host")
+    dashboard.add_argument(
+        "--port",
+        type=_port,
+        default=0,
+        help="local port (default: choose an available port)",
+    )
+
+    project = subparsers.add_parser("project", help="create or inspect local projects and supported releases")
+    project_subparsers = project.add_subparsers(dest="project_command", required=True)
+    project_new = project_subparsers.add_parser("new", help="atomically create a complete Lean and Autoform project")
+    project_new.add_argument("target", nargs="?", help="new project directory (required); it must not exist")
+    project_new.add_argument("--package", help="UpperCamelCase Lean package name (required)")
+    project_new.add_argument("--release", help="release id from 'project versions' (default: the recommended release)")
+    project_new.add_argument(
+        "--lean-toolchain",
+        help=(
+            "Lean release tag such as v4.30.0; a pair the catalog does not list is written "
+            "without lake-manifest.json, so run 'lake update' in the project"
+        ),
+    )
+    project_new.add_argument(
+        "--mathlib-rev",
+        help=(
+            "Mathlib tag, branch, or commit to require with --lean-toolchain "
+            "(default: the same tag as the toolchain)"
+        ),
+    )
+    project_new.add_argument(
+        "--library",
+        metavar="NAME",
+        help=(
+            "shared Lean library from the bundled library catalog to require at its pinned commit; "
+            "it selects the release, so it combines with no version option"
+        ),
+    )
+    project_new.add_argument(
+        "--autoform-source",
+        default="",
+        help=(
+            "Autoform Git source the generated workflows install from (default: a safe remote "
+            "locally known to contain the HEAD of this checkout, or of the marketplace checkout "
+            "an installed copy came from)"
+        ),
+    )
+    project_new.add_argument(
+        "--autoform-ref",
+        default="",
+        help=(
+            "full 40-character Autoform commit the workflows pin (default: the HEAD commit of "
+            "that checkout; none when --autoform-source is given)"
+        ),
+    )
+    project_new.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    project_inspect = project_subparsers.add_parser(
+        "inspect", help="inspect a project without running Lake, Git, or network operations"
+    )
+    project_inspect.add_argument(
+        "target", nargs="?", default=".", help="a path inside the project (default: current directory)"
+    )
+    project_inspect.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    project_versions = project_subparsers.add_parser(
+        "versions", help="list bundled known-good Lean and Mathlib releases"
+    )
+    project_versions.add_argument("--json", action="store_true", help="write stable machine-readable output")
+
+    work = subparsers.add_parser("work", help="inspect the Markdown-derived formalization frontier")
+    work_subparsers = work.add_subparsers(dest="work_command", required=True)
+    work_list = work_subparsers.add_parser("list", help="list ready formalization leaves")
+    work_list.add_argument(
+        "target", nargs="?", default=".", help="project root or blueprint directory"
+    )
+    work_list.add_argument("--lean-root", type=Path, help="resolve local Lean declaration targets")
+    work_list.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    work_context_parser = work_subparsers.add_parser(
+        "context", help="show one article's phase, dependencies, sources, and claim target"
+    )
+    work_context_parser.add_argument("selector", help="path-derived node id or durable article_id")
+    work_context_parser.add_argument(
+        "target", nargs="?", default=".", help="project root or blueprint directory"
+    )
+    work_context_parser.add_argument(
+        "--lean-root", type=Path, help="resolve local Lean declaration targets"
+    )
+    work_context_parser.add_argument(
+        "--json", action="store_true", help="write stable machine-readable output"
+    )
+    work_assumptions = work_subparsers.add_parser(
+        "assumptions", help="list open statements and the open statements each stated article rests on"
+    )
+    work_assumptions.add_argument(
+        "target", nargs="?", default=".", help="project root or blueprint directory"
+    )
+    work_assumptions.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    work_impact = work_subparsers.add_parser(
+        "impact", help="show which articles and helpers a revision of an article's Lean declarations affects"
+    )
+    work_impact.add_argument("selector", help="path-derived node id or durable article_id")
+    work_impact.add_argument("target", nargs="?", default=".", help="project root or blueprint directory")
+    work_impact.add_argument(
+        "--lean-root", type=Path, required=True, metavar="PATH", help="the built Lean project"
+    )
+    work_impact.add_argument(
+        "--declaration",
+        action="append",
+        default=[],
+        dest="declarations",
+        metavar="NAME",
+        help="revise this project-local constant instead of the article's lean: declarations (repeatable)",
+    )
+    work_impact.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    work_impact.add_argument(
+        "--timeout",
+        type=_positive_seconds,
+        metavar="SECONDS",
+        help=f"seconds the Lean probe may run (default {DEFAULT_PROBE_TIMEOUT:g}); "
+        "the Lake freshness check before it has its own budget",
+    )
+    work_import_impact = work_subparsers.add_parser(
+        "import-impact",
+        help="report the claim and review scope of editing a Lean module's imports: what an added import can "
+        "affect, not the modules a removed import can drop from the build",
+    )
+    work_import_impact.add_argument("selector", help="path-derived node id or durable article_id")
+    work_import_impact.add_argument("module", help="project module whose imports may change")
+    work_import_impact.add_argument(
+        "target", nargs="?", default=".", help="project root or blueprint directory"
+    )
+    work_import_impact.add_argument(
+        "--lean-root", type=Path, required=True, metavar="PATH", help="the built Lean project"
+    )
+    work_import_impact.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    work_import_impact.add_argument(
+        "--timeout",
+        type=_positive_seconds,
+        metavar="SECONDS",
+        help=f"seconds the Lean probe may run (default {DEFAULT_PROBE_TIMEOUT:g}); "
+        "the Lake freshness check before it has its own budget",
+    )
+    search = subparsers.add_parser(
+        "search", help="find articles by title, Lean name, or statement text before adding one"
+    )
+    search.add_argument("target", help="project root or blueprint directory")
+    search.add_argument(
+        "query",
+        help="one quoted argument; every word, with filler such as 'of' dropped and common endings cut, "
+        "must occur in an article's title, Lean name, path, or statement, or in a containing article's title; "
+        "put -- before one starting with -",
+    )
+    search.add_argument("--lean-root", type=Path, help="resolve local Lean declaration targets")
+    search.add_argument(
+        "--state",
+        action="append",
+        default=[],
+        dest="states",
+        choices=[state.key for state in status.STATES],
+        metavar="KEY",
+        help="keep articles in exactly this derived state (repeatable): "
+        + ", ".join(state.key for state in status.STATES),
+    )
+    search.add_argument(
+        "--declaration",
+        action="append",
+        default=[],
+        dest="declarations",
+        metavar="KIND",
+        help="keep articles whose frontmatter declaration is KIND: theorem, lemma, def, ... (repeatable)",
+    )
+    search.add_argument(
+        "--limit", type=int, default=20, metavar="N", help="show at most N articles (default 20)"
+    )
+    search.add_argument(
+        "--library",
+        action="append",
+        default=[],
+        dest="libraries",
+        type=_library_argument,
+        metavar="NAME[=INDEX]",
+        help="also search the index a locked Lake package publishes (repeatable); needs --lean-root. "
+        "INDEX reads the index from a file instead of the package's checkout",
+    )
+    search.add_argument("--json", action="store_true", help="write stable machine-readable output")
+
+    library = subparsers.add_parser("library", help="inspect the shared Lean libraries a project depends on")
+    library_subparsers = library.add_subparsers(dest="library_command", required=True)
+    library_list = library_subparsers.add_parser(
+        "list", help="list the locked Lake packages and whether each publishes an index search can use"
+    )
+    library_list.add_argument("target", type=Path, help="Lean project root, where lake-manifest.json is")
+    library_list.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    library_index = library_subparsers.add_parser(
+        "index", help="write the index a Lean library publishes, from its current build"
+    )
+    library_index.add_argument("target", type=Path, help="the library's package root; it must be built")
+    library_index.add_argument(
+        "--lib",
+        action="append",
+        default=[],
+        dest="libraries",
+        metavar="NAME",
+        help="index this lean_lib (repeatable); default: every lean_lib of the package",
+    )
+    library_index.add_argument(
+        "--check", action="store_true", help="write nothing; exit 1 when the index at the root is not current"
+    )
+    library_index.add_argument(
+        "--timeout", type=_positive_seconds, default=None, metavar="SECONDS", help="time limit for the Lean probe"
+    )
+
     claim = subparsers.add_parser("claim", help="coordinate temporary node ownership through Git refs")
     claim_subparsers = claim.add_subparsers(dest="claim_command", required=True)
     for operation in ("acquire", "renew", "release"):
         command = claim_subparsers.add_parser(operation)
-        command.add_argument("node_id")
+        command.add_argument("node_id", nargs="+", help="claim target(s); several change all-or-nothing")
         _add_claim_board_arguments(command)
         if operation in {"acquire", "renew"}:
             command.add_argument("--ttl", type=int, default=CLAIM_TTL_S)
@@ -86,17 +332,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     claim_cleanup = claim_subparsers.add_parser("cleanup")
     _add_claim_board_arguments(claim_cleanup)
 
-    migrate = subparsers.add_parser("migrate", help="inspect authored migration contracts")
+    migrate = subparsers.add_parser("migrate", help="plan or apply authored migrations")
     migrate_subparsers = migrate.add_subparsers(dest="migrate_command", required=True)
     article_ids = migrate_subparsers.add_parser(
         "article-ids",
-        help="plan durable roadmap article identifiers without writing files",
+        help="plan durable roadmap article identifiers, or add them with --write",
     )
     article_ids.add_argument("blueprint_dir")
-    article_ids.add_argument(
+    article_ids_mode = article_ids.add_mutually_exclusive_group()
+    article_ids_mode.add_argument(
         "--check",
         action="store_true",
         help="fail when an article is missing article_id frontmatter",
+    )
+    article_ids_mode.add_argument(
+        "--write",
+        action="store_true",
+        help="add each planned article_id to the frontmatter of the article missing one",
     )
     article_ids.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
@@ -145,16 +397,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         "the Lake freshness check before it has its own budget",
     )
 
+    unused = subparsers.add_parser(
+        "unused-hypotheses",
+        help="report the hypotheses that the proof of each theorem the blueprint names never uses",
+    )
+    unused.add_argument("blueprint_dir")
+    unused.add_argument(
+        "--lean-root",
+        type=Path,
+        required=True,
+        help="built Lean project whose declarations the blueprint names",
+    )
+    unused.add_argument(
+        "--node",
+        action="append",
+        dest="nodes",
+        metavar="ID",
+        help="restrict to one article id (repeatable)",
+    )
+    unused.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    unused.add_argument(
+        "--timeout",
+        type=_positive_seconds,
+        metavar="SECONDS",
+        help=f"seconds the Lean probe may run (default {DEFAULT_PROBE_TIMEOUT:g}); "
+        "the Lake freshness check before it has its own budget",
+    )
+
     render = subparsers.add_parser("render", help="build the publishable blueprint")
     render.add_argument("blueprint_dir")
     render.add_argument("-o", "--output", default="site-src", help="output directory")
     render.add_argument("--lean-root", type=Path, help="Lean project to link code from")
     render.add_argument("--repository-url", help="project URL, e.g. https://github.com/owner/repo")
-    render.add_argument("--ref", help="commit or branch the code links should pin")
+    render.add_argument(
+        "--ref",
+        help="commit or branch to link; links appear only if its local commit "
+        "holds the exact rendered inputs",
+    )
     render.add_argument(
         "--require-declarations",
         action="store_true",
-        help="fail when a 'lean:' declaration is not found in the Lean sources",
+        help="fail when a 'lean:' declaration is not found in the Lean sources "
+        "or cannot be looked up because the sources cannot be read",
     )
 
     prove2me_cli.add_parser(subparsers)
@@ -169,12 +453,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _audit(args)
     if args.command == "doctor":
         return _doctor(args)
+    if args.command == "dashboard":
+        return _dashboard(args)
+    if args.command == "project":
+        return _project(args)
+    if args.command == "work":
+        return _work(args)
+    if args.command == "search":
+        return _search(args)
+    if args.command == "library":
+        return _library_index(args) if args.library_command == "index" else _library_list(args)
     if args.command == "claim":
         return _claim(args)
     if args.command == "migrate":
         return _migrate(args)
     if args.command == "skeleton":
         return _skeleton(args)
+    if args.command == "unused-hypotheses":
+        return _unused_hypotheses(args)
     if args.command == "render":
         return _render(args)
     if args.command == "prove2me":
@@ -217,7 +513,8 @@ def _init(args: argparse.Namespace) -> int:
     for path in result.written:
         print(f"  + {path}")
     for path in result.skipped:
-        note = "no Autoform ref to pin" if result.unpinned and ".github" in path else "exists, left alone"
+        needs_pin = result.unpinned and path != ".github/CODEOWNERS.autoform.example" and ".github" in path
+        note = "no Autoform ref to pin" if needs_pin else "exists, left alone"
         print(f"  = {path} ({note})")
     print("Next: describe the project in blueprint/README.md, then add chapters "
           "as roadmap/<chapter>/README.md.")
@@ -235,6 +532,45 @@ def _init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _byte_order_mark_warnings(graph: Graph) -> list[str]:
+    """Name each article that starts with a byte-order mark, which hides frontmatter on its first line."""
+    warnings = []
+    for node in graph.nodes.values():
+        try:
+            with node.path.open("rb") as article:
+                marked = article.read(3) == b"\xef\xbb\xbf"
+        except OSError:
+            continue
+        if marked:
+            warnings.append(
+                f"{node.id}: starts with a byte-order mark, so frontmatter on its first line is read as text "
+                "and its keys are ignored; remove the mark"
+            )
+    return warnings
+
+
+def _source_link_issues(graph: Graph) -> list[str]:
+    """Name each ``## Sources`` link to a local path that is not a file in the blueprint.
+
+    The generated workflows run ``check`` but not ``audit``, and render publishes
+    a missing or escaping target broken: a page a strict MkDocs build cannot find,
+    a repository URL that 404s, or a path off the site. Fragments and other
+    schemes stay with ``audit``, whose anchor check renders each cited note.
+    """
+    rejected = {
+        "source-not-found": "does not resolve to a file",
+        "source-escapes-blueprint": "escapes the blueprint directory",
+        "malformed-source-link": "contains an invalid path",
+    }
+    issues = []
+    for node in graph.nodes.values():
+        for target in node.sources:
+            issue = local_target_issue(node.path, target.partition("#")[0], graph.blueprint_dir, label="source")
+            if issue is not None and issue[0] in rejected:
+                issues.append(f"{node.id}: source target {rejected[issue[0]]}: {target!r}")
+    return issues
+
+
 def _check(args: argparse.Namespace) -> int:
     try:
         graph = load_graph(args.blueprint_dir)
@@ -242,6 +578,18 @@ def _check(args: argparse.Namespace) -> int:
         for issue in exc.issues:
             print(f"error: {issue}")
         return 1
+    if source_issues := _source_link_issues(graph):
+        for issue in source_issues:
+            print(f"error: {issue}")
+        return 1
+
+    linker = None
+    if args.lean_root is not None:
+        try:
+            linker = build_linker(args.lean_root)
+        except OSError as error:
+            print(f"error: {index_failure_message(error)}")
+            return 1
 
     statuses = status.derive(graph)
     summary = " · ".join(f"{count} {state.label}" for state, count in status.summarize(statuses))
@@ -249,22 +597,23 @@ def _check(args: argparse.Namespace) -> int:
     if summary:
         print(f"    {summary}")
 
-    if args.lean_root is None:
-        return 0
-
-    linker = build_linker(args.lean_root)
-    missing = [
-        f"{node.id}: declaration not found in {args.lean_root}: {name}"
-        for node in graph.nodes.values()
-        for name in declaration_names(node.lean or "")
-        if linker.location(name) is None
-    ]
-    for issue in missing:
-        print(f"error: {issue}")
-    if missing:
-        return 1
-    declared = sum(1 for node in graph.nodes.values() if node.lean)
-    print(f"    {declared} declaration(s) resolved in the Lean sources")
+    if linker is not None:
+        missing = [
+            f"{node.id}: declaration not found in {args.lean_root}: {name}"
+            for node in graph.nodes.values()
+            for name in declaration_names(node.lean or "")
+            if linker.location(name) is None
+        ]
+        for issue in missing:
+            print(f"error: {issue}")
+        if missing:
+            return 1
+        declared = sum(1 for node in graph.nodes.values() if node.lean)
+        print(f"    {declared} declaration(s) resolved in the Lean sources")
+    for omission in projection_omissions(graph):
+        print(f"warning: {omission}")
+    for warning in _byte_order_mark_warnings(graph):
+        print(f"warning: {warning}")
     return 0
 
 
@@ -300,18 +649,634 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0 if result.clean else 1
 
 
+def _dashboard(args: argparse.Namespace) -> int:
+    try:
+        paths = resolve_runtime_paths(args.target)
+        site = Path(args.site_dir).expanduser()
+        if not site.is_absolute():
+            site = paths.project_root / site
+        repo = args.repo or _origin_url(paths.project_root)
+
+        def run(scratch: Path) -> None:
+            claims = ClaimBoard(repo, "dashboard-readonly", scratch)
+            state = publication_bound_live_state(
+                claims,
+                blueprint_dir=paths.blueprint_dir,
+                site_dir=site,
+            )
+            def ready(host: str, port: int) -> None:
+                print(f"Dashboard: http://{host}:{port}/", flush=True)
+                print(
+                    "Static content comes from the built site; live claims remain local-only.",
+                    flush=True,
+                )
+
+            serve_dashboard(site, state, host=args.host, port=args.port, on_ready=ready)
+
+        if args.scratch is not None:
+            run(args.scratch)
+        else:
+            with tempfile.TemporaryDirectory(prefix="autoform-dashboard-") as temporary:
+                run(Path(temporary) / "claims.git")
+    except (OSError, RuntimeProjectionError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+def _project(args: argparse.Namespace) -> int:
+    try:
+        if args.project_command == "new":
+            if args.target is None:
+                raise ProjectCreateError("project-target-invalid", "A new project directory is required.")
+            if args.package is None:
+                raise ProjectCreateError(
+                    "project-name-invalid", "--package is required (an UpperCamelCase Lean package name)."
+                )
+            target = os.path.expanduser(args.target)
+            existed = os.path.lexists(target)
+            try:
+                result = create_project(
+                    args.target,
+                    package=args.package,
+                    release_id=args.release,
+                    lean_toolchain=args.lean_toolchain,
+                    mathlib_rev=args.mathlib_rev,
+                    autoform_source=args.autoform_source,
+                    autoform_ref=args.autoform_ref,
+                    library=args.library,
+                )
+            except KeyboardInterrupt:
+                # An interrupt during create_project's final cleanup can follow a
+                # successful publication, so look before saying nothing was published.
+                if not existed and os.path.lexists(target):
+                    message = (
+                        "Project creation was interrupted after the target was created, so it may be "
+                        "this run's complete project. Check it with autoform project inspect before "
+                        "using or removing it."
+                    )
+                else:
+                    message = (
+                        "Project creation was interrupted and no project was published. A hidden "
+                        ".autoform-new-* stage may remain in the target parent; inspect it before removal."
+                    )
+                raise ProjectCreateError("project-create-interrupted", message) from None
+            if args.json:
+                print(result.to_json())
+            else:
+                label = result.release or f"unlisted: {result.lean_toolchain}, Mathlib {result.mathlib_rev}"
+                print(_ascii_text(f"Created {result.package} at {result.target} ({label})"))
+                if result.library is not None:
+                    library = result.library
+                    print(_ascii_text(f"Library: {library.name} @ {library.commit} ({library.git})"))
+                # Flush first so the warnings never appear ahead of the line they qualify.
+                sys.stdout.flush()
+                for code, message in result.warnings:
+                    print(_ascii_text(f"warning[{code}]: {message}"), file=sys.stderr)
+                if not result.workflows_pinned:
+                    init_command = (
+                        'uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform init '
+                        f"{_shell_quote_one_line(target)}"
+                    )
+                    if args.autoform_source:
+                        # Without the source, init would pin this checkout's origin instead.
+                        init_command += f" --autoform-source {shlex.quote(args.autoform_source)}"
+                    print(
+                        "warning: workflows were omitted because no immutable Autoform pin was "
+                        f"available; add them with: {init_command} --autoform-ref <40-char-sha>",
+                        file=sys.stderr,
+                    )
+            return 0
+        catalog = load_release_catalog()
+    except ProjectCreateError as error:
+        if args.json:
+            print(error.to_json())
+        else:
+            print(f"error[{error.code}]: {error.message}", file=sys.stderr)
+        return 130 if error.code == "project-create-interrupted" else 1
+    except ProjectCatalogError as error:
+        if args.json:
+            print(json.dumps({"error": {"code": "project-catalog-invalid", "message": str(error)}, "ok": False}))
+        else:
+            print(f"error: {error}", file=sys.stderr)
+        return 1
+    if args.project_command == "versions":
+        if args.json:
+            print(catalog.to_json())
+            return 0
+        print("Known-good Lean/Mathlib releases:")
+        for release in catalog.releases:
+            print(f"  {release.id}{' [recommended]' if release.recommended else ''}")
+            print(f"    Lean: {release.lean_toolchain}")
+            print(f"    Mathlib: {release.mathlib_rev} @ {release.mathlib_commit} ({release.mathlib_git})")
+        return 0
+    result = inspect_project(args.target, catalog=catalog)
+    if args.json:
+        print(result.to_json())
+    else:
+        _print_project_inspection(result)
+    return 0 if result.ok else 1
+
+
+def _work(args: argparse.Namespace) -> int:
+    if args.work_command == "assumptions":
+        return _work_assumptions(args)
+    if args.work_command in {"impact", "import-impact"}:
+        return _work_impact(args)
+    # Only loading the roadmap can fail on the project's paths; printing the
+    # result stays outside, so an output error is not reported as one.
+    try:
+        if args.work_command == "list":
+            frontier = list_ready_work(args.target, lean_root=args.lean_root)
+        else:
+            source_revision, item = work_context(
+                args.target,
+                args.selector,
+                lean_root=args.lean_root,
+            )
+    except (GraphValidationError, RuntimeProjectionError) as error:
+        for issue in error.issues:
+            print(f"error: {_human_text(issue)}", file=sys.stderr)
+        return 2
+    except WorkError as error:
+        print(f"error: {_human_text(error)}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, ValueError):
+        print("error: project, blueprint, or Lean root path cannot be read", file=sys.stderr)
+        return 2
+
+    if args.work_command == "list":
+        if args.json:
+            print(frontier.to_json())
+            return 0
+        if frontier.open_statements:
+            print("Open statements: allowed (a statement may land with a sorry proof)")
+        if not frontier.items:
+            print("No ready formalization work.")
+            return 0
+        for item in frontier.items:
+            durable = f" [{item.article_id}]" if item.article_id else ""
+            print(_human_text(f"{item.phase}: {item.node_id}{durable} - {item.title}"))
+            if item.assumes:
+                print(_human_text("  assumes: " + ", ".join(item.assumes)))
+            if item.revision:
+                print("  revision: start from `autoform work impact`")
+        return 0
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema": WORK_SCHEMA,
+                    "source_revision": source_revision,
+                    "item": item.as_dict(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    if item.phase:
+        phase = item.phase
+    elif item.blockers:
+        phase = "not ready"
+    else:
+        phase = "none (already formalized)"
+    print(_human_text(f"{item.title} ({item.node_id})"))
+    print(f"State: {item.state}")
+    print(f"Phase: {phase}")
+    if item.revision:
+        print("Revision: the statement was retracted; start from `autoform work impact`")
+    if item.open_statements:
+        print("Open statements: allowed")
+        if item.assumes:
+            print(_human_text("Assumes: " + ", ".join(item.assumes)))
+    print(_human_text(f"Claim target: {item.claim_target}"))
+    if item.blockers:
+        print(_human_text("Blocked by: " + ", ".join(item.blockers)))
+    print(_human_text(f"Article: {item.article_path}"))
+    print(f"Article revision: {item.article_revision or 'unknown'}")
+    print(f"Graph source revision: {source_revision}")
+    if item.dependencies:
+        print(_human_text("Dependencies: " + ", ".join(item.dependencies)))
+    if item.source_targets:
+        print(_human_text("Sources: " + ", ".join(item.source_targets)))
+    for target in item.lean_targets:
+        location = f" ({target.source_file})" if target.source_file else ""
+        print(_human_text(f"Lean: {target.declaration}{location}"))
+    return 0
+
+
+def _search(args: argparse.Namespace) -> int:
+    # Only reading the blueprint and the libraries can fail on the project's
+    # paths; printing the result stays outside, so an output error is not
+    # reported as one.
+    options = {
+        "lean_root": args.lean_root,
+        "states": args.states,
+        "declarations": args.declarations,
+        "limit": args.limit,
+    }
+    libraries: tuple[LibraryResult, ...] = ()
+    try:
+        if args.libraries:
+            # A library that cannot be verified refuses the whole call: the
+            # blueprint hits alone would read as "this result is new".
+            combined = search_with_libraries(args.target, args.query, libraries=args.libraries, **options)
+            result, libraries = combined.blueprint, combined.libraries
+        else:
+            combined = None
+            result = search_blueprint(args.target, args.query, **options)
+    except (GraphValidationError, RuntimeProjectionError) as error:
+        for issue in error.issues:
+            print(f"error: {_human_text(issue)}", file=sys.stderr)
+        return 2
+    except (SearchError, LibraryError, WorkspaceError) as error:
+        print(f"error: {_human_text(error)}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, ValueError):
+        print("error: project, blueprint, or Lean root path cannot be read", file=sys.stderr)
+        return 2
+
+    note = None if args.libraries else _unsearched_library_note(args.target, args.lean_root)
+    if args.json:
+        print(result.to_json() if combined is None else combined.to_json())
+        if note:
+            print(note, file=sys.stderr)
+        return 0
+    if not result.hits:
+        print("No matching articles.")
+    for hit in result.hits:
+        durable = f" [{hit.article_id}]" if hit.article_id else ""
+        print(_human_text(f"{hit.title} ({hit.node_id}){durable}"))
+        summary = [
+            hit.declaration or "no declaration",
+            hit.state,
+            f"used by {hit.used_by_count}",
+        ]
+        if hit.shared_title:
+            summary.append("title shared with another article")
+        print(_human_text("  " + ", ".join(summary)))
+        for target in hit.lean_targets:
+            location = f" ({target.source_file}:{target.line})" if target.source_file else ""
+            print(_human_text(f"  Lean: {target.declaration}{location}"))
+        if hit.mathlib_declarations:
+            print(_human_text("  Mathlib: " + ", ".join(hit.mathlib_declarations)))
+        preview = statement_preview(hit)
+        if preview:
+            print(_human_text(f"  Statement: {preview}"))
+        print("  Matched: " + ", ".join(hit.matched_fields))
+    if result.hits:
+        print(f"{len(result.hits)} of {result.total_matches} matching article(s) shown.")
+    for library in libraries:
+        _print_library(library)
+    if note:
+        sys.stdout.flush()
+        print(note, file=sys.stderr)
+    return 0
+
+
+def _unsearched_library_note(target: str, lean_root: str | None) -> str | None:
+    """Name the locked packages that publish an index a blueprint-only search skipped.
+
+    An empty blueprint answers every query with no match, which reads as "this
+    result is new" although a library the project depends on may prove it.
+    The note is best effort: any failure to read the project leaves it out.
+    """
+
+    candidates = [Path(lean_root)] if lean_root else [Path(target), Path(target).parent]
+    for root in candidates:
+        try:
+            if not (root / "lake-manifest.json").is_file():
+                continue
+            names = indexed_packages(root)
+        except (LibraryError, WorkspaceError, OSError, ValueError):
+            return None
+        if not names:
+            return None
+        listed = " and ".join(names)
+        flags = " ".join(f"--library {name}" for name in names)
+        verb, pronoun = ("publishes a search index", "it") if len(names) == 1 else ("publish search indexes", "them")
+        return _human_text(
+            f"note: {listed} {verb} this search did not read; search {pronoun} too with --lean-root {root} {flags}"
+        )
+    return None
+
+
+def _print_library(library: LibraryResult) -> None:
+    print(_human_text(f"Library {library.name} @ {library.revision[:12]}"))
+    for difference in library.differences:
+        what = difference.what if difference.name is None else difference.name
+        if difference.project is None:
+            held = "the project has no lean-toolchain" if difference.name is None else "the project does not lock it"
+        else:
+            held = f"project: {difference.project}"
+        print(_human_text(f"  differs: {what} {difference.library} ({held})"))
+    if not library.hits:
+        print("No matching declarations.")
+        return
+    for hit in library.hits:
+        declaration = hit.declaration
+        print(_human_text(f"{declaration.name} ({declaration.kind}, {declaration.status})"))
+        print(_human_text(f"  {hit.source_file}:{declaration.line}"))
+        if hit.import_line is not None:
+            print(_human_text(f"  {hit.import_line}"))
+        print(_human_text(f"  Signature: {_one_line(declaration.signature)}"))
+        if declaration.docstring:
+            print(_human_text(f"  Docstring: {_one_line(declaration.docstring)}"))
+        print("  Matched: " + ", ".join(hit.matched_fields))
+    print(f"{len(library.hits)} of {library.total_matches} matching declaration(s) shown.")
+
+
+def _one_line(text: str) -> str:
+    """Cut library text to what fits one report line; the JSON output carries it whole."""
+
+    text = " ".join(text.split())
+    return text if len(text) <= 200 else text[:197].rstrip() + "..."
+
+
+def _library_index(args: argparse.Namespace) -> int:
+    options = {"libraries": tuple(args.libraries), "timeout": args.timeout}
+    try:
+        if args.check:
+            reasons = check_index(args.target, **options)
+            for reason in reasons:
+                print(f"stale: {_human_text(reason)}", file=sys.stderr)
+            if not reasons:
+                print(f"{INDEX_FILE} is current.")
+            return 1 if reasons else 0
+        generated = generate_index(args.target, **options)
+        write_index(args.target, generated)
+    except GenerateError as error:
+        print(f"error: {_human_text(error)}", file=sys.stderr)
+        return 2
+    except OSError as error:
+        # Every write is reported by `write_index`; what is left is a file of the package that cannot be read.
+        what = error.filename if error.filename is not None else args.target
+        print(f"error: {_human_text(f'{what} cannot be read: {error.strerror or error}')}", file=sys.stderr)
+        return 2
+    except ValueError as error:
+        print(f"error: {_human_text(f'the package root cannot be used: {error}')}", file=sys.stderr)
+        return 2
+    index = generated.index
+    wanted = sum(declaration.status == "wanted" for declaration in index.declarations)
+    twice = f", {len(generated.shared)} declared in more than one module" if generated.shared else ""
+    print(
+        f"Wrote {INDEX_FILE}: {_count(len(index.modules), 'module')}, "
+        f"{_count(len(index.declarations), 'declaration')} ({wanted} wanted{twice})."
+    )
+    # Flush first: stdout is block-buffered when piped, and the warnings explain the count.
+    sys.stdout.flush()
+    for shared in generated.shared:
+        print(
+            _human_text(
+                f"warning: {shared.name} is declared in {shared.module} and also in {', '.join(shared.others)}; "
+                f"it is indexed once, under {shared.module}"
+            ),
+            file=sys.stderr,
+        )
+    for shared in generated.shared_left_out:
+        print(
+            _human_text(
+                f"warning: {shared.name} is left out: its declaration in {shared.module} depends on sorry or "
+                f"another axiom; {', '.join(shared.others)} {'declares' if len(shared.others) == 1 else 'declare'} it too"
+            ),
+            file=sys.stderr,
+        )
+    if generated.left_out:
+        verb = "depends" if generated.left_out == 1 else "depend"
+        print(
+            f"Left out {_count(generated.left_out, 'declaration')} that {verb} on sorry or another axiom.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
+
+
+def _library_list(args: argparse.Namespace) -> int:
+    try:
+        listing = list_libraries(args.target)
+    except WorkspaceError as error:
+        print(f"error: {_human_text(error)}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, ValueError):
+        print("error: Lean root path cannot be read", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(listing.to_json())
+        return 0
+    if not listing.packages:
+        print("No locked packages.")
+        return 0
+    for package in listing.packages:
+        where = package.type if package.revision is None else f"{package.type} {package.revision[:12]}"
+        verdict = "usable" if package.usable else f"not usable: {package.reason}"
+        print(_human_text(f"{package.name}  {where}  {verdict}"))
+    return 0
+
+
+def _work_assumptions(args: argparse.Namespace) -> int:
+    # As in `_work`, only loading the roadmap is reported as a path error.
+    try:
+        contract = assumption_contract(args.target)
+    except (GraphValidationError, RuntimeProjectionError) as error:
+        for issue in error.issues:
+            print(f"error: {_human_text(issue)}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, ValueError):
+        print("error: project or blueprint path cannot be read", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(contract.to_json())
+        return 0
+    print(_human_text(f"Open statements: {'allowed' if contract.open_statements else 'forbidden'}"))
+    # A conditional article is proved, so the loader made its `lean:` name a
+    # declaration, and the contract lists it.
+    for article in contract.articles:
+        assumes = f"assumes {', '.join(article.assumes)}"
+        if article.open:
+            # An open statement is not conditional: its own proof is missing.
+            line = f"open: {article.id} ({', '.join(article.declarations)})"
+            print(_human_text(f"{line} {assumes}" if article.assumes else line))
+        elif article.state == "conditional":
+            print(_human_text(f"conditional: {article.id} {assumes}"))
+        elif article.assumes:
+            # Not proved, so nothing is conditional yet; its proof would rest on these.
+            print(_human_text(f"unproved: {article.id} {assumes}"))
+    return 0
+
+
+def _work_impact(args: argparse.Namespace) -> int:
+    try:
+        if args.work_command == "impact":
+            report = revision_impact(
+                args.target,
+                args.selector,
+                lean_root=args.lean_root,
+                declarations=args.declarations,
+                timeout=args.timeout,
+            )
+        else:
+            report = module_import_impact(
+                args.target,
+                args.selector,
+                args.module,
+                lean_root=args.lean_root,
+                timeout=args.timeout,
+            )
+    except (GraphValidationError, RuntimeProjectionError) as error:
+        for issue in error.issues:
+            print(f"error: {_human_text(issue)}", file=sys.stderr)
+        return 2
+    except (WorkError, ImpactError) as error:
+        print(f"error: {_human_text(error)}", file=sys.stderr)
+        return 2
+    except SkeletonError as error:
+        # Probe failures carry Lean's multi-line output; escape it line by line.
+        for issue in error.issues:
+            for index, line in enumerate(str(issue).splitlines() or [""]):
+                print(("error: " if index == 0 else "") + _human_text(line), file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, ValueError):
+        print("error: project, blueprint, or Lean root path cannot be read", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(report.to_json())
+        return 0
+    lines = format_impact(report) if args.work_command == "impact" else format_module_import_impact(report)
+    for line in lines:
+        print(_human_text(line))
+    return 0
+
+
+def _print_project_inspection(result) -> None:
+    if result.project_root is not None:
+        print(f"Project root: {_human_text(result.project_root)}")
+    if result.lake is not None:
+        version = f" {result.lake.version}" if result.lake.version else ""
+        print(f"Lake: {_human_text((result.lake.name or 'unknown package') + version)} ({result.lake.config})")
+        for target in result.lake.targets:
+            print(f"  {target.kind} {_human_text(target.name)}")
+    if result.lean_toolchain is not None:
+        print(f"Lean: {_human_text(result.lean_toolchain)}")
+    if result.mathlib is not None:
+        mathlib = result.mathlib
+        revision = f"{mathlib.input_rev} @ {mathlib.rev}" if mathlib.input_rev else mathlib.rev
+        where = mathlib.dir if mathlib.type == "path" else f"{revision} ({mathlib.url})"
+        print(f"Mathlib: {_human_text(where)} [{mathlib.source}]")
+    if result.autoform_paths:
+        print(f"Autoform: {', '.join(result.autoform_paths)}")
+    release = f" ({result.compatibility.release})" if result.compatibility.release else ""
+    print(f"Compatibility: {result.compatibility.status}{release}")
+    for diagnostic in result.diagnostics:
+        location = f" {diagnostic.path}" if diagnostic.path else ""
+        print(f"{diagnostic.severity}[{diagnostic.code}]{location}: {diagnostic.message}", file=sys.stderr)
+
+
+def _library_argument(value: str):
+    try:
+        return library_argument(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _human_text(value: object) -> str:
+    """Escape nonprintable characters so project files cannot forge report lines."""
+
+    return "".join(
+        character if character.isprintable() else character.encode("unicode_escape").decode("ascii")
+        for character in str(value)
+    )
+
+
+def _ascii_text(value: object) -> str:
+    """Escape untrusted text into one unambiguous printable ASCII line.
+
+    `project new` reports after publishing, when a non-UTF-8 stream must not
+    turn success into a traceback.
+    """
+
+    return ascii(str(value))[1:-1]
+
+
+def _shell_quote_one_line(value: str) -> str:
+    """Quote one filesystem argument without letting it forge another line.
+
+    Ordinary printable paths use the standard shell spelling. POSIX project
+    creation can also accept control bytes in filenames; Bash and Zsh ANSI-C
+    quoting keeps those paths executable while spelling every byte on one line.
+    """
+
+    if all(character.isprintable() and character not in "\r\n" for character in value):
+        return shlex.quote(value)
+    pieces: list[str] = []
+    for byte in os.fsencode(value):
+        if byte == 0x27:
+            pieces.append("\\'")
+        elif byte == 0x5C:
+            pieces.append("\\\\")
+        elif 0x20 <= byte <= 0x7E:
+            pieces.append(chr(byte))
+        else:
+            pieces.append(f"\\x{byte:02x}")
+    return "$'" + "".join(pieces) + "'"
+
+
 def _claim(args: argparse.Namespace) -> int:
     try:
         board = _claim_board(args)
         operation = args.claim_command
         if operation == "list":
             print(json.dumps(board.list(), sort_keys=True, separators=(",", ":")))
-            return 0
-        if operation == "cleanup":
+        elif operation == "cleanup":
             print(f"removed {board.cleanup()} expired claim(s)")
+        if operation in {"list", "cleanup"}:
+            # Lock files are not refs, so neither command's own output can show one.
+            for lock in board.ref_locks():
+                print(
+                    f"warning: {lock.describe()}; if no Git process is using the claim board, delete it",
+                    file=sys.stderr,
+                )
             return 0
 
-        key = author_claim_key(args.node_id)
+        past_tense = {"acquire": "acquired", "renew": "renewed", "release": "released"}
+        if len(args.node_id) > 1:
+            # Several targets change in one atomic push, so a failure holds none of them.
+            targets: dict[str, str] = {}
+            for node_id in args.node_id:
+                key = author_claim_key(node_id)
+                if key in targets:
+                    print(f"error: duplicate claim target: {node_id}", file=sys.stderr)
+                    return 2
+                targets[key] = node_id
+            if operation == "acquire":
+                result = board.acquire_many(list(targets), ttl=args.ttl, note=args.note)
+            elif operation == "renew":
+                result = board.renew_many(list(targets), ttl=args.ttl)
+            else:
+                result = board.release_many(list(targets))
+            if result:
+                for key, node_id in targets.items():
+                    print(f"{past_tense[operation]} {node_id} ({key})")
+                return 0
+            blocking = ", ".join(targets.get(key, key) for key in result.blocking)
+            reason = f"{result.reason}: {blocking}" if blocking else result.reason
+            print(
+                f"error: could not {operation} {', '.join(args.node_id)}; "
+                f"no claim was {past_tense[operation]}: {reason}"
+            )
+            return 1
+
+        node_id = args.node_id[0]
+        key = author_claim_key(node_id)
         if operation == "acquire":
             succeeded = board.acquire(key, ttl=args.ttl, note=args.note)
         elif operation == "renew":
@@ -319,10 +1284,9 @@ def _claim(args: argparse.Namespace) -> int:
         else:
             succeeded = board.release(key)
         if succeeded:
-            past_tense = {"acquire": "acquired", "renew": "renewed", "release": "released"}
-            print(f"{past_tense[operation]} {args.node_id} ({key})")
+            print(f"{past_tense[operation]} {node_id} ({key})")
             return 0
-        print(f"error: could not {operation} {args.node_id}; ownership is held or unverifiable")
+        print(f"error: could not {operation} {node_id}; ownership is held or unverifiable")
         return 1
     except (ClaimTransportError, ValueError) as exc:
         print(f"error: {exc}")
@@ -333,7 +1297,20 @@ def _migrate(args: argparse.Namespace) -> int:
     if args.migrate_command != "article-ids":
         return 2
     try:
+        if args.write:
+            # Beside --json, stdout carries only the plan, so the writes go to stderr.
+            stream = sys.stderr if args.json else sys.stdout
+            for entry in write_article_ids(args.blueprint_dir):
+                print(f"{entry.article_path}: added article_id {entry.article_id}", file=stream)
         plan = plan_article_ids(args.blueprint_dir)
+    except ArticleIdWriteError as error:
+        for entry in error.written:
+            print(f"{entry.article_path}: added article_id {entry.article_id}", file=sys.stderr)
+        for issue in error.issues:
+            print(f"error: {issue}", file=sys.stderr)
+        if error.written:
+            print(f"error: added {len(error.written)} article_id(s) before stopping", file=sys.stderr)
+        return 2
     except GraphValidationError as error:
         for issue in error.issues:
             print(f"error: {issue}", file=sys.stderr)
@@ -410,6 +1387,22 @@ def _skeleton(args: argparse.Namespace) -> int:
     return 0 if report.clean else 1
 
 
+def _unused_hypotheses(args: argparse.Namespace) -> int:
+    try:
+        report = find_unused_hypotheses(
+            args.blueprint_dir,
+            lean_root=args.lean_root,
+            node_ids=tuple(args.nodes) if args.nodes else None,
+            timeout=args.timeout or DEFAULT_PROBE_TIMEOUT,
+        )
+    except SkeletonError as exc:
+        for issue in exc.issues:
+            print(f"error: {issue}", file=sys.stderr)
+        return 2
+    print(report.to_json() if args.json else format_unused_hypotheses(report), end="\n" if args.json else "")
+    return 0 if report.clean else 1
+
+
 def _claim_board(args: argparse.Namespace) -> ClaimBoard:
     worker_id = args.worker_id
     if not worker_id:
@@ -419,7 +1412,7 @@ def _claim_board(args: argparse.Namespace) -> ClaimBoard:
     return ClaimBoard(repo, worker_id, scratch)
 
 
-def _origin_url() -> str:
+def _origin_url(root: Path | None = None) -> str:
     try:
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -427,10 +1420,21 @@ def _origin_url() -> str:
             text=True,
             check=True,
             timeout=10,
+            cwd=root,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise ValueError("--repo is required outside a Git checkout with an origin remote") from exc
     return result.stdout.strip()
+
+
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("port must be an integer") from error
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+    return port
 
 
 def _default_claim_scratch(repo: str, worker_id: str) -> Path:
@@ -456,7 +1460,10 @@ def _render(args: argparse.Namespace) -> int:
     print(f"{report.output_dir}: {report.pages} pages, {report.nodes} nodes, {report.linked} code links")
     for issue in report.unresolved:
         print(f"warning: declaration not found in the Lean sources: {issue}")
-    if report.unresolved and args.require_declarations:
+    for issue in report.warnings:
+        print(f"warning: {issue}")
+    # A declaration that was never looked up is not known to exist.
+    if (report.unresolved or report.unchecked) and args.require_declarations:
         return 1
     return 0
 

@@ -79,7 +79,7 @@ class TestProjectResolution:
 
 
 class TestReplServer:
-    """Contracts for the persistent Lean REPL server."""
+    """Contracts for the Lean REPL MCP adapter."""
 
     def test_import_server(self):
         from servers.repl import server  # noqa: F401
@@ -104,35 +104,6 @@ class TestReplServer:
         assert required["run_lean_code"] == {"project_dir", "code"}
         assert required["get_repl_status"] == {"project_dir"}
         assert set(required) == {"run_lean_code", "get_repl_status"}
-
-    def test_project_router_reuses_and_separates_pools(self, tmp_path):
-        from servers.repl.projects import LeanReplProjects
-
-        class FakePool:
-            def __init__(self, root):
-                self.root = root
-                self.closed = False
-
-            def shutdown(self):
-                self.closed = True
-
-        created = []
-
-        def factory(root):
-            pool = FakePool(root)
-            created.append(pool)
-            return pool
-
-        first = make_lake_project(tmp_path, "first")
-        second = make_lake_project(tmp_path, "second")
-        projects = LeanReplProjects(factory)
-
-        assert projects.get(str(first)) is projects.get(str(first))
-        assert projects.get(str(first)) is not projects.get(str(second))
-        assert [pool.root for pool in created] == [first.resolve(), second.resolve()]
-
-        projects.shutdown()
-        assert all(pool.closed for pool in created)
 
 
 # ---------------------------------------------------------------------------
@@ -160,32 +131,3 @@ class TestLspServer:
         assert required["lean_diagnostic_messages"] == {"project_dir", "file_path"}
         assert required["lean_hover"] == {"project_dir", "file_path", "line", "character"}
         assert set(required) == {"lean_diagnostic_messages", "lean_hover"}
-
-    def test_project_router_reuses_and_separates_sessions(self, tmp_path):
-        from servers.lsp.server import LeanLspProjects
-
-        class FakeSession:
-            def __init__(self, root):
-                self.root = root
-                self.closed = False
-
-            def close(self):
-                self.closed = True
-
-        created = []
-
-        def factory(root):
-            session = FakeSession(root)
-            created.append(session)
-            return session
-
-        first = make_lake_project(tmp_path, "first")
-        second = make_lake_project(tmp_path, "second")
-        projects = LeanLspProjects(factory)
-
-        assert projects.get(str(first)) is projects.get(str(first))
-        assert projects.get(str(first)) is not projects.get(str(second))
-        assert [session.root for session in created] == [first.resolve(), second.resolve()]
-
-        projects.close()
-        assert all(session.closed for session in created)

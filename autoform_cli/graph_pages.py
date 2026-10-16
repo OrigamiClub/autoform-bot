@@ -17,11 +17,12 @@ from .graph import Graph
 from .graph_views import (
     GraphView,
     chapter_view,
+    container_nodes,
     focus_views,
     full_view,
     group_nodes,
     project_view,
-    scope_view,
+    scope_views,
 )
 from .status import NodeStatus
 
@@ -44,11 +45,15 @@ def write_graph_pages(
     """
     destination = Path(destination).resolve()
     groups = group_nodes(graph)
-    local_views = focus_views(graph, statuses)
+    container_boxes = container_nodes(graph, statuses)
+    # Containers are drawn as scope boxes, so they have no row in the legend.
+    drawn = {node_id: state for node_id, state in statuses.items() if node_id not in container_boxes}
+    local_views = focus_views(graph, statuses, containers=container_boxes)
     project_page = destination / "dependencies.md"
     full_page = destination / "dependencies/full.md"
     chapter_pages = {group: destination / "dependencies/chapters" / f"{group or 'roadmap'}.md" for group in groups}
-    containers = [node_id for node_id in graph.nodes if graph.children(node_id)]
+    scope_maps = scope_views(graph, statuses)
+    containers = list(scope_maps)
     scope_pages = {
         node_id: (
             project_page
@@ -65,7 +70,9 @@ def write_graph_pages(
     written: list[Path] = []
 
     project = project_view(graph, statuses)
-    project_item_count = sum(len(node_ids) for node_ids in groups.values())
+    project_item_count = sum(node.item_count for node in project.nodes)
+    # Like the project lead, chapter leads count formalization targets, so notes are left out.
+    chapter_item_counts = {node.id: node.item_count for node in project.nodes}
     project_book_links = node_links(project_page)
     project_links = {
         view_node.id: (
@@ -85,7 +92,7 @@ def write_graph_pages(
         _write_page(
             project_page,
             view=project,
-            statuses=statuses,
+            statuses=drawn,
             links=project_links,
             heading="Dependency maps",
             lead=(
@@ -96,8 +103,8 @@ def write_graph_pages(
     )
 
     for group, chapter_page in chapter_pages.items():
-        view = chapter_view(graph, statuses, group)
-        links = dict(node_links(chapter_page))
+        view = scope_maps[group] if group in scope_maps else chapter_view(graph, statuses, group)
+        links = _view_links(view, node_links(chapter_page))
         for node in view.nodes:
             if node.kind == "boundary":
                 external = node.id.removeprefix("boundary:")
@@ -116,6 +123,7 @@ def write_graph_pages(
             ("Full theorem DAG", _markdown_link(full_page, chapter_page)),
             ("Open textbook chapter", _markdown_link(book_page, chapter_page)),
         )
+        item_count = chapter_item_counts[f"scope:{group or 'roadmap'}"]
         written.append(
             _write_page(
                 chapter_page,
@@ -124,7 +132,7 @@ def write_graph_pages(
                 links=links,
                 heading=view.title,
                 lead=(
-                    f"This map contains the {len(groups[group])} decomposed items in this chapter. "
+                    f"This map covers {item_count} item{'s' if item_count != 1 else ''} in this chapter. "
                     "Dashed chapter boxes stand for external prerequisites or dependents."
                 ),
                 navigation=navigation,
@@ -135,8 +143,8 @@ def write_graph_pages(
         if scope in {"roadmap", *chapter_pages}:
             continue
         scope_page = scope_pages[scope]
-        view = scope_view(graph, statuses, scope)
-        links = dict(node_links(scope_page))
+        view = scope_maps[scope]
+        links = _view_links(view, node_links(scope_page))
         for node in view.nodes:
             if node.kind == "scope":
                 nested = node.id.removeprefix("scope:")
@@ -163,12 +171,12 @@ def write_graph_pages(
                 ),
             )
         )
-    complete = full_view(graph, statuses)
+    complete = full_view(graph, statuses, containers=container_boxes)
     written.append(
         _write_page(
             full_page,
             view=complete,
-            statuses=statuses,
+            statuses=drawn,
             links=node_links(full_page),
             heading=complete.title,
             lead=(
@@ -183,7 +191,8 @@ def write_graph_pages(
         view = local_views[node_id]
         parent = graph.nodes[node_id].parent
         chapter_page = scope_pages.get(parent or article_groups[node_id], chapter_pages[article_groups[node_id]])
-        statement_href = _markdown_document_link(node_links(focus_page)[node_id])
+        focus_links = node_links(focus_page)
+        statement_href = _markdown_document_link(focus_links[node_id])
         navigation = _navigation(
             ("Project map", _markdown_link(project_page, focus_page)),
             ("Chapter map", _markdown_link(chapter_page, focus_page)),
@@ -194,8 +203,8 @@ def write_graph_pages(
             _write_page(
                 focus_page,
                 view=view,
-                statuses=_selected_statuses(statuses, view),
-                links=node_links(focus_page),
+                statuses=_selected_statuses(drawn, view),
+                links=focus_links,
                 heading=view.title,
                 lead=(
                     "This local map shows one dependency hop in either direction. "
@@ -224,7 +233,7 @@ def _write_page(
     navigation: str = "",
     extra: str = "",
 ) -> Path:
-    diagram = mermaid.render_view_diagram(view, links=dict(links), include_classdefs=False)
+    diagram = mermaid.render_view_diagram(view, links=_view_links(view, links), include_classdefs=False)
     sections = [
         "---",
         "kind: graph",
@@ -251,7 +260,16 @@ def _selected_statuses(
     statuses: dict[str, NodeStatus],
     view: GraphView,
 ) -> dict[str, NodeStatus]:
-    return {node_id: statuses[node_id] for node_id in view.member_ids}
+    return {node_id: statuses[node_id] for node_id in view.member_ids if node_id in statuses}
+
+
+def _view_links(view: GraphView, links: Mapping[str, str]) -> dict[str, str]:
+    """The links of the nodes *view* draws.
+
+    ``node_links`` covers the whole graph and builds each link when it is read,
+    so taking only these keeps a page's cost to the size of its view.
+    """
+    return {node.id: links[node.id] for node in view.nodes if node.id in links}
 
 
 def _navigation(*items: tuple[str, str]) -> str:

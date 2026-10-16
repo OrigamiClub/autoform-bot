@@ -1,3 +1,5 @@
 .lake/
 site/
 site-src/
+.autoform-publication-*/
+.claude/worktrees/

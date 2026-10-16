@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, Literal
+from typing import Callable, Iterable, Literal
 
 from .graph import Graph, Node
 from .status import STATES, NodeStatus, topological_order
@@ -18,6 +18,10 @@ from .status import STATES, NodeStatus, topological_order
 
 ViewKind = Literal["project", "chapter", "focus", "full"]
 NodeKind = Literal["scope", "boundary", "node"]
+
+# source, target, proof-only, then each endpoint's direct child of the viewed
+# scope, or ``None`` when that endpoint lies outside it.
+_ScopedRelation = tuple[str, str, bool, str | None, str | None]
 
 _H1 = re.compile(r"^ {0,3}#[ \t]+(.+?)[ \t]*#*[ \t]*$")
 
@@ -34,10 +38,11 @@ class ViewNode:
     declaration: str | None = None
     status_key: str | None = None
     focus: bool = False
+    complete: bool = False
 
     @property
     def item_count(self) -> int:
-        return len(self.members)
+        return sum(count for _, count in self.status_counts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,13 +88,17 @@ def group_id(node_id: str) -> str:
 
 def group_nodes(graph: Graph) -> dict[str, tuple[str, ...]]:
     """Group articles under their top-level roadmap container."""
+    return _group_nodes(graph, _containment_children(graph))
+
+
+def _group_nodes(graph: Graph, children: dict[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
     grouped: dict[str, list[str]] = {}
     for node_id in topological_order(graph):
         if node_id == "roadmap":
             continue
-        if graph.children(node_id):
+        if node_id in children:
             continue
-        scope = _top_scope(graph, node_id)
+        scope = _top_scope(graph, node_id, children)
         grouped.setdefault(scope, [])
         grouped[scope].append(node_id)
     return {group: tuple(node_ids) for group, node_ids in grouped.items()}
@@ -110,18 +119,13 @@ def group_title(graph: Graph, group: str) -> str:
 
 def project_view(graph: Graph, statuses: dict[str, NodeStatus]) -> GraphView:
     """Collapse every publication chapter to one project-map node."""
-    grouped = group_nodes(graph)
-    edges = _project_edges(graph)
+    children = _containment_children(graph)
+    grouped = _group_nodes(graph, children)
+    edges = _project_edges(graph, children)
     required_scopes = {endpoint.removeprefix("scope:") for edge in edges for endpoint in (edge.source, edge.target)}
     scopes = [*grouped, *(scope for scope in sorted(required_scopes) if scope not in grouped)]
     nodes = tuple(
-        ViewNode(
-            id=_scope_node_id(group),
-            title=group_title(graph, group),
-            kind="scope",
-            members=grouped.get(group, ()),
-            status_counts=_status_counts(grouped.get(group, ()), statuses),
-        )
+        _scope_node(graph, statuses, _scope_node_id(group), group_title(graph, group), grouped.get(group, ()))
         for group in scopes
     )
     return GraphView(kind="project", title="Project dependency map", nodes=nodes, edges=edges)
@@ -129,9 +133,10 @@ def project_view(graph: Graph, statuses: dict[str, NodeStatus]) -> GraphView:
 
 def chapter_view(graph: Graph, statuses: dict[str, NodeStatus], group: str) -> GraphView:
     """Show one chapter's nodes and collapse every external chapter to a boundary."""
-    if group in graph.nodes and graph.children(group):
+    children = _containment_children(graph)
+    if group in graph.nodes and group in children:
         return scope_view(graph, statuses, group)
-    grouped = group_nodes(graph)
+    grouped = _group_nodes(graph, children)
     group = group or "roadmap"
     if group not in grouped:
         raise KeyError(f"unknown blueprint chapter: {group}")
@@ -139,22 +144,17 @@ def chapter_view(graph: Graph, statuses: dict[str, NodeStatus], group: str) -> G
     inside = frozenset(grouped[group])
     boundaries: dict[str, set[str]] = defaultdict(set)
     edge_counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+
+    def endpoint(node_id: str) -> str:
+        if node_id in inside:
+            return node_id
+        external = _top_scope(graph, node_id, children)
+        boundaries[external].add(node_id)
+        return _boundary_node_id(external)
+
     for source, target, proof_only in _relations(graph):
-        source_inside = source in inside
-        target_inside = target in inside
-        if not source_inside and not target_inside:
-            continue
-        if source_inside and target_inside:
-            projected_source, projected_target = source, target
-        elif target_inside:
-            external = _top_scope(graph, source)
-            boundaries[external].add(source)
-            projected_source, projected_target = _boundary_node_id(external), target
-        else:
-            external = _top_scope(graph, target)
-            boundaries[external].add(target)
-            projected_source, projected_target = source, _boundary_node_id(external)
-        edge_counts[(projected_source, projected_target)][1 if proof_only else 0] += 1
+        if source in inside or target in inside:
+            edge_counts[(endpoint(source), endpoint(target))][1 if proof_only else 0] += 1
 
     nodes = [_theorem_node(graph.nodes[node_id], statuses[node_id]) for node_id in grouped[group]]
     nodes.extend(
@@ -189,51 +189,114 @@ def scope_view(
     children are visible, and authored dependencies are rolled up through the
     containment hierarchy without creating another graph representation.
     """
-    if scope not in graph.nodes or not graph.children(scope):
+    children = _containment_children(graph)
+    if scope not in graph.nodes or scope not in children:
         raise KeyError(f"unknown blueprint scope: {scope}")
-    direct = graph.children(scope)
-    members = {child: _leaf_descendants(graph, child) for child in direct}
+    relations = (
+        (source, target, proof_only, _direct_child(graph, scope, source), _direct_child(graph, scope, target))
+        for source, target, proof_only in _relations(graph)
+    )
+    return _scope_view(
+        graph,
+        statuses,
+        scope,
+        children=children,
+        relations=relations,
+        top_scope=lambda node_id: _top_scope(graph, node_id, children),
+        include_external=include_external,
+    )
+
+
+def scope_views(
+    graph: Graph,
+    statuses: dict[str, NodeStatus],
+    *,
+    include_external: bool = True,
+) -> dict[str, GraphView]:
+    """Build every container's view while sharing the graph-wide indexes.
+
+    Static publication writes one page per container. Rebuilding the
+    containment index and rescanning every relation for each page becomes
+    quadratic on a large book, so the bulk path indexes containment once and
+    files each relation under only the containers that enclose an endpoint.
+    """
+    children = _containment_children(graph)
+    enclosing: dict[str, dict[str, str]] = {}
+    top_scopes: dict[str, str] = {}
+
+    def enclosing_scopes(node_id: str) -> dict[str, str]:
+        found = enclosing.get(node_id)
+        if found is None:
+            found = enclosing[node_id] = _enclosing_scopes(graph, node_id)
+        return found
+
+    def top_scope(node_id: str) -> str:
+        found = top_scopes.get(node_id)
+        if found is None:
+            found = top_scopes[node_id] = _top_scope(graph, node_id, children)
+        return found
+
+    relations: dict[str, list[_ScopedRelation]] = defaultdict(list)
+    for source, target, proof_only in _relations(graph):
+        source_scopes = enclosing_scopes(source)
+        target_scopes = enclosing_scopes(target)
+        for scope, source_child in source_scopes.items():
+            relations[scope].append((source, target, proof_only, source_child, target_scopes.get(scope)))
+        for scope, target_child in target_scopes.items():
+            if scope not in source_scopes:
+                relations[scope].append((source, target, proof_only, None, target_child))
+
+    return {
+        scope: _scope_view(
+            graph,
+            statuses,
+            scope,
+            children=children,
+            relations=relations.get(scope, ()),
+            top_scope=top_scope,
+            include_external=include_external,
+        )
+        for scope in graph.nodes
+        if scope in children
+    }
+
+
+def _scope_view(
+    graph: Graph,
+    statuses: dict[str, NodeStatus],
+    scope: str,
+    *,
+    children: dict[str, tuple[str, ...]],
+    relations: Iterable[_ScopedRelation],
+    top_scope: Callable[[str], str],
+    include_external: bool,
+) -> GraphView:
+    direct = children[scope]
+    members = {child: _leaf_descendants(children, child) for child in direct}
     nodes: list[ViewNode] = []
     for child in direct:
         article = graph.nodes[child]
-        if graph.children(child):
-            nodes.append(
-                ViewNode(
-                    id=_scope_node_id(child),
-                    title=article.title,
-                    kind="scope",
-                    members=members[child],
-                    status_counts=_status_counts(members[child], statuses),
-                )
-            )
+        if child in children:
+            nodes.append(_scope_node(graph, statuses, _scope_node_id(child), article.title, members[child]))
         else:
             nodes.append(_theorem_node(article, statuses[child]))
 
     edge_counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     boundaries: dict[str, set[str]] = defaultdict(set)
-    for source, target, proof_only in _relations(graph):
-        source_child = _direct_child(graph, scope, source)
-        target_child = _direct_child(graph, scope, target)
-        if source_child is None and target_child is None:
+
+    def endpoint(node_id: str, child: str | None) -> str:
+        if child is None:
+            external = top_scope(node_id)
+            boundaries[external].add(node_id)
+            return _boundary_node_id(external)
+        return _scope_node_id(child) if child in children else child
+
+    for source, target, proof_only, source_child, target_child in relations:
+        if source_child == target_child:  # both outside the scope, or both under one child
             continue
-        if source_child is not None and target_child is not None:
-            if source_child == target_child:
-                continue
-            projected_source = _scope_node_id(source_child) if graph.children(source_child) else source_child
-            projected_target = _scope_node_id(target_child) if graph.children(target_child) else target_child
-        elif not include_external:
+        if (source_child is None or target_child is None) and not include_external:
             continue
-        elif target_child is not None:
-            external = _top_scope(graph, source)
-            boundaries[external].add(source)
-            projected_source = _boundary_node_id(external)
-            projected_target = _scope_node_id(target_child) if graph.children(target_child) else target_child
-        else:
-            external = _top_scope(graph, target)
-            boundaries[external].add(target)
-            projected_source = _scope_node_id(source_child) if graph.children(source_child) else source_child
-            projected_target = _boundary_node_id(external)
-        edge_counts[(projected_source, projected_target)][1 if proof_only else 0] += 1
+        edge_counts[(endpoint(source, source_child), endpoint(target, target_child))][1 if proof_only else 0] += 1
 
     for external, external_members in sorted(boundaries.items()):
         nodes.append(
@@ -273,6 +336,7 @@ def focus_view(
         radius=radius,
         adjacency=_adjacency(graph),
         order_index={candidate: index for index, candidate in enumerate(topological_order(graph))},
+        containers=container_nodes(graph, statuses),
     )
 
 
@@ -281,6 +345,7 @@ def focus_views(
     statuses: dict[str, NodeStatus],
     *,
     radius: int = 1,
+    containers: dict[str, ViewNode] | None = None,
 ) -> dict[str, GraphView]:
     """Build every local view while sharing the graph-wide indexes.
 
@@ -293,6 +358,8 @@ def focus_views(
         raise ValueError("focus radius must be non-negative")
     adjacency = _adjacency(graph)
     order_index = {candidate: index for index, candidate in enumerate(topological_order(graph))}
+    if containers is None:
+        containers = container_nodes(graph, statuses)
     return {
         node_id: _focus_view(
             graph,
@@ -301,6 +368,7 @@ def focus_views(
             radius=radius,
             adjacency=adjacency,
             order_index=order_index,
+            containers=containers,
         )
         for node_id in graph.nodes
     }
@@ -314,12 +382,8 @@ def _focus_view(
     radius: int,
     adjacency: dict[str, set[str]],
     order_index: dict[str, int],
+    containers: dict[str, ViewNode],
 ) -> GraphView:
-    if node_id not in graph.nodes:
-        raise KeyError(f"unknown blueprint node: {node_id}")
-    if radius < 0:
-        raise ValueError("focus radius must be non-negative")
-
     selected = {node_id}
     frontier = {node_id}
     for _ in range(radius):
@@ -333,6 +397,7 @@ def _focus_view(
         statuses,
         sorted(selected, key=order_index.__getitem__),
         ordered=True,
+        containers=containers,
     )
     nodes = tuple(
         ViewNode(
@@ -344,6 +409,7 @@ def _focus_view(
             declaration=node.declaration,
             status_key=node.status_key,
             focus=node.id == node_id,
+            complete=node.complete,
         )
         for node in view.nodes
     )
@@ -357,9 +423,16 @@ def _focus_view(
     )
 
 
-def full_view(graph: Graph, statuses: dict[str, NodeStatus]) -> GraphView:
+def full_view(
+    graph: Graph,
+    statuses: dict[str, NodeStatus],
+    *,
+    containers: dict[str, ViewNode] | None = None,
+) -> GraphView:
     """Present the complete fine-grained theorem DAG through the view API."""
-    view = _node_view(graph, statuses, graph.nodes)
+    if containers is None:
+        containers = container_nodes(graph, statuses)
+    view = _node_view(graph, statuses, graph.nodes, containers=containers)
     return GraphView(kind="full", title="Full theorem dependency graph", nodes=view.nodes, edges=view.edges)
 
 
@@ -369,13 +442,19 @@ def _node_view(
     selected: Iterable[str],
     *,
     ordered: bool = False,
+    containers: dict[str, ViewNode],
 ) -> GraphView:
-    ordered_ids = list(dict.fromkeys(node_id for node_id in selected if node_id in graph.nodes))
+    ordered_ids = list(selected)
     selected_ids = frozenset(ordered_ids)
     if not ordered:
         order_index = {node_id: index for index, node_id in enumerate(topological_order(graph))}
         ordered_ids.sort(key=order_index.__getitem__)
-    nodes = tuple(_theorem_node(graph.nodes[node_id], statuses[node_id]) for node_id in ordered_ids)
+    # A container is a chapter or section page, not a result: drawing it as a
+    # theorem gave it the "ready to state" status of an empty statement.
+    nodes = tuple(
+        containers[node_id] if node_id in containers else _theorem_node(graph.nodes[node_id], statuses[node_id])
+        for node_id in ordered_ids
+    )
     edge_counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     for target in ordered_ids:
         node = graph.nodes[target]
@@ -397,11 +476,11 @@ def _adjacency(graph: Graph) -> dict[str, set[str]]:
     return adjacency
 
 
-def _project_edges(graph: Graph) -> tuple[ViewEdge, ...]:
+def _project_edges(graph: Graph, children: dict[str, tuple[str, ...]]) -> tuple[ViewEdge, ...]:
     edge_counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     for source, target, proof_only in _relations(graph):
-        source_group = _top_scope(graph, source)
-        target_group = _top_scope(graph, target)
+        source_group = _top_scope(graph, source, children)
+        target_group = _top_scope(graph, target, children)
         if source_group == target_group:
             continue
         key = (_scope_node_id(source_group), _scope_node_id(target_group))
@@ -439,6 +518,52 @@ def _theorem_node(node: Node, node_status: NodeStatus) -> ViewNode:
     )
 
 
+def _scope_node(
+    graph: Graph,
+    statuses: dict[str, NodeStatus],
+    view_id: str,
+    title: str,
+    leaves: Iterable[str],
+    *,
+    members: tuple[str, ...] | None = None,
+) -> ViewNode:
+    """Summarize a container by the formalization targets beneath it.
+
+    Only leaves that declare something or are marked not ready count, so a
+    note cannot hold a finished chapter open but deferred work does. In a
+    node-level view the box stands for the container itself, so *members* is
+    the container, while its counts still describe what lies beneath it.
+    """
+    targets = tuple(
+        node_id for node_id in leaves if graph.nodes[node_id].formalizable or graph.nodes[node_id].not_ready
+    )
+    return ViewNode(
+        id=view_id,
+        title=title,
+        kind="scope",
+        members=targets if members is None else members,
+        status_counts=_status_counts(targets, statuses),
+        complete=bool(targets) and all(statuses[node_id].fully_proved for node_id in targets),
+    )
+
+
+def container_nodes(graph: Graph, statuses: dict[str, NodeStatus]) -> dict[str, ViewNode]:
+    """Every container as it appears in a node-level view.
+
+    Bulk publication builds this once and passes it to ``focus_views`` and
+    ``full_view``, so the containment index is not rebuilt per page.
+    """
+    children = _containment_children(graph)
+    return {
+        node_id: _scope_node(
+            graph, statuses, node_id, graph.nodes[node_id].title, _leaf_descendants(children, node_id),
+            members=(node_id,),
+        )
+        for node_id in children
+        if node_id in graph.nodes
+    }
+
+
 def _status_counts(
     node_ids: Iterable[str],
     statuses: dict[str, NodeStatus],
@@ -457,13 +582,13 @@ def _boundary_node_id(group: str) -> str:
     return f"boundary:{group or 'roadmap'}"
 
 
-def _top_scope(graph: Graph, node_id: str) -> str:
+def _top_scope(graph: Graph, node_id: str, children: dict[str, tuple[str, ...]]) -> str:
     """Return the canonical roadmap scope containing *node_id*."""
     current = node_id
     while graph.nodes[current].parent is not None:
         parent = graph.nodes[current].parent
         if parent == "roadmap":
-            return current if graph.children(current) else "roadmap"
+            return current if current in children else "roadmap"
         current = parent
     # Hand-built/legacy in-memory graphs did not carry containment. Preserve
     # their path-based chapter grouping without weakening Markdown inference.
@@ -479,11 +604,53 @@ def _direct_child(graph: Graph, scope: str, node_id: str) -> str | None:
     return None
 
 
-def _leaf_descendants(graph: Graph, node_id: str) -> tuple[str, ...]:
-    children = graph.children(node_id)
-    if not children:
-        return (node_id,)
-    return tuple(leaf for child in children for leaf in _leaf_descendants(graph, child))
+def _enclosing_scopes(graph: Graph, node_id: str) -> dict[str, str]:
+    """Map every container enclosing *node_id* to its child on the way down."""
+    scopes: dict[str, str] = {}
+    current = node_id
+    while current in graph.nodes:
+        parent = graph.nodes[current].parent
+        if parent is None:
+            break
+        scopes[parent] = current
+        current = parent
+    return scopes
+
+
+def _leaf_descendants(children: dict[str, tuple[str, ...]], node_id: str) -> tuple[str, ...]:
+    leaves: list[str] = []
+    pending = [node_id]
+    while pending:
+        current = pending.pop()
+        contained = children.get(current)
+        if contained:
+            pending.extend(reversed(contained))
+        else:
+            leaves.append(current)
+    return tuple(leaves)
+
+
+def _containment_children(graph: Graph) -> dict[str, tuple[str, ...]]:
+    """Index direct containment once per view, rejecting hand-built cycles.
+
+    ``load_graph`` only produces forests; checking here keeps every parent walk
+    in a view finite for graphs built in memory.
+    """
+    children: dict[str, list[str]] = {}
+    for node in graph.nodes.values():
+        if node.parent is not None:
+            children.setdefault(node.parent, []).append(node.id)
+    acyclic: set[str] = set()
+    for node_id in graph.nodes:
+        trail: set[str] = set()
+        current: str | None = node_id
+        while current is not None and current in graph.nodes and current not in acyclic:
+            if current in trail:
+                raise ValueError("article containment is not a forest")
+            trail.add(current)
+            current = graph.nodes[current].parent
+        acyclic |= trail
+    return {parent: tuple(node_ids) for parent, node_ids in children.items()}
 
 
 __all__ = [
@@ -491,6 +658,7 @@ __all__ = [
     "ViewEdge",
     "ViewNode",
     "chapter_view",
+    "container_nodes",
     "focus_view",
     "focus_views",
     "full_view",
@@ -499,4 +667,5 @@ __all__ = [
     "group_title",
     "project_view",
     "scope_view",
+    "scope_views",
 ]

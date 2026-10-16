@@ -22,8 +22,8 @@ permissions:
   contents: read
 
 env:
-  AUTOFORM_SOURCE: "https://github.com/VivienCabannes/autoform-bot.git"
-  AUTOFORM_REF: "43097b2c07e68df899d6b8bca7849d091c294754"
+  AUTOFORM_SOURCE: "https://github.com/facebookresearch/autoform-bot.git"
+  AUTOFORM_REF: "c994d83f9fab1f40d69b2f279d4c62ca937a0186"
 
 concurrency:
   group: blueprint-pages
@@ -61,9 +61,10 @@ jobs:
       - name: Build the Markdown site
         run: >-
           uvx --from mkdocs==1.6.1
-          --with mkdocs-material==9.6.21
+          --with mkdocs-material==9.7.7
           --with mkdocs-literate-nav==0.6.2
-          --with pymdown-extensions==10.21.3
+          --with markdown==3.10.3
+          --with pymdown-extensions==11.0.1
           mkdocs build --strict
 
       - name: Upload Pages artifact

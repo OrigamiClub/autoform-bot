@@ -1,0 +1,214 @@
+{imports}
+-- Autoform impact probe. This file is a Python-format template: `{{`/`}}` are
+-- literal braces and single-brace fields are filled by autoform_cli.impact.
+-- It is written to a temporary file and run with `lake env lean` inside the
+-- built project; it never modifies the project.
+import Lean.Linter.Deprecated
+import Lean.Elab.Command
+import Lean.Data.Json
+
+open Lean Elab Command Meta
+
+namespace AutoformImpact
+
+def probeOutputLimit : Nat := {output_limit}
+
+/-- A name as the CLI spells it: a JSON array of components, each a string or
+a number. -/
+def nameOf (components : Json) : Except String Name := do
+  (← components.getArr?).foldlM (init := Name.anonymous) fun name component =>
+    match component with
+    | .str part => pure (name.str part)
+    | _ => name.num <$> component.getNat?
+
+/-- Names as the CLI passes them: JSON `[request, components]` pairs. A list
+literal of names would be compiled, and the code generator gives up on one
+longer than about 1,500 entries. -/
+def requestedNames (text : String) : CommandElabM (Array Name) := do
+  let decode (entry : Json) : Except String Name := entry.getArrVal? 1 >>= nameOf
+  match _root_.Lean.Json.parse text >>= (·.getArr?) >>= (·.mapM decode) with
+  | .ok names => pure names
+  | .error e => throwError ("the project module list is malformed: " ++ e)
+
+/-- The directory each `M.*` or `M.+` glob walks, with `M` and the glob, as
+JSON `[directory, components, glob]` triples, for the same reason. -/
+def globDirectories (text : String) : CommandElabM (Array (System.FilePath × Name × String)) := do
+  let decode (entry : Json) : Except String (System.FilePath × Name × String) := do
+    let directory ← entry.getArrVal? 0 >>= (·.getStr?)
+    let base ← entry.getArrVal? 1 >>= nameOf
+    let glob ← entry.getArrVal? 2 >>= (·.getStr?)
+    pure (System.FilePath.mk directory, base, glob)
+  match _root_.Lean.Json.parse text >>= (·.getArr?) >>= (·.mapM decode) with
+  | .ok directories => pure directories
+  | .error e => throwError ("the glob directory list is malformed: " ++ e)
+
+/-- Write one complete record without letting the scratch file grow past the
+CLI's output limit. The Python reader checks the limit again after exit. -/
+def emitRecord (out : IO.FS.Handle) (written : IO.Ref Nat) (marker : String)
+    (record : Json) : IO Unit := do
+  let line := s!"{{marker}}{{record.compress}}\n"
+  let total := (← written.get) + line.utf8ByteSize
+  if total > probeOutputLimit then
+    throw <| IO.userError s!"lake env lean exceeded the {{probeOutputLimit}}-byte output limit"
+  written.set total
+  out.putStr line
+
+def kindOf : ConstantInfo → String
+  | .defnInfo _   => "def"
+  | .thmInfo _    => "theorem"
+  | .axiomInfo _  => "axiom"
+  | .opaqueInfo _ => "opaque"
+  | .inductInfo _ => "inductive"
+  | .ctorInfo _   => "constructor"
+  | .recInfo _    => "recursor"
+  | .quotInfo _   => "quot"
+
+/-- The longest proper prefix of the user-facing name that is itself a
+constant. A private name's prefixes are tried under its own private prefix
+first, so a `where` helper of a private declaration finds that declaration. -/
+def parentOf (env : Environment) (c : Name) : Option Name := Id.run do
+  let privatePrefix := privatePrefix? c
+  let mut p := (privateToUserName c).getPrefix
+  while !p.isAnonymous do
+    if let some pre := privatePrefix then
+      if env.contains (pre ++ p) then return some (pre ++ p)
+    if env.contains p then return some p
+    p := p.getPrefix
+  return none
+
+def nameJson (n : Name) : Json := Json.str (toString n)
+
+def namesJson (names : Array Name) : Json :=
+  Json.arr ((names.qsort Name.lt).map nameJson)
+
+/-- What a revision of any project-local constant can reach through `c`: the
+local constants its type and its value mention, and its deprecation state.
+Theorem values are read too (`allowOpaque`), since proofs break when the
+statements they use change; an inductive's constructors stand in for a value,
+and so does the `_unsafe_rec` companion of a `partial def`, whose kernel value
+is only an `Inhabited` witness while the companion holds the body Lean runs.
+`internal` is judged on the user-facing name: a private declaration someone
+wrote is not an internal detail, while the companions Lean generates for it
+(`_proof_1`, `match_1`, `_simp_1`) still are. `user_name` is that name for a
+private constant, which is how articles and `--declaration` name it.
+`alias_of` is the local constant a theorem's value is exactly when the
+theorem's type is also exactly that constant's, as Batteries' `alias` writes:
+its statement then changes with the target's although its type never mentions
+it. A theorem whose type differs from its target's, even up to definitional
+unfolding, keeps its own statement. -/
+def record (env : Environment) (isLocal : Name → Bool) (c : Name) (info : ConstantInfo)
+    (module : Name) : Json :=
+  let value := info.value? (allowOpaque := true)
+  let typeConstants := info.type.getUsedConstants
+  -- `Compiler.mkUnsafeRecName c`, spelled out to keep the probe's imports small.
+  let implementation := Name.str c "_unsafe_rec"
+  let valueConstants := match info with
+    | .inductInfo v => v.ctors.toArray
+    | .opaqueInfo _ =>
+      let uses := (value.map (·.getUsedConstants)).getD #[]
+      if env.contains implementation then uses.push implementation else uses
+    | _             => (value.map (·.getUsedConstants)).getD #[]
+  let valueMissing := match info with
+    | .thmInfo _ | .defnInfo _ | .opaqueInfo _ => value.isNone
+    | _                                        => false
+  let aliasOf := match info, value.map (·.consumeMData) with
+    | .thmInfo _, some (.const target levels) =>
+      let sameType := (env.find? target).any
+        (fun (targetInfo : ConstantInfo) => info.type == targetInfo.instantiateTypeLevelParams levels)
+      if isLocal target && sameType then some target else none
+    | _, _ => none
+  let usesDeprecated := (typeConstants ++ valueConstants).foldl
+    (fun acc d => if Linter.isDeprecated env d && !acc.contains d then acc.push d else acc) #[]
+  Json.mkObj [
+    ("name", nameJson c),
+    ("kind", Json.str (kindOf info)),
+    ("instance", Json.bool (isInstanceCore env c)),
+    ("internal", Json.bool (privateToUserName c).isInternalDetail),
+    ("user_name", if isPrivateName c then nameJson (privateToUserName c) else Json.null),
+    ("module", nameJson module),
+    ("parent", ((parentOf env c).map nameJson).getD Json.null),
+    ("type_uses", namesJson (typeConstants.filter isLocal)),
+    ("value_uses", namesJson (valueConstants.filter isLocal)),
+    ("alias_of", (aliasOf.map nameJson).getD Json.null),
+    ("deprecated", Json.bool (Linter.isDeprecated env c)),
+    ("replacement", ((Linter.getDeprecatedNewName env c).map nameJson).getD Json.null),
+    ("uses_deprecated", namesJson usesDeprecated),
+    ("value_missing", Json.bool valueMissing)]
+
+end AutoformImpact
+
+set_option maxHeartbeats 0 in
+run_cmd do
+  let projectModules : Std.HashSet Name :=
+    Std.HashSet.ofList (← AutoformImpact.requestedNames {project_modules}).toList
+  let env ← getEnv
+  -- `env.header` is slow to reach from the interpreted probe, so module names
+  -- are read once.
+  let moduleNames := env.header.moduleNames
+  let moduleOf (n : Name) : Option Name :=
+    (env.getModuleIdxFor? n).map fun idx => moduleNames[idx.toNat]!
+  let isLocalModule (m : Name) : Bool := projectModules.contains m
+  let isLocal (n : Name) : Bool := (moduleOf n).any isLocalModule
+  -- Records go to the file the CLI names: a command's stdout is buffered into
+  -- one message, and any other write could split a record.
+  let some path ← IO.getEnv "{output_env}" | throwError "{output_env} is not set"
+  let out ← IO.FS.Handle.mk path .write
+  let written ← IO.mkRef 0
+  try
+    -- A root-package module the inventory missed gets no records, so what it
+    -- uses and imports would silently drop out of the scope. Lake builds every
+    -- module an `M.*` or `M.+` glob finds by this same walk of the live tree,
+    -- imported or not. This probe imports every glob module the inventory
+    -- holds, so one it did not load is one the inventory missed (even if
+    -- another srcDir holds a file of that name).
+    if {check_inventory} then
+      let artifactDir := (← IO.FS.realPath {artifact_dir}).components
+      for (dir, base, glob) in (← AutoformImpact.globDirectories {glob_directories}) do
+        if (← dir.isDir) then
+          Lean.forEachModuleInDir dir fun sub => do
+            unless (env.getModuleIdx? (base ++ sub)).isSome do
+              throwError m!"the impact probe found root-package module {{base ++ sub}} under glob {{glob}}, \
+                but loaded no captured source for it: the source inventory skips nested Git checkouts, \
+                ignored directories such as `build`, and symlinked directories"
+      for module in moduleNames do
+        unless isLocalModule module do
+          let oleanPath ← IO.FS.realPath (← findOLean module)
+          if oleanPath.components.take artifactDir.length == artifactDir then
+            throwError m!"the impact probe loaded root-package module {{module}} from {{oleanPath}}, \
+              but the captured source inventory has no such module: it skips nested Git checkouts, \
+              ignored directories such as `build`, and symlinked directories, and names a module \
+              exactly as its file is spelled, including case"
+    -- Module ownership and direct imports come from the loaded environment,
+    -- not source syntax. Emit even modules with no declarations so the
+    -- evidence is a closed graph over every loaded project module.
+    if {emit_module_evidence} then
+      let sourceSearchPath ← getSrcSearchPath
+      for module in moduleNames do
+        if isLocalModule module then
+          let some moduleIdx := env.getModuleIdx? module | continue
+          -- Not `findWithExt`, which takes the first entry with a directory
+          -- named like the module's root: srcDir "." then answers for module
+          -- `Tests` of a later srcDir whenever a `Tests` directory sits beside
+          -- the lakefile, or, on a case-insensitive file system, a `tests` one.
+          let some sourceDir ← sourceSearchPath.findM? fun dir => (modToFilePath dir module "lean").pathExists |
+            throwError m!"project module {{module}} has no source path"
+          let sourcePath ← IO.FS.realPath (modToFilePath sourceDir module "lean")
+          let oleanPath ← IO.FS.realPath (← findOLean module)
+          let directImports := env.header.moduleData[moduleIdx.toNat]!.imports.foldl
+            (fun imports imported =>
+              if isLocalModule imported.module && !imports.contains imported.module then
+                imports.push imported.module
+              else imports)
+            #[]
+          AutoformImpact.emitRecord out written "{module_marker}" <| Json.mkObj [
+            ("module", AutoformImpact.nameJson module),
+            ("source_path", Json.str sourcePath.toString),
+            ("olean_path", Json.str oleanPath.toString),
+            ("direct_local_imports", AutoformImpact.namesJson directImports)]
+    for (c, info) in env.constants do
+      let some module := moduleOf c | continue
+      if isLocalModule module then
+        AutoformImpact.emitRecord out written "{marker}"
+          (AutoformImpact.record env isLocal c info module)
+  finally
+    out.flush

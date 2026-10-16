@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import pytest
 
 
 def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
@@ -15,6 +19,7 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
     assert skills == {
         "setup",
         "roadmap",
+        "formalize",
         "human-review",
         "agent-review",
         "develop-plugin",
@@ -24,6 +29,7 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
     review_dir = repo_root / "skills" / "agent-review"
     references = {
         "faithfulness.md",
+        "readback-faithfulness.md",
         "proof-integrity.md",
         "code-quality.md",
         "mathlib-style.md",
@@ -50,11 +56,26 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
             assert config["mcpServers"][name]["args"][-2:] == ["-m", module]
 
     codex_manifest = json.loads((repo_root / ".codex-plugin/plugin.json").read_text())
-    assert len(codex_manifest["interface"]["defaultPrompt"]) == 6
+    interface = codex_manifest["interface"]
+    assert len(interface["shortDescription"]) <= 30
+    assert interface["category"] == "Developer Tools"
+    default_prompts = interface["defaultPrompt"]
+    assert len(default_prompts) == 3
+    assert all(len(prompt) <= 128 and "\n" not in prompt for prompt in default_prompts)
+    assert any(
+        "source-grounded Autoform roadmap" in prompt and "persistent Goal" in prompt
+        for prompt in default_prompts
+    )
+    assert any("Formalize the ready Markdown roadmap frontier" in prompt for prompt in default_prompts)
+    assert not any(
+        "claim-backed workers" in prompt
+        for prompt in default_prompts
+    )
     muse = json.loads((repo_root / ".muse-plugin/plugin.json").read_text())
     assert [command["id"] for command in muse["capabilities"]["commands"]] == [
         "setup",
         "roadmap",
+        "formalize",
         "human-review",
         "agent-review",
         "develop-plugin",
@@ -77,6 +98,88 @@ def test_mcp_launchers_use_plugin_only_as_the_uv_project(repo_root):
         assert "LEAN_PROJECT_DIR" not in json.dumps(server)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="project new requires POSIX publication")
+def test_copied_plugin_project_entrypoints_need_no_autoform_on_path(repo_root, tmp_path):
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    for name in ("LICENSE", "pyproject.toml", "uv.lock"):
+        shutil.copy2(repo_root / name, plugin / name)
+    for package in ("autoform_cli", "servers"):
+        shutil.copytree(
+            repo_root / package,
+            plugin / package,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    environment = os.environ.copy()
+    environment["PATH"] = str(empty_path)
+    environment.pop("VIRTUAL_ENV", None)
+    uv = shutil.which("uv")
+    assert uv is not None
+    assert shutil.which("autoform", path=environment["PATH"]) is None
+
+    def run(*arguments: str, cwd: Path = tmp_path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                uv,
+                "run",
+                "--python",
+                sys.executable,
+                "--project",
+                str(plugin),
+                "autoform",
+                *arguments,
+            ],
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+
+    versions = run("project", "versions", "--json")
+    assert versions.returncode == 0, versions.stderr
+    release = json.loads(versions.stdout)["releases"][0]
+
+    parent = tmp_path / "consumer"
+    parent.mkdir(mode=0o700)
+    target = parent / "CopiedProject"
+    created = run(
+        "project",
+        "new",
+        str(target),
+        "--package",
+        "CopiedProject",
+        "--release",
+        release["id"],
+        "--json",
+        cwd=parent,
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+    payload = json.loads(created.stdout)
+    assert payload["schema"] == "autoform-project-creation/v1"
+    assert payload["release"] == release["id"]
+    assert (target / ".gitignore").read_text(encoding="utf-8").splitlines() == [
+        ".lake/",
+        "site/",
+        "site-src/",
+        ".autoform-publication-*/",
+        "*.log",
+        ".claude/worktrees/",
+    ]
+
+    inspection = run("project", "inspect", str(target), "--json", cwd=parent)
+    assert inspection.returncode == 0, inspection.stderr
+    report = json.loads(inspection.stdout)
+    assert report["compatibility"] == {
+        "recommended_release": release["id"],
+        "release": release["id"],
+        "status": "supported",
+    }
+
+
 def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
     dist = tmp_path / "dist"
     result = subprocess.run(
@@ -95,15 +198,29 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             "autoform_cli/__main__.py",
             "autoform_cli/graph.py",
             "autoform_cli/probes/skeleton_probe.lean",
+            "autoform_cli/probes/unused_hypotheses.lean",
+            "autoform_cli/project/README.md",
+            "autoform_cli/project/_lake_metadata.py",
+            "autoform_cli/project/_snapshot.py",
             "autoform_cli/visualize.py",
+            "autoform_cli/project/create.py",
+            "autoform_cli/project/creation-release-lean-v4.32.2-mathlib-v4.32.2.json",
+            "autoform_cli/project/release-manifest-lean-v4.32.2-mathlib-v4.32.2.json",
+            "autoform_cli/project/creation-release-lean-v4.34.1-mathlib-v4.34.1.json",
+            "autoform_cli/project/release-manifest-lean-v4.34.1-mathlib-v4.34.1.json",
+            "autoform_cli/project/libraries.json",
+            "autoform_cli/project/releases.json",
             "servers/lean_client.py",
             "servers/lean_runtime.py",
             "servers/lsp/server.py",
             "servers/repl/core.py",
+            "servers/repl/parse_header.lean",
             "servers/repl/server.py",
         } <= names
         assert "autoform_cli/lake.py" not in names
         assert "autoform_cli/templates/github/autoform_audit.py" in names
+        assert "autoform_cli/templates/github/CODEOWNERS.autoform.example" in names
+        assert "autoform_cli/assets/blueprint-live.js" in names
         assert not any(
             name.startswith(("scripts/", "autoform/", "visualization/", "servers/lean/", "servers/search/"))
             for name in names
@@ -116,7 +233,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             next(name for name in names if name.endswith(".dist-info/METADATA"))
         ).decode()
         assert "Requires-Dist: psutil>=5.9" in metadata
-        assert "Requires-Dist: tomli>=2.0.1; python_version < '3.11'" in metadata
+        assert "Requires-Dist: tomli<2.4,>=2.3.1" in metadata
         assert "Provides-Extra: repl" in metadata
         archive.extractall(site)
 
@@ -157,3 +274,57 @@ finally:
             text=True,
         )
     assert probe.returncode == 0, probe.stderr
+
+    environment = tmp_path / "wheel-venv"
+    created = subprocess.run(
+        ["uv", "venv", "--python", sys.executable, str(environment)],
+        capture_output=True,
+        text=True,
+    )
+    assert created.returncode == 0, created.stderr
+    python = environment / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    installed = subprocess.run(
+        ["uv", "pip", "install", "--python", str(python), str(wheel)],
+        capture_output=True,
+        text=True,
+    )
+    assert installed.returncode == 0, installed.stderr
+    command = environment / ("Scripts/autoform.exe" if sys.platform == "win32" else "bin/autoform")
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    outside.chmod(0o755)
+    project = outside / "project"
+    versions = subprocess.run(
+        [str(command), "project", "versions", "--json"],
+        cwd=outside,
+        capture_output=True,
+        text=True,
+    )
+    assert versions.returncode == 0, versions.stderr
+    assert json.loads(versions.stdout)["schema"] == "autoform-project-release-catalog/v1"
+    creation = subprocess.run(
+        [
+            str(command),
+            "project",
+            "new",
+            str(project),
+            "--package",
+            "WheelProject",
+            "--release",
+            "lean-v4.32.2-mathlib-v4.32.2",
+            "--json",
+        ],
+        cwd=outside,
+        capture_output=True,
+        text=True,
+    )
+    assert creation.returncode == 0, creation.stdout + creation.stderr
+    assert json.loads(creation.stdout)["package"] == "WheelProject"
+    inspection = subprocess.run(
+        [str(command), "project", "inspect", str(project), "--json"],
+        cwd=outside,
+        capture_output=True,
+        text=True,
+    )
+    assert inspection.returncode == 0, inspection.stderr
+    assert json.loads(inspection.stdout)["lake"]["name"] == "WheelProject"

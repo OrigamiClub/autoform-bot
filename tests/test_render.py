@@ -1,16 +1,43 @@
 from __future__ import annotations
 
+import dataclasses
+import errno
+import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from autoform_cli.lean import _normalize_remote
-from autoform_cli.render import PUBLICATION_MANIFEST, PublicationError, render_site
-from autoform_cli.status import STATES
+import autoform_cli.audit as audit_module
+import autoform_cli.lean as lean_module
+import autoform_cli.render as render_module
+from autoform_cli._tree_snapshot import TreeChangedError
+from autoform_cli.audit import audit_blueprint
+from autoform_cli.coverage import COVERAGE_DISPOSITIONS
+from autoform_cli.graph import GraphValidationError, load_graph
+from autoform_cli.lean import LeanSourceError, _normalize_remote
+from autoform_cli.render import (
+    PUBLICATION_MANIFEST,
+    PublicationError,
+    _COVERAGE_SUMMARY_ORDER,
+    _completion_percentage,
+    _document_body,
+    _first_h1,
+    load_publication_source,
+    publication_source_revision,
+    render_site,
+)
+from autoform_cli.status import STATES, derive
+from tests.test_lean_sources import _git_commit
 
 
 def _project(tmp_path: Path) -> Path:
@@ -57,6 +84,14 @@ def _project(tmp_path: Path) -> Path:
     return project
 
 
+_REPOSITORY = "https://github.com/owner/repo"
+
+
+def _commit_project(project: Path) -> str:
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    return _git_commit(project, "fixture")
+
+
 def _render(tmp_path: Path, **kwargs):
     project = _project(tmp_path)
     report = render_site(
@@ -64,7 +99,7 @@ def _render(tmp_path: Path, **kwargs):
         tmp_path / "out",
         lean_root=project,
         repository_url="https://github.com/owner/repo",
-        ref="cafe1234",
+        ref=_commit_project(project),
         **kwargs,
     )
     return project, report
@@ -87,6 +122,7 @@ def test_render_writes_a_derived_tree_and_leaves_the_vault_alone(tmp_path: Path)
     assert (out / "dependencies/full.md").is_file()
     assert (out / "stylesheets/blueprint.css").is_file()
     assert (out / "javascripts/blueprint-mermaid.js").is_file()
+    assert (out / "javascripts/blueprint-live.js").is_file()
     assert (out / PUBLICATION_MANIFEST).is_file()
     # Nodes are absorbed into their chapter, not published one page each.
     assert not (out / "roadmap/base.md").exists()
@@ -278,6 +314,8 @@ def test_a_chapter_places_statements_in_the_authored_narrative(tmp_path: Path) -
     assert page.index("## Results") < page.index('id="top"')
     assert '<div class="bp-thmwrapper theorem-style-definition bp-fully_proved" id="base"' in page
     assert '<div class="bp-thmwrapper theorem-style-plain bp-fully_proved" id="top"' in page
+    assert 'data-autoform-node-id="base"' in page
+    assert 'data-autoform-node-id="top"' in page
     assert '<span class="bp-thmcaption">Definition</span><span class="bp-thmlabel">1</span>' in page
     assert '<span class="bp-thmtitle">Top</span>' in page
     assert "The main result." in page
@@ -286,6 +324,24 @@ def test_a_chapter_places_statements_in_the_authored_narrative(tmp_path: Path) -
     assert "###### Sources" in page
     assert "\n## Sources" not in page
     assert "## Depends on" not in page
+    assert "Additional formalization targets" not in page
+
+
+def test_inline_triple_backticks_do_not_hide_the_chapter_structure(tmp_path: Path) -> None:
+    # Only a line that starts with the backticks can be mistaken for an opening fence.
+    project = _project(tmp_path)
+    readme = project / "blueprint/roadmap/README.md"
+    readme.write_text(
+        readme.read_text(encoding="utf-8").replace(
+            "This chapter develops",
+            "```x``` is inline code here.\n\nThis chapter develops",
+        ),
+        encoding="utf-8",
+    )
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+    assert page.index('class="bp-progress-overview"') < page.index("## Definitions") < page.index('id="base"')
     assert "Additional formalization targets" not in page
 
 
@@ -321,8 +377,9 @@ def test_authored_slots_override_dependency_order_for_book_flow(tmp_path: Path) 
 def test_cross_references_point_at_anchors_on_the_chapter(tmp_path: Path) -> None:
     _render(tmp_path)
     page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+    ref = json.loads((tmp_path / "out" / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["git_ref"]
 
-    assert "https://github.com/owner/repo/blob/cafe1234/Project/Basic.lean#L5" in page
+    assert f"https://github.com/owner/repo/blob/{ref}/Project/Basic.lean#L5" in page
     assert '<a class="bp-code-link"' in page
     assert 'aria-label="View Project.top in Lean source"' in page
     assert '<svg class="bp-code-icon"' in page
@@ -344,11 +401,123 @@ def test_overview_carries_the_counts_without_a_separate_progress_page(tmp_path: 
     # The landing page leads with the figures; a chapter keeps the compact strip.
     assert overview.index("bp-hero-title") < overview.index("bp-hero-figures")
     assert 'class="bp-figure-value"' in overview
+    assert '<div class="bp-figure-label">Scoped roadmap</div>' in overview
+    assert "2 of 2 targets complete" in overview
+    assert "Declared source coverage:" in overview
+    assert "1 mapped" in overview
+    assert 'href="coverage/index.html"' in overview
+    assert '<div class="bp-hero-bar" aria-hidden="true">' in overview
+    assert 'role="img"' not in overview
+    assert "items settled" not in overview
     chapter = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
     assert "1 definition · 1 result" in chapter
-    # No page to send the reader to, so no link out of the summary.
+    # Progress stays on the landing page; the only summary link explains scope.
     assert "bp-progress-link" not in overview
     assert not (tmp_path / "out/progress.md").exists()
+
+
+def test_statement_only_theorems_never_count_as_complete(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    roadmap = project / "blueprint/roadmap"
+    (project / "Project" / "Blocker.lean").write_text(
+        "namespace Project\n\ntheorem blocker : True := trivial\n\nend Project\n", encoding="utf-8"
+    )
+    blocker = roadmap / "blocker.md"
+    blocker.write_text(
+        "---\ndeclaration: theorem\nstatement: formalized\nlean: Project.blocker\n---\n\n# Blocker\n",
+        encoding="utf-8",
+    )
+    top = roadmap / "top.md"
+    top.write_text(
+        "---\ndeclaration: theorem\nstatement: formalized\nlean: Project.top\n---\n\n"
+        "# Top\n\nThe main result.\n\n"
+        "## Depends on\n\n- [Base](base.md)\n\n"
+        "## Proof depends on\n\n- [Blocker](blocker.md)\n",
+        encoding="utf-8",
+    )
+
+    statuses = derive(load_graph(project / "blueprint"))
+    assert statuses["blocker"].key == "can_prove"
+    assert statuses["top"].key == "stated"
+
+    render_site(project / "blueprint", tmp_path / "blocked", lean_root=project)
+    blocked = (tmp_path / "blocked/README.md").read_text(encoding="utf-8")
+    assert "1 of 3 targets complete" in blocked
+
+    blocker.write_text(
+        "---\ndeclaration: theorem\nstatement: formalized\nproof: formalized\nlean: Project.blocker\n---\n\n"
+        "# Blocker\n",
+        encoding="utf-8",
+    )
+    statuses = derive(load_graph(project / "blueprint"))
+    assert statuses["top"].key == "can_prove"
+
+    render_site(project / "blueprint", tmp_path / "ready", lean_root=project)
+    ready = (tmp_path / "ready/README.md").read_text(encoding="utf-8")
+    assert "2 of 3 targets complete" in ready
+
+
+def test_completion_requires_every_dependency_to_be_fully_proved(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/roadmap/base.md").write_text(
+        "---\n---\n\n# Base\n\nAn unfinished prerequisite.\n",
+        encoding="utf-8",
+    )
+
+    statuses = derive(load_graph(project / "blueprint"))
+    assert statuses["top"].proved
+    assert not statuses["top"].fully_proved
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
+    assert "0 of 1 target complete" in overview
+    assert '<div class="bp-figure-value">0%</div>' in overview
+
+
+def test_definitions_and_mathlib_marked_targets_count_as_complete(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/roadmap/upstream.md").write_text(
+        "---\ndeclaration: theorem\nmathlib: true\n"
+        "mathlib_declaration: Nat.add_comm\n"
+        "mathlib_file: Mathlib/Data/Nat/Basic.lean\n"
+        "---\n\n# Upstream\n",
+        encoding="utf-8",
+    )
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
+    assert "3 of 3 targets complete" in overview
+    assert '<div class="bp-figure-value">100%</div>' in overview
+
+
+def test_completion_percentage_reserves_100_for_complete_work() -> None:
+    assert _completion_percentage(0, 200) == 0
+    assert _completion_percentage(1, 200) == 1
+    assert _completion_percentage(199, 200) == 99
+    assert _completion_percentage(200, 200) == 100
+    assert _completion_percentage(0, 0) == 0
+
+
+def test_coverage_summary_tracks_every_canonical_disposition() -> None:
+    assert set(_COVERAGE_SUMMARY_ORDER) == set(COVERAGE_DISPOSITIONS)
+    assert len(_COVERAGE_SUMMARY_ORDER) == len(COVERAGE_DISPOSITIONS)
+    assert _COVERAGE_SUMMARY_ORDER[0] == "DECOMPOSED"
+
+
+def test_single_target_uses_singular_completion_copy(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/roadmap/top.md").write_text(
+        "---\n---\n\n# Top\n\nNarrative context rather than a Lean target.\n",
+        encoding="utf-8",
+    )
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
+    assert "1 of 1 target complete" in overview
+    assert "1 of 1 targets complete" not in overview
 
 
 def test_the_landing_page_is_the_hero_and_the_map_and_nothing_else(tmp_path: Path) -> None:
@@ -413,10 +582,10 @@ def test_links_naming_a_node_file_follow_it_onto_the_chapter(tmp_path: Path) -> 
 def test_coverage_is_reachable_once_the_landing_page_stops_listing_it(
     tmp_path: Path,
 ) -> None:
-    """Dropping the authored body would otherwise strand the coverage contract.
+    """Dropping the authored body must not strand the coverage contract.
 
-    Nothing else linked it: it is not a chapter, so the book order never picks
-    it up, and the landing page's prose was its only route.
+    It is not a chapter, so it needs explicit routes from both the hero's scope
+    summary and the generated Book navigation.
     """
     project = _project(tmp_path)
     coverage = project / "blueprint" / "coverage"
@@ -429,7 +598,9 @@ def test_coverage_is_reachable_once_the_landing_page_stops_listing_it(
     render_site(project / "blueprint", tmp_path / "out", lean_root=project)
 
     nav = (tmp_path / "out/SUMMARY.md").read_text(encoding="utf-8")
+    overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
     assert "[Coverage](coverage/README.md)" in nav
+    assert 'href="coverage/index.html"' in overview
 
 
 def test_a_hoisted_body_keeps_its_other_links_working(tmp_path: Path) -> None:
@@ -448,6 +619,40 @@ def test_a_hoisted_body_keeps_its_other_links_working(tmp_path: Path) -> None:
 
     chapter = (tmp_path / "out/roadmap/chapter/README.md").read_text(encoding="utf-8")
     assert "[Paper](../../sources.md)" in chapter
+
+
+def test_a_link_to_the_chapters_own_directory_is_published(tmp_path: Path) -> None:
+    """``./`` on a chapter page is the page's own directory, which is ``.`` once published."""
+    project = _project(tmp_path)
+    readme = project / "blueprint/roadmap/README.md"
+    readme.write_text(
+        readme.read_text(encoding="utf-8").replace(
+            "This chapter develops",
+            "See [this folder](./) and [its results](./#results). This chapter develops",
+        ),
+        encoding="utf-8",
+    )
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    chapter = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+    assert "[this folder](.)" in chapter
+    assert "[its results](.#results)" in chapter
+
+
+def test_a_hoisted_body_can_link_to_the_chapter_it_lands_on(tmp_path: Path) -> None:
+    """``../`` from a leaf one level below its chapter names the page its body is published on."""
+    project = _project(tmp_path)
+    leaf = project / "blueprint/roadmap/chapter/definitions/deep.md"
+    leaf.parent.mkdir(parents=True)
+    (project / "blueprint/roadmap/chapter/README.md").write_text("# Chapter\n", encoding="utf-8")
+    leaf.write_text(
+        "---\ndeclaration: def\n---\n\n# Deep\n\nSee [the chapter](../).\n",
+        encoding="utf-8",
+    )
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    chapter = (tmp_path / "out/roadmap/chapter/README.md").read_text(encoding="utf-8")
+    assert "[the chapter](.)" in chapter
 
 
 def test_unresolved_declarations_are_reported_not_linked(tmp_path: Path) -> None:
@@ -479,6 +684,10 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     _render(tmp_path)
     css = (tmp_path / "out/stylesheets/blueprint.css").read_text(encoding="utf-8")
     script = (tmp_path / "out/javascripts/blueprint-mermaid.js").read_text(encoding="utf-8")
+    live = (tmp_path / "out/javascripts/blueprint-live.js").read_text(encoding="utf-8")
+    packaged_live = (
+        Path(__file__).resolve().parent.parent / "autoform_cli/assets/blueprint-live.js"
+    ).read_text(encoding="utf-8")
 
     # Facebook's surface greys and Meta blue, not Material's defaults, and both
     # schemes hang off the theme's own data-md-color-scheme attribute.
@@ -488,6 +697,13 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     assert "--bp-link: #2D88FF" in css
     assert "--bp-surface: #242526" in css
     assert "background-color: #18191A" in css
+    assert "/__autoform/live.json" in live
+    assert 'window.location.hostname !== "127.0.0.1"' in live
+    assert "data-autoform-node-id" in live
+    assert "setInterval" not in live
+    assert "setTimeout(refresh, pollDelayMs)" in live
+    assert 'render({ claims: [], error: "Live overlay unavailable" })' in live
+    assert live == packaged_live
     # The brand sweep is defined once and reused, rather than pasted per rule.
     assert css.count("--bp-sweep:") == 1
     assert css.count("var(--bp-sweep)") >= 3
@@ -543,8 +759,38 @@ def test_refuses_overlapping_source_and_output(tmp_path: Path, destination: str)
         render_site(blueprint, output)
 
 
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        (None, "Lean sources could not be indexed"),
+        (
+            "permission denied: Project/Secret.lean",
+            "Lean sources could not be indexed: permission denied: Project/Secret.lean",
+        ),
+    ],
+)
+def test_render_translates_source_index_io_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str | None, message: str
+) -> None:
+    project = _project(tmp_path)
+
+    def fail_linker(root: Path, **kwargs: object):
+        if reason is not None:
+            raise LeanSourceError(reason)
+        raise OSError(f"private host detail: {root}")
+
+    monkeypatch.setattr("autoform_cli.render.snapshot_project_sources", fail_linker)
+
+    with pytest.raises(PublicationError) as error:
+        render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    assert error.value.issues == (message,)
+    assert str(tmp_path) not in str(error.value)
+
+
 def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path) -> None:
     project = _project(tmp_path)
+    ref = _commit_project(project)
     outputs = [tmp_path / "first", tmp_path / "second"]
     for output in outputs:
         render_site(
@@ -552,7 +798,7 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
             output,
             lean_root=project,
             repository_url="https://github.com/owner/repo",
-            ref="a" * 40,
+            ref=ref,
         )
 
     def files(root: Path) -> dict[str, bytes]:
@@ -575,15 +821,31 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
             "source_sha256": manifest["coverage"]["source_sha256"],
         },
         "dependencies": 1,
-        "git_ref": "a" * 40,
+        "directories": manifest["directories"],
+        "files": manifest["files"],
+        "git_ref": ref,
+        "lean_source_revision": manifest["lean_source_revision"],
         "nodes": 3,
-        "schema": "autoform-publication/v1",
+        "schema": "autoform-publication/v2",
         "source": "blueprint/roadmap Markdown",
         "source_revision": manifest["source_revision"],
         "views": ["book", "progress", "project", "chapter", "focus", "full"],
     }
     assert re.fullmatch(r"[0-9a-f]{64}", manifest["source_revision"])
+    assert manifest["files"] == {
+        path: hashlib.sha256(data).hexdigest() for path, data in first.items() if path != PUBLICATION_MANIFEST
+    }
     assert str(tmp_path).encode() not in b"".join(first.values())
+
+
+def test_the_source_revision_of_a_fixed_blueprint_is_pinned(tmp_path: Path) -> None:
+    """Sites and the dashboard compare this hash, so a framing change would mark every site stale."""
+    (tmp_path / "blueprint/roadmap").mkdir(parents=True)
+    (tmp_path / "blueprint/roadmap/README.md").write_bytes(b"# Roadmap\n")
+
+    assert publication_source_revision(tmp_path / "blueprint") == (
+        "3f0d54b44bb4077afbfa730e1544a34ce6bdca035c63a7c3db4488514c938fde"
+    )
 
 
 def test_manifest_records_machine_checkable_coverage_aggregates(tmp_path: Path) -> None:
@@ -746,17 +1008,53 @@ def test_render_refuses_decomposition_evidence_with_a_missing_anchor(tmp_path: P
     assert manifest["coverage"]["complete"]
 
 
-def test_render_cleans_only_an_owned_publication(tmp_path: Path) -> None:
+def _tree(root: Path) -> dict[str, bytes]:
+    return {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+_V2 = '{"complete": true, "schema": "autoform-publication/v2"}'
+
+
+def _debris(parent: Path) -> list[Path]:
+    return sorted(parent.glob(".autoform-publication-*"))
+
+
+def _published(tmp_path: Path) -> tuple[Path, Path, dict[str, bytes]]:
     project = _project(tmp_path)
     output = tmp_path / "out"
     render_site(project / "blueprint", output, lean_root=project)
-    stale = output / "stale.txt"
-    stale.write_text("old generated output\n", encoding="utf-8")
+    return project, output, _tree(output)
 
+
+def _manifest(output: Path, text: str) -> None:
+    (output / PUBLICATION_MANIFEST).write_text(text, encoding="utf-8")
+
+
+def _edit(path: Path, old: str, new: str) -> None:
+    path.write_text(path.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [
+        (lambda out: (out / "stale.txt").write_text("user\n"), "untracked or missing files: stale.txt"),
+        (lambda out: (out / "README.md").write_text("edited\n"), "modified Autoform publication"),
+        (lambda out: (out / "assets/empty").mkdir(), "untracked or missing directories"),
+        (lambda out: _manifest(out, _V2), "file inventory"),
+        (lambda out: _manifest(out, _V2.replace("v2", "v1")), "legacy autoform-publication/v1 site at .* once"),
+    ],
+)
+def test_render_replaces_only_an_exact_owned_publication(tmp_path: Path, tamper, message: str) -> None:
+    project, output, _site = _published(tmp_path)
     render_site(project / "blueprint", output, lean_root=project)
+    tamper(output)
+    before = _tree(output)
 
-    assert not stale.exists()
-    assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["complete"]
+    with pytest.raises(PublicationError, match=message):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert _tree(output) == before
+    assert not _debris(tmp_path)
 
 
 def test_render_refuses_to_overwrite_an_unowned_directory(tmp_path: Path) -> None:
@@ -828,6 +1126,56 @@ def test_render_omits_benign_hidden_files(tmp_path: Path) -> None:
     assert not (tmp_path / "out/.gitignore").exists()
 
 
+def test_implementation_notes_stay_out_of_the_published_wiki(tmp_path: Path) -> None:
+    """Notes are for the next worker, not the reader.
+
+    Editing them changes nothing a reader can see, so it must not mark the
+    published site stale either.
+    """
+    project = _project(tmp_path)
+    blueprint = project / "blueprint"
+    article_id = "af_0123456789abcdef01234567"
+    top = blueprint / "roadmap/top.md"
+    top.write_text(
+        top.read_text(encoding="utf-8").replace(
+            "---\n", f"---\narticle_id: {article_id}\n", 1
+        ),
+        encoding="utf-8",
+    )
+    before = publication_source_revision(blueprint)
+    (blueprint / "agents.md").write_text("# Agents in the source material\n", encoding="utf-8")
+    with_public_page = publication_source_revision(blueprint)
+    assert with_public_page != before
+    notes = blueprint / ".implementation-notes"
+    notes.mkdir()
+    (notes / f"{article_id}.md").write_text("Mathlib gap.\n", encoding="utf-8")
+
+    render_site(blueprint, tmp_path / "out", lean_root=project)
+
+    assert not (tmp_path / "out/.implementation-notes").exists()
+    assert (tmp_path / "out/agents.md").is_file()
+    assert ".implementation-notes" not in (tmp_path / "out/structure.md").read_text(
+        encoding="utf-8"
+    )
+    assert publication_source_revision(blueprint) == with_public_page
+
+
+def test_an_orphaned_implementation_note_stops_the_render(tmp_path: Path) -> None:
+    """Render and the dashboard read a copy without hidden files, but still check the notes."""
+    project = _project(tmp_path)
+    blueprint = project / "blueprint"
+    notes = blueprint / ".implementation-notes"
+    notes.mkdir()
+    (notes / "af_0123456789abcdef01234567.md").write_text("Mathlib gap.\n", encoding="utf-8")
+
+    with pytest.raises(GraphValidationError, match="names no roadmap article"):
+        render_site(blueprint, tmp_path / "out", lean_root=project)
+    with pytest.raises(GraphValidationError, match="names no roadmap article"):
+        load_publication_source(blueprint)
+
+    assert not (tmp_path / "out").exists()
+
+
 @pytest.mark.parametrize(
     ("remote", "expected"),
     [
@@ -835,6 +1183,10 @@ def test_render_omits_benign_hidden_files(tmp_path: Path) -> None:
         ("https://github.com/owner/repo.git", "https://github.com/owner/repo"),
         ("https://github.com/owner/repo/", "https://github.com/owner/repo"),
         ("ssh://git@github.com/owner/repo.git", "https://github.com/owner/repo"),
+        ("https://user:secret@github.com/owner/repo.git", None),
+        ("https://ci:token@git.example.com:8443/group/repo.git", None),
+        ("https://github.com/owner/repo.git?access_token=secret", None),
+        ("https://github.com/owner/repo.git#secret", None),
         ("/local/path", None),
     ],
 )
@@ -870,6 +1222,7 @@ def test_source_notes_leave_the_site_for_the_repository(tmp_path: Path) -> None:
     site links to it in the repository.
     """
     project = _with_source_notes(tmp_path)
+    ref = _commit_project(project)
     out = tmp_path / "out"
 
     render_site(
@@ -877,11 +1230,11 @@ def test_source_notes_leave_the_site_for_the_repository(tmp_path: Path) -> None:
         out,
         lean_root=project,
         repository_url="https://github.com/owner/repo",
-        ref="cafe1234",
+        ref=ref,
     )
 
     assert not (out / "sources").exists()
-    expected = "https://github.com/owner/repo/blob/cafe1234/blueprint/sources/paper.md#lemma-3"
+    expected = f"https://github.com/owner/repo/blob/{ref}/blueprint/sources/paper.md#lemma-3"
     assert expected in (out / "roadmap/README.md").read_text(encoding="utf-8")
 
 
@@ -903,6 +1256,34 @@ def test_source_notes_stay_published_when_there_is_nowhere_to_send_readers(
     assert "github.com" not in (out / "roadmap/README.md").read_text(encoding="utf-8")
 
 
+def test_a_published_link_out_of_the_blueprint_keeps_only_its_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The site holds only the blueprint, so the link could only dangle.
+
+    Source notes stay published when readers cannot be sent to the repository,
+    and they often cite Lean files beside the blueprint. MkDocs reported each
+    such link as missing, which failed a strict build.
+    """
+    for variable in ("GITHUB_REPOSITORY", "GITHUB_SERVER_URL", "GITHUB_SHA"):
+        monkeypatch.delenv(variable, raising=False)
+    project = _with_source_notes(tmp_path)
+    paper = project / "blueprint" / "sources" / "paper.md"
+    paper.write_text(
+        paper.read_text(encoding="utf-8")
+        + "\nEvidence: [Top.lean](../../Project/Top.lean#L5) and [`Lean`](../../lean/) for [Top](../roadmap/top.md).\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+
+    render_site(project / "blueprint", out, lean_root=project, repository_url="", ref="")
+
+    published = (out / "sources/paper.md").read_text(encoding="utf-8")
+    assert "Evidence: Top.lean and `Lean` for [Top](" in published
+    assert "../../Project/Top.lean" not in published
+    assert "../../lean/" not in published
+
+
 def test_permalinks_are_relative_to_the_repository_not_the_vaults_parent(
     tmp_path: Path,
 ) -> None:
@@ -914,6 +1295,7 @@ def test_permalinks_are_relative_to_the_repository_not_the_vaults_parent(
     project = repo / "docs"
     project.mkdir(parents=True)
     inner = _project(project)  # writes into <repo>/docs/project/blueprint
+    ref = _commit_project(repo)
     out = tmp_path / "out"
 
     render_site(
@@ -921,12 +1303,12 @@ def test_permalinks_are_relative_to_the_repository_not_the_vaults_parent(
         out,
         lean_root=repo,
         repository_url="https://github.com/owner/repo",
-        ref="cafe1234",
+        ref=ref,
     )
 
     chapter = (out / "roadmap/README.md").read_text(encoding="utf-8")
-    assert "blob/cafe1234/docs/project/blueprint/roadmap/top.md" in chapter
-    assert "blob/cafe1234/blueprint/roadmap/top.md" not in chapter
+    assert f"blob/{ref}/docs/project/blueprint/roadmap/top.md" in chapter
+    assert f"blob/{ref}/blueprint/roadmap/top.md" not in chapter
 
 
 def test_reference_style_links_are_rewritten_with_the_inline_ones(tmp_path: Path) -> None:
@@ -946,6 +1328,7 @@ def test_reference_style_links_are_rewritten_with_the_inline_ones(tmp_path: Path
         "[paper]: ../sources/paper.md\n",
         encoding="utf-8",
     )
+    ref = _commit_project(project)
     out = tmp_path / "out"
 
     render_site(
@@ -953,11 +1336,11 @@ def test_reference_style_links_are_rewritten_with_the_inline_ones(tmp_path: Path
         out,
         lean_root=project,
         repository_url="https://github.com/owner/repo",
-        ref="cafe1234",
+        ref=ref,
     )
 
     chapter = (out / "roadmap/README.md").read_text(encoding="utf-8")
-    expected = "[paper]: https://github.com/owner/repo/blob/cafe1234/blueprint/sources/paper.md"
+    expected = f"[paper]: https://github.com/owner/repo/blob/{ref}/blueprint/sources/paper.md"
     assert expected in chapter
     assert "[paper]: ../sources/paper.md" not in chapter
 
@@ -974,6 +1357,7 @@ def test_angle_bracket_reference_destinations_with_spaces_are_rewritten(tmp_path
         + '\nGrounded in [Paper][paper].\n\n[paper]: <../sources/paper note.md> "Source note"\n',
         encoding="utf-8",
     )
+    ref = _commit_project(project)
     out = tmp_path / "out"
 
     render_site(
@@ -981,12 +1365,12 @@ def test_angle_bracket_reference_destinations_with_spaces_are_rewritten(tmp_path
         out,
         lean_root=project,
         repository_url="https://github.com/owner/repo",
-        ref="cafe1234",
+        ref=ref,
     )
 
     chapter = (out / "roadmap/README.md").read_text(encoding="utf-8")
     assert (
-        '[paper]: https://github.com/owner/repo/blob/cafe1234/blueprint/sources/paper%20note.md "Source note"'
+        f'[paper]: https://github.com/owner/repo/blob/{ref}/blueprint/sources/paper%20note.md "Source note"'
         in chapter
     )
     assert "<../sources/paper note.md>" not in chapter
@@ -996,7 +1380,7 @@ def test_a_fresh_vault_reports_no_work_rather_than_one_ready_item(tmp_path: Path
     """The roadmap landing page is not a formalization target.
 
     Counting every childless article made a freshly scaffolded vault claim
-    "0 of 1 items settled, 1 ready now", so the site described work before any
+    "0 of 1 targets complete, 1 ready now", so the site described work before any
     had been planned.
     """
     from autoform_cli.scaffold import scaffold_project
@@ -1008,7 +1392,9 @@ def test_a_fresh_vault_reports_no_work_rather_than_one_ready_item(tmp_path: Path
     render_site(project / "blueprint", out)
 
     overview = (out / "README.md").read_text(encoding="utf-8")
-    assert "0 of 0 items settled" in overview
+    assert "0 of 0 targets complete" in overview
+    assert "items settled" not in overview
+    assert '<div class="bp-figure-value">0%</div>' in overview
     assert '<div class="bp-figure-value">0</div>' in overview
 
 
@@ -1023,3 +1409,1205 @@ def test_a_directory_link_uses_tree_even_when_the_repo_url_says_blob() -> None:
         "https://git.example/blob/x/repo/blob/abc/blueprint/sources/paper.md"
     )
     assert base.href(()) == "https://git.example/blob/x/repo/tree/abc/blueprint/sources"
+
+
+def _count_relative_links(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Record the target of every `mermaid.relative_link` call."""
+    from autoform_cli import mermaid
+
+    calls: list[Path] = []
+    relative_link = mermaid.relative_link
+
+    def counting(target: Path, output: Path, link_extension: str) -> str:
+        calls.append(target)
+        return relative_link(target, output, link_extension)
+
+    monkeypatch.setattr(mermaid, "relative_link", counting)
+    return calls
+
+
+def test_node_links_resolve_each_target_page_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Building a link per node resolved paths on disk once per node on every
+    page, which made render time grow with the square of the node count."""
+    from autoform_cli.render import _anchored_links
+
+    chapter, other, page = tmp_path / "a.md", tmp_path / "b" / "README.md", tmp_path / "page.md"
+    targets = {f"a/{index}": (chapter, f"n{index}") for index in range(20)}
+    targets["b"] = (other, "")
+    targets["here"] = (page, "self")
+    calls = _count_relative_links(monkeypatch)
+    resolved: list[Path] = []
+    resolve = Path.resolve
+
+    def counting_resolve(self: Path, strict: bool = False) -> Path:
+        resolved.append(self)
+        return resolve(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", counting_resolve)
+
+    links = _anchored_links(targets, page)
+
+    # A page reads only the nodes it shows, so nothing is linked before then.
+    assert calls == []
+    assert links["a/7"] == "a.html#n7"
+    assert links["b"] == "b/index.html"
+    assert links["here"] == "#self"
+    assert len(dict(links)) == len(targets)
+    assert sorted(calls) == [chapter, other]
+    # Once to compare it with the current page, once inside relative_link.
+    assert resolved.count(chapter) <= 2
+
+
+def test_rewriting_a_page_links_only_the_nodes_it_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A page uses the few node links it contains, so rewriting it should not
+    build a link for every node in the graph."""
+    from autoform_cli.render import _rewrite_links
+
+    blueprint, destination = tmp_path / "blueprint", tmp_path / "out"
+    source_dir = blueprint / "roadmap"
+    source_dir.mkdir(parents=True)
+    chapter, other, page = destination / "a.md", destination / "b.md", destination / "page.md"
+    targets = {"a/x": (chapter, "x"), "a/z": (chapter, "z"), "b/y": (other, "y")}
+    node_sources = {
+        (source_dir / "x.md").resolve(): "a/x",
+        (source_dir / "z.md").resolve(): "a/z",
+        (source_dir / "y.md").resolve(): "b/y",
+    }
+    calls = _count_relative_links(monkeypatch)
+
+    def rewrite(text: str) -> str:
+        return _rewrite_links(
+            text,
+            source_dir=source_dir,
+            page=page,
+            blueprint=blueprint,
+            destination=destination,
+            node_sources=node_sources,
+            targets=targets,
+        )
+
+    assert rewrite("Plain prose.\n") == "Plain prose.\n"
+    assert calls == []
+    assert rewrite("See [X](x.md).\n") == "See [X](a.md#x).\n"
+    assert calls == [chapter]
+    calls.clear()
+    # Two nodes on the same chapter page cost one link to it, not one each.
+    assert rewrite("[X](x.md), [Z](z.md)\n") == "[X](a.md#x), [Z](a.md#z)\n"
+    assert calls == [chapter]
+
+
+def test_a_focus_page_asks_for_its_node_links_once(tmp_path: Path) -> None:
+    """Each request builds a link for every node, so asking twice per focus
+    page doubled the cost of the largest group of generated pages."""
+    from autoform_cli.graph_pages import focus_page_path, write_graph_pages
+
+    project = _project(tmp_path)
+    graph = load_graph(project / "blueprint")
+    destination = tmp_path / "out"
+    requested: list[Path] = []
+
+    def node_links(page: Path) -> dict[str, str]:
+        requested.append(page)
+        return {node_id: f"roadmap.html#{node_id}" for node_id in graph.nodes}
+
+    write_graph_pages(graph, derive(graph), destination, node_links=node_links)
+
+    for node_id in ("base", "top"):
+        page = focus_page_path(destination, node_id)
+        assert requested.count(page) == 1
+        assert f"roadmap.html#{node_id}" in page.read_text(encoding="utf-8")
+
+
+def test_a_node_that_is_the_current_page_links_as_a_bare_fragment(tmp_path: Path) -> None:
+    """A container article has no anchor of its own, and an empty href would
+    drop the link, so its own page links to the top of itself."""
+    from autoform_cli.render import _anchored_links
+
+    page = tmp_path / "chapter" / "README.md"
+
+    assert _anchored_links({"chapter": (page, ""), "chapter/x": (page, "x")}, page) == {
+        "chapter": "#",
+        "chapter/x": "#x",
+    }
+
+
+def _conditional_project(tmp_path: Path, policy: str) -> Path:
+    """`_project` with Top proved from an open statement, under the given policy."""
+    project = _project(tmp_path)
+    roadmap = project / "blueprint" / "roadmap"
+    (roadmap / "README.md").write_text(
+        f"---\nopen_statements: {policy}\n---\n\n# Roadmap\n\n"
+        "## Definitions\n\n- [Base](base.md)\n\n"
+        "## Results\n\n- [Open](open.md)\n- [Top](top.md)\n",
+        encoding="utf-8",
+    )
+    (project / "Project" / "Open.lean").write_text(
+        "namespace Project\n\ntheorem openStatement : True := sorry\n\nend Project\n", encoding="utf-8"
+    )
+    (roadmap / "open.md").write_text(
+        "---\ndeclaration: theorem\nstatement: formalized\nlean: Project.openStatement\n---\n\n"
+        "# Open\n\nA statement whose proof is still sorry.\n\n## Depends on\n\n- [Base](base.md)\n",
+        encoding="utf-8",
+    )
+    top = roadmap / "top.md"
+    top.write_text(
+        top.read_text(encoding="utf-8") + "\n## Proof depends on\n\n- [Open](open.md)\n", encoding="utf-8"
+    )
+    return project
+
+
+def test_a_conditional_proof_names_the_open_statements_it_assumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The Lean row is the fallback for a declaration without a source link, and
+    # on CI the Actions environment would supply the coordinates for one.
+    for variable in ("GITHUB_REPOSITORY", "GITHUB_SERVER_URL", "GITHUB_SHA"):
+        monkeypatch.delenv(variable, raising=False)
+    project = _conditional_project(tmp_path, "allowed")
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project, repository_url="", ref="")
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+    top = page[page.index('id="top"'):]
+
+    assert '<div class="bp-thmwrapper theorem-style-plain bp-conditional" id="top"' in page
+    assert '●<span class="bp-mark-label">conditionally proved</span>' in top
+    assert (
+        '<span class="bp-key">Assumes</span><span class="bp-value">'
+        '<a class="bp-ref bp-ref-can_prove" href="#open">Theorem 1 (Open)</a>'
+        " (open statements without a recorded Lean proof)</span>"
+    ) in top
+    # Only the conditional proof carries the row; the open statement assumes nothing.
+    assert page.count('<span class="bp-key">Assumes</span>') == 1
+    # The row follows the implementation row and precedes Discussion.
+    meta = top[top.index('<div class="bp-meta">'):top.index('<details class="bp-dependencies">')]
+    assert re.findall(r'<span class="bp-key">([^<]+)</span>', meta) == ["Lean", "Assumes", "Discussion"]
+
+    css = (tmp_path / "out/stylesheets/blueprint.css").read_text(encoding="utf-8")
+    assert ".bp-ref-conditional::before, .bp-swatch-conditional { background: #E9DFFC; border-color: #6B3FCF; }" in css
+    assert "[data-md-color-scheme=slate] .bp-ref-conditional::before" in css
+    assert ".bp-conditional .bp-mark { color: #6B3FCF; }" in css
+
+
+def test_the_strict_policy_shows_the_same_proof_as_proved_with_no_assumptions(tmp_path: Path) -> None:
+    project = _conditional_project(tmp_path, "forbidden")
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+
+    assert '<div class="bp-thmwrapper theorem-style-plain bp-proved" id="top"' in page
+    assert '<span class="bp-key">Assumes</span>' not in page
+
+
+@pytest.mark.parametrize(
+    ("dropped", "why"),
+    [
+        ("proof: formalized\n", "Its prerequisites are ready, so the proof can be written now."),
+        (
+            "statement: formalized\nproof: formalized\n",
+            "Its prerequisites are ready, so the statement can be written down.",
+        ),
+    ],
+)
+def test_next_up_explains_readiness_without_naming_a_policy(tmp_path: Path, dropped: str, why: str) -> None:
+    project = _project(tmp_path)
+    top = project / "blueprint" / "roadmap" / "top.md"
+    top.write_text(top.read_text(encoding="utf-8").replace(dropped, ""), encoding="utf-8")
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    landing = (tmp_path / "out/README.md").read_text(encoding="utf-8")
+
+    assert '<div class="bp-next-target" data-autoform-node-id="top">' in landing
+    assert f'<div class="bp-next-why">{why}</div>' in landing
+
+
+def _statement_box(page: str, node_id: str) -> str:
+    start = page.index('<div class="bp-thmcontent"', page.index(f'data-autoform-node-id="{node_id}"'))
+    return page[start : page.index("</div>", start)]
+
+
+def test_a_statement_keeps_its_subheadings_inside_the_theorem(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/roadmap/top.md").write_text(
+        "---\ndeclaration: theorem\nlean: Project.top\n---\n\n"
+        "# Top\n\nThe main result.\n\n### Setting\n\nThe hypotheses.\n\n"
+        "## Sources\n\nA citation.\n\n## Depends on\n\n- [Base](base.md)\n",
+        encoding="utf-8",
+    )
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+    box = _statement_box(page, "top")
+
+    assert "The main result." in box and "The hypotheses." in box
+    # Demoted like every other heading a node brings onto the chapter page.
+    assert "###### Setting" in box
+    assert "\n### Setting" not in page
+    assert "A citation." not in box
+    assert page.index("###### Setting") < page.index("###### Sources")
+    assert "## Depends on" not in page
+
+
+def test_a_hidden_heading_does_not_cut_a_statement_short(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/roadmap/top.md").write_text(
+        "---\ndeclaration: theorem\nlean: Project.top\n---\n\n"
+        "# Top\n\nThe main result.\n\n<!--\n## Draft\n-->\n\nIts second sentence.\n\n"
+        "## Depends on\n\n- [Base](base.md)\n",
+        encoding="utf-8",
+    )
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    box = _statement_box((tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8"), "top")
+
+    assert "The main result." in box and "Its second sentence." in box
+
+
+def test_neither_dependency_section_is_republished(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/roadmap/top.md").write_text(
+        "---\ndeclaration: theorem\nlean: Project.top\n---\n\n# Top\n\nThe main result.\n\n"
+        "## Depends on\n\nStatement prerequisites.\n\n## Proof depends on\n\n- [Base](base.md)\n\n"
+        "## Sources\nA citation.\n",
+        encoding="utf-8",
+    )
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+
+    assert "Statement prerequisites." not in page
+    assert "Proof depends on" not in page
+    assert "###### Sources" in page and "A citation." in page
+
+
+def test_prose_above_the_title_is_published_in_the_theorem(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/roadmap/top.md").write_text(
+        "---\ndeclaration: theorem\nlean: Project.top\n---\n\n"
+        "A lead-in sentence.\n\n# Top\n\nThe main result.\n\n## Depends on\n\n- [Base](base.md)\n",
+        encoding="utf-8",
+    )
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    box = _statement_box((tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8"), "top")
+
+    assert "A lead-in sentence." in box and "The main result." in box
+
+
+def test_a_statement_written_below_a_section_is_still_published(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/roadmap/top.md").write_text(
+        "---\ndeclaration: theorem\nlean: Project.top\n---\n\n"
+        "## Sources\n\nA citation.\n\n# Top\n\nThe main result.\n\n## Depends on\n\n- [Base](base.md)\n",
+        encoding="utf-8",
+    )
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+
+    assert "The main result." in _statement_box(page, "top")
+    assert "## Depends on" not in page
+
+
+def test_finder_metadata_does_not_block_replacing_an_owned_publication(tmp_path: Path) -> None:
+    project, output, _site = _published(tmp_path)
+    # ._* is the extended-attribute file macOS writes beside a file on a non-APFS volume.
+    finder_files = [output / ".DS_Store", output / "roadmap" / ".DS_Store", output / "._README.md"]
+    for path in finder_files:
+        path.write_bytes(b"\x00\x00\x00\x01Bud1")
+
+    render_site(project / "blueprint", output, lean_root=project)
+
+    assert not any(path.exists() for path in finder_files)
+    assert not _debris(tmp_path)
+
+
+def test_metadata_files_macos_deletes_with_their_file_do_not_stop_the_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, output, _site = _published(tmp_path)
+    finder_files = [output / "._README.md", output / "roadmap" / "._README.md"]
+    for path in finder_files:
+        path.write_bytes(b"\x00\x05\x16\x07")
+    unlink = os.unlink
+
+    def gone_already(path, *, dir_fd=None) -> None:  # the kernel removed it with README.md
+        unlink(path, dir_fd=dir_fd)
+        if os.path.basename(path).startswith("._"):
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+
+    monkeypatch.setattr(render_module.os, "unlink", gone_already)
+    report = render_site(project / "blueprint", output, lean_root=project)
+
+    assert report.warnings == []
+    assert not any(path.exists() for path in finder_files)
+    assert not _debris(tmp_path)
+
+
+def test_a_manifest_that_lists_macos_metadata_still_replaces(tmp_path: Path) -> None:
+    # An extended attribute set on a staged file, on a volume without native
+    # ones, becomes a ._ file that the manifest then lists.
+    project, output, _site = _published(tmp_path)
+    manifest = json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))
+    manifest["files"]["._README.md"] = hashlib.sha256(b"\x00\x05\x16\x07").hexdigest()
+    _manifest(output, json.dumps(manifest))
+    (output / "._README.md").write_bytes(b"\x00\x05\x16\x07")
+
+    render_site(project / "blueprint", output, lean_root=project)
+
+    assert not (output / "._README.md").exists()
+    assert not _debris(tmp_path)
+
+
+@pytest.mark.parametrize("finder", [None, "file", "directory"])
+def test_render_installs_into_an_existing_empty_directory(tmp_path: Path, finder: str | None) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    output.mkdir()
+    if finder == "file":  # what Finder leaves in a folder emptied by hand
+        (output / ".DS_Store").write_bytes(b"\x00\x00\x00\x01Bud1")
+    elif finder == "directory":
+        (output / ".DS_Store").mkdir()
+        with pytest.raises(PublicationError, match="non-Autoform output directory"):
+            render_site(project / "blueprint", output, lean_root=project)
+        return
+
+    render_site(project / "blueprint", output, lean_root=project)
+
+    assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["complete"]
+    assert not (output / ".DS_Store").exists()
+    assert not _debris(tmp_path)
+
+
+def test_a_failed_render_leaves_the_previous_site_and_no_debris(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, output, site = _published(tmp_path)
+    render_pages = render_module._render_pages
+
+    def fail_after_writing(*args, **kwargs):
+        render_pages(*args, **kwargs)
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(render_module, "_render_pages", fail_after_writing)
+
+    with pytest.raises(PublicationError, match="No space left on device; output was not changed"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert _tree(output) == site
+    assert not _debris(tmp_path)
+
+
+def test_a_manifest_the_next_render_could_not_read_is_never_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    monkeypatch.setattr(render_module, "PUBLICATION_MANIFEST_MAX_BYTES", 512)
+
+    with pytest.raises(PublicationError, match="manifest exceeds max_file_bytes=512"):
+        render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    assert not (tmp_path / "out").exists()
+    assert not _debris(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("refused", "message"),
+    [
+        ("exchange", "is a mount point or in use; output was not changed"),
+        ("backup", "Permission denied; output was not changed"),
+        ("install", "Permission denied; output was not changed"),
+    ],
+)
+def test_a_refused_commit_keeps_the_site_and_leaves_no_debris(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refused: str, message: str
+) -> None:
+    project, output, site = _published(tmp_path)
+    backup = render_module._backup(output)
+    rename = os.rename
+
+    def exchange(first: Path, second: Path) -> None:
+        code = errno.EBUSY if refused == "exchange" else errno.ENOTSUP
+        raise OSError(code, os.strerror(code))
+
+    def refuse(source, target) -> None:
+        if (refused == "backup" and Path(target) == backup) or (
+            refused == "install" and Path(target) == output and Path(source) != backup
+        ):
+            raise OSError(errno.EACCES, os.strerror(errno.EACCES))
+        rename(source, target)
+
+    monkeypatch.setattr(render_module, "_exchange", exchange)
+    monkeypatch.setattr(render_module.os, "rename", refuse)
+
+    with pytest.raises(PublicationError, match=message):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert _tree(output) == site
+    assert not _debris(tmp_path)
+
+
+@pytest.mark.parametrize("failure", [OSError(errno.EIO, "Input/output error"), KeyboardInterrupt()])
+def test_an_uncertain_commit_keeps_the_previous_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    project, output, site = _published(tmp_path)
+    exchange = render_module._exchange
+
+    def swap_then_fail(first: Path, second: Path) -> None:
+        exchange(first, second)
+        raise failure
+
+    monkeypatch.setattr(render_module, "_exchange", swap_then_fail)
+
+    with pytest.raises((PublicationError, KeyboardInterrupt)) as error:
+        render_site(project / "blueprint", output, lean_root=project)
+
+    [kept] = _debris(tmp_path)
+    assert _tree(kept) == site
+    assert isinstance(failure, KeyboardInterrupt) or f"{kept} may hold the previous site" in str(error.value)
+
+
+@pytest.mark.parametrize("installed", [True, False])
+def test_a_render_that_loses_a_race_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installed: bool
+) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    if installed:
+        render_site(project / "blueprint", output, lean_root=project)
+    render_pages = render_module._render_pages
+
+    def race(*args, **kwargs):
+        report = render_pages(*args, **kwargs)
+        output.mkdir(exist_ok=True)
+        (output / "README.md").write_text("written meanwhile\n", encoding="utf-8")
+        return report
+
+    monkeypatch.setattr(render_module, "_render_pages", race)
+
+    with pytest.raises(PublicationError, match="changed during publication|refusing to overwrite"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert (output / "README.md").read_text(encoding="utf-8") == "written meanwhile\n"
+    assert not _debris(tmp_path)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="root ignores directory write permission",
+)
+def test_an_unwritable_output_parent_is_reported_not_a_traceback(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    parent = tmp_path / "readonly"
+    output = parent / "out"
+    output.mkdir(parents=True)
+    parent.chmod(0o555)
+    try:
+        with pytest.raises(PublicationError, match="needs write access to the output"):
+            render_site(project / "blueprint", output, lean_root=project)
+    finally:
+        parent.chmod(0o755)
+
+    assert not any(output.iterdir())
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="root ignores directory read permission",
+)
+def test_an_output_parent_that_cannot_be_read_still_publishes(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    parent = tmp_path / "dropbox"
+    parent.mkdir()
+    output = parent / "out"
+    parent.chmod(0o300)  # write and search, no read
+    try:
+        render_site(project / "blueprint", output, lean_root=project)
+        render_site(project / "blueprint", output, lean_root=project)
+    finally:
+        parent.chmod(0o755)
+
+    assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["complete"]
+    assert not _debris(parent)
+
+
+def test_a_ctrl_c_after_the_fallback_install_keeps_the_new_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, output, site = _published(tmp_path)
+    _edit(project / "blueprint/roadmap/top.md", "The main result.", "Revised.")
+    rename = os.rename
+
+    def unsupported(first: Path, second: Path) -> None:
+        raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP))
+
+    def interrupt_after_install(source, target) -> None:
+        rename(source, target)
+        if Path(target) == output and Path(source).name.startswith(render_module._STAGE_PREFIX):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(render_module, "_exchange", unsupported)
+    monkeypatch.setattr(render_module.os, "rename", interrupt_after_install)
+    with pytest.raises(KeyboardInterrupt):
+        render_site(project / "blueprint", output, lean_root=project)
+    monkeypatch.undo()
+
+    assert "Revised." in (output / "roadmap/README.md").read_text(encoding="utf-8")
+    assert _tree(render_module._backup(output)) == site
+    render_site(project / "blueprint", output, lean_root=project)  # retires the backup
+    assert not _debris(tmp_path)
+
+
+@pytest.mark.parametrize("code", sorted(render_module._UNSUPPORTED))
+def test_without_an_atomic_exchange_render_replaces_through_a_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    project, output, _site = _published(tmp_path)
+    _edit(project / "blueprint/roadmap/top.md", "The main result.", "Revised.")
+
+    def unsupported(first: Path, second: Path) -> None:
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(render_module, "_exchange", unsupported)
+    render_site(project / "blueprint", output, lean_root=project)
+
+    assert "Revised." in (output / "roadmap/README.md").read_text(encoding="utf-8")
+    assert not _debris(tmp_path)
+
+
+def test_the_next_render_finishes_an_interrupted_backup_commit(tmp_path: Path) -> None:
+    project, output, site = _published(tmp_path)
+    backup = render_module._backup(output)
+    coverage = project / "blueprint/coverage/README.md"
+    contract = coverage.read_text(encoding="utf-8")
+    coverage.write_text("# Coverage\n", encoding="utf-8")
+    for empty_output in (False, True):  # killed between the two renames; maybe an empty output since
+        output.rename(backup)
+        if empty_output:
+            output.mkdir()
+        with pytest.raises(PublicationError, match="coverage contract"):
+            render_site(project / "blueprint", output, lean_root=project)
+        assert _tree(output) == site and not backup.exists()
+
+    coverage.write_text(contract, encoding="utf-8")
+    shutil.copytree(output, backup)  # killed after the second rename instead
+    render_site(project / "blueprint", output, lean_root=project)
+    assert _tree(output) == site and not _debris(tmp_path)
+
+    shutil.copytree(output, backup)
+    (backup / "README.md").write_text("edited\n", encoding="utf-8")
+    with pytest.raises(PublicationError, match="could not recover the previous site at .*by hand"):
+        render_site(project / "blueprint", output, lean_root=project)
+    assert (backup / "README.md").read_text(encoding="utf-8") == "edited\n" and _tree(output) == site
+
+
+def test_a_partly_deleted_backup_does_not_block_the_render(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, output, site = _published(tmp_path)
+    shutil.copytree(output, render_module._backup(output))  # killed after the second rename
+    remove_tree = render_module._remove_tree
+    removed: list[Path] = []
+
+    def busy_once(path: Path) -> None:
+        removed.append(path)
+        if len(removed) == 1:  # the retired backup
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+        remove_tree(path)
+
+    monkeypatch.setattr(render_module, "_remove_tree", busy_once)
+    report = render_site(project / "blueprint", output, lean_root=project)
+
+    assert (
+        f"the previous site at {removed[0]} was only partly deleted: {os.strerror(errno.EBUSY)}; "
+        "remove the rest by hand"
+    ) in report.warnings
+    assert _tree(output) == site
+
+
+def test_a_file_saved_into_the_replaced_site_during_deletion_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, output, _site = _published(tmp_path)
+    rmtree = shutil.rmtree
+    saved: list[Path] = []
+
+    def save_meanwhile(path, *args, **kwargs) -> None:  # an editor whose cwd was the old output
+        rmtree(path, *args, **kwargs)
+        parent = Path(path).parent
+        if not saved and parent.name.startswith(render_module._STAGE_PREFIX):
+            saved.append(parent / "notes.md")
+            saved[0].write_text("draft\n", encoding="utf-8")
+
+    monkeypatch.setattr(render_module.shutil, "rmtree", save_meanwhile)
+    report = render_site(project / "blueprint", output, lean_root=project)
+
+    assert saved[0].read_text(encoding="utf-8") == "draft\n"
+    assert any(f"{saved[0].parent} was only partly deleted" in warning for warning in report.warnings)
+
+
+def test_an_output_inside_the_vault_under_another_spelling_is_refused(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    if not (project / "BLUEPRINT").is_dir():
+        pytest.skip("filesystem is case-sensitive")
+
+    with pytest.raises(PublicationError, match="must be disjoint"):
+        render_site(project / "blueprint", project / "BLUEPRINT" / "site", lean_root=project)
+
+    assert not (project / "blueprint" / "site").exists()
+
+
+def test_a_capable_filesystem_swaps_the_site_in_one_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, output, _site = _published(tmp_path)
+    renames = []
+    rename = os.rename
+    monkeypatch.setattr(render_module.os, "rename", lambda *args: (renames.append(args), rename(*args)))
+
+    render_site(project / "blueprint", output, lean_root=project)
+
+    assert renames == []
+
+
+def test_render_fsyncs_the_new_site_and_its_parent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fsync = os.fsync
+    synced: set[tuple[int, int]] = set()
+
+    def record(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        synced.add((metadata.st_dev, metadata.st_ino))
+        fsync(descriptor)
+
+    monkeypatch.setattr(render_module.os, "fsync", record)
+    _render(tmp_path)
+
+    output = tmp_path / "out"
+    published = [tmp_path, output, *output.rglob("*")]
+    assert [path for path in published if (path.stat().st_dev, path.stat().st_ino) not in synced] == []
+
+
+def test_published_modes_follow_the_umask(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    previous = os.umask(0o027)
+    try:
+        render_site(project / "blueprint", output, lean_root=project)
+    finally:
+        os.umask(previous)
+
+    published = [output, *output.rglob("*")]
+    assert {stat.S_IMODE(path.stat().st_mode) for path in published if path.is_dir()} == {0o750}
+    assert {stat.S_IMODE(path.stat().st_mode) for path in published if path.is_file()} == {0o640}
+
+
+def test_metadata_only_changes_during_a_render_do_not_fail_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, output, _site = _published(tmp_path)
+    render_pages = render_module._render_pages
+
+    def touch(*args, **kwargs):
+        report = render_pages(*args, **kwargs)
+        for path in (output / "README.md", project / "blueprint/README.md", project / "Project/Basic.lean"):
+            os.utime(path)
+        return report
+
+    monkeypatch.setattr(render_module, "_render_pages", touch)
+
+    assert render_site(project / "blueprint", output, lean_root=project).warnings == []
+
+
+def test_renders_into_sibling_outputs_wait_for_each_other_instead_of_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    barrier = threading.Barrier(2)
+    locked_parent = render_module._locked_parent
+
+    def together(parent: Path):
+        barrier.wait(timeout=30)
+        return locked_parent(parent)
+
+    monkeypatch.setattr(render_module, "_locked_parent", together)
+    outputs = [tmp_path / "public/a", tmp_path / "public/b"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda output: render_site(project / "blueprint", output, lean_root=project), outputs))
+
+    assert all((output / PUBLICATION_MANIFEST).is_file() for output in outputs)
+    assert not _debris(tmp_path / "public")
+
+
+def test_a_commit_lock_held_past_the_deadline_names_the_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fcntl
+
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    monkeypatch.setattr(render_module, "_PUBLICATION_LOCK_WAIT_SECONDS", 0.2)
+    holder = os.open(tmp_path, os.O_RDONLY)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with pytest.raises(PublicationError, match="kept the output parent .* locked"):
+            render_site(project / "blueprint", output, lean_root=project)
+    finally:
+        os.close(holder)
+
+    assert not output.exists()
+    assert not _debris(tmp_path)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="root ignores directory read permission",
+)
+def test_render_accepts_an_ancestor_that_grants_search_but_not_read(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = _project(home / "alice")
+    output = project / "site-src"
+    home.chmod(0o311)
+    try:
+        render_site(project / "blueprint", output, lean_root=project)
+        render_site(project / "blueprint", output, lean_root=project)
+    finally:
+        home.chmod(0o755)
+
+    assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["complete"]
+    assert not _debris(project)
+
+
+@pytest.mark.parametrize(
+    ("name", "generated"),
+    [
+        ("Summary.md", "SUMMARY.md"),
+        ("Dependencies.md", "dependencies.md"),
+        ("Structure.md", "structure.md"),
+        ("Publication.json", PUBLICATION_MANIFEST),
+        ("Assets/logo.svg", "assets"),
+        ("Stylesheets/site.css", "stylesheets"),
+        ("stylesheets/Blueprint.css", "stylesheets/blueprint.css"),
+        ("assets/Autoform.svg", "assets/autoform.svg"),
+        ("Progress.md", None),
+        ("Graph.html", None),
+        ("roadmap/dependencies.md", None),
+    ],
+)
+def test_only_names_that_collide_with_generated_output_are_refused(
+    tmp_path: Path, name: str, generated: str | None
+) -> None:
+    project = _project(tmp_path)
+    authored = project / "blueprint" / name
+    authored.parent.mkdir(exist_ok=True)
+    authored.write_text("# Authored\n", encoding="utf-8")
+    output = tmp_path / "out"
+
+    if generated is None:
+        render_site(project / "blueprint", output, lean_root=project)
+        assert (output / name).is_file()
+        return
+    with pytest.raises(PublicationError, match=f"only in case from the generated {re.escape(generated)}"):
+        render_site(project / "blueprint", output, lean_root=project)
+    assert not output.exists()
+
+
+def test_output_must_have_an_ordinary_final_component(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+
+    with pytest.raises(PublicationError, match="ordinary directory"):
+        render_site(project / "blueprint", tmp_path / "child" / "..", lean_root=project)
+
+    assert not (tmp_path / "child").exists()
+
+
+def test_blueprint_paths_that_differ_only_in_case_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    bind = render_module.bind_directory_tree
+
+    @contextmanager
+    def with_a_case_alias(*args, **kwargs):  # what a case-sensitive volume can hold
+        with bind(*args, **kwargs) as tree:
+            snapshot = tree.capture()
+        files = (*snapshot.files, ("roadmap/TOP.md", b"# Top\n"))
+        yield SimpleNamespace(capture=lambda: dataclasses.replace(snapshot, files=files))
+
+    monkeypatch.setattr(render_module, "bind_directory_tree", with_a_case_alias)
+
+    with pytest.raises(PublicationError, match="roadmap/TOP.md and roadmap/top.md: they differ only in case"):
+        render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    assert not (tmp_path / "out").exists()
+
+
+def test_lasting_capture_failures_name_their_cause(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+
+    with pytest.raises(PublicationError, match="blueprint directory does not exist"):
+        render_site(project / "bluepirnt", tmp_path / "out", lean_root=project)
+    with pytest.raises(PublicationError, match="Lean root does not exist or is not a directory"):
+        render_site(project / "blueprint", tmp_path / "out", lean_root=project / "nope")
+
+    alias = project / "Project/Alias.lean"
+    alias.symlink_to(project / "Project/Basic.lean")
+    with pytest.raises(PublicationError, match="unsafe Lean source Project/Alias.lean: symbolic links"):
+        render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    alias.unlink()
+
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        secret = project / "blueprint/roadmap/secret.md"
+        secret.write_text("# Secret\n", encoding="utf-8")
+        secret.chmod(0)
+        try:
+            with pytest.raises(PublicationError, match="permission denied: roadmap/secret.md"):
+                render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+        finally:
+            secret.unlink()
+
+    os.mkfifo(project / "blueprint/roadmap/trap.md")
+    with pytest.raises(PublicationError, match=r"trap\.md: named pipe"):
+        render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_transient_lean_listing_change_is_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = _project(tmp_path)
+    open_sources = lean_module.open_project_sources
+    calls = []
+
+    def change_once(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise TreeChangedError("directory tree changed while it was captured")
+        return open_sources(*args, **kwargs)
+
+    monkeypatch.setattr(lean_module, "open_project_sources", change_once)
+
+    assert render_site(project / "blueprint", tmp_path / "out", lean_root=project).linked == 2
+    assert len(calls) == 2
+    assert calls[-1]["limits"].max_entries is None  # the Lean walk has no entry cap
+
+
+def test_a_blueprint_that_changes_while_it_is_read_asks_for_a_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+
+    def changing(*args, **kwargs):
+        raise TreeChangedError("directory tree changed while it was captured")
+
+    monkeypatch.setattr(render_module, "bind_directory_tree", changing)
+
+    with pytest.raises(PublicationError, match="blueprint changed while it was read; retry"):
+        render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    assert not (tmp_path / "out").exists()
+
+
+def test_entries_added_removed_or_renamed_during_a_render_publish_the_captured_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, output, previous = _published(tmp_path)
+    blueprint = project / "blueprint"
+    _edit(blueprint / "roadmap/top.md", "The main result.", "Revised.")
+    undisturbed = tmp_path / "undisturbed"
+    render_site(blueprint, undisturbed, lean_root=project)
+    render_pages = render_module._render_pages
+
+    def churn_then_render(*args, **kwargs):
+        (blueprint / "roadmap/added.md").write_text("# Added\n\nSaved mid-render.\n", encoding="utf-8")
+        (blueprint / "roadmap/base.md").unlink()
+        (blueprint / "roadmap").rename(blueprint / "moved")
+        return render_pages(*args, **kwargs)
+
+    monkeypatch.setattr(render_module, "_render_pages", churn_then_render)
+    render_site(blueprint, output, lean_root=project)
+
+    # Render replaced the previous site with the generation it captured, byte for byte: the revised article,
+    # no added page, Base still published, and nothing under the new directory name.
+    assert _tree(output) == _tree(undisturbed) != previous
+
+
+def test_repository_links_use_the_verified_commit_not_a_mutable_ref(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    commit = _commit_project(project)
+    output = tmp_path / "out"
+
+    render_site(project / "blueprint", output, lean_root=project, repository_url=_REPOSITORY, ref="HEAD")
+
+    assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["git_ref"] == commit
+    assert f"/blob/{commit}/Project/Basic.lean#L5" in (output / "roadmap/README.md").read_text(encoding="utf-8")
+
+
+def test_a_symlinked_lean_root_still_gets_verified_links(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    commit = _commit_project(project)
+    alias = tmp_path / "project-alias"
+    alias.symlink_to(project, target_is_directory=True)
+    output = tmp_path / "out"
+
+    report = render_site(project / "blueprint", output, lean_root=alias, repository_url=_REPOSITORY, ref=commit)
+
+    assert report.linked == 2
+    assert f"/blob/{commit}/blueprint/roadmap/top.md" in (output / "roadmap/README.md").read_text(encoding="utf-8")
+
+
+def test_dirty_lean_snapshot_does_not_borrow_the_clean_commit_ref(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    commit = _commit_project(project)
+    _edit(project / "Project/Basic.lean", "end Project", "end Project\n-- uncommitted")
+    output = tmp_path / "out"
+
+    report = render_site(project / "blueprint", output, lean_root=project, repository_url=_REPOSITORY, ref="HEAD")
+
+    assert "/blob/" not in (output / "roadmap/README.md").read_text(encoding="utf-8")
+    assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["git_ref"] is None
+    assert report.warnings == [
+        "repository links were omitted because the captured Lean inputs do not match one "
+        f"verified local Git commit: Project/Basic.lean differs from commit {commit[:12]}"
+    ]
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["sibling", "nested-checkout"])
+def test_a_blueprint_outside_the_repository_keeps_its_lean_code_links(tmp_path: Path, nested: bool) -> None:
+    project = _project(tmp_path)
+    if nested:  # a submodule or a separate clone inside the Lean repository
+        subprocess.run(["git", "init", "-q"], cwd=project / "blueprint", check=True)
+        _git_commit(project / "blueprint", "notes")
+        blueprint = project / "blueprint"
+    else:
+        blueprint = (project / "blueprint").rename(tmp_path / "notes")
+    commit = _commit_project(project)
+    output = tmp_path / "out"
+
+    report = render_site(blueprint, output, lean_root=project, repository_url=_REPOSITORY, ref="HEAD")
+
+    chapter = (output / "roadmap/README.md").read_text(encoding="utf-8")
+    assert f"/blob/{commit}/Project/Basic.lean#L5" in chapter
+    # Render's copy places the vault at blueprint/, which names nothing in the Lean repository's commit.
+    assert f"/blob/{commit}/blueprint/" not in chapter
+    assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["git_ref"] == commit
+    assert report.warnings == []
+
+
+def test_an_uncommitted_blueprint_edit_drops_only_the_markdown_source_links(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    commit = _commit_project(project)
+    _edit(project / "blueprint/roadmap/top.md", "The main result.", "The main result, revised.")
+    output = tmp_path / "out"
+
+    report = render_site(project / "blueprint", output, lean_root=project, repository_url=_REPOSITORY, ref="HEAD")
+
+    chapter = (output / "roadmap/README.md").read_text(encoding="utf-8")
+    assert f"/blob/{commit}/Project/Basic.lean#L5" in chapter
+    assert f"/blob/{commit}/blueprint/" not in chapter
+    assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["git_ref"] == commit
+    assert report.warnings == [
+        "Markdown source links were omitted because the captured blueprint does not match the verified "
+        f"local Git commit: blueprint/roadmap/top.md differs from commit {commit[:12]}"
+    ]
+
+
+@pytest.mark.parametrize("note", ["untracked.md", ""])
+def test_an_untracked_source_note_or_directory_gets_no_commit_link(tmp_path: Path, note: str) -> None:
+    project = _project(tmp_path)
+    _edit(project / "blueprint/roadmap/README.md", "# Roadmap", f"# Roadmap\n\nSee [sources](../sources/{note}).")
+    commit = _commit_project(project)
+    (project / "blueprint/sources").mkdir()
+    if note:
+        (project / "blueprint/sources" / note).write_text("# Local note\n", encoding="utf-8")
+    output = tmp_path / "out"
+
+    report = render_site(project / "blueprint", output, lean_root=project, repository_url=_REPOSITORY, ref=commit)
+
+    assert f"/{commit}/blueprint/sources" not in (output / "roadmap/README.md").read_text(encoding="utf-8")
+    assert not note or (output / "sources" / note).is_file()
+    assert report.warnings[0].startswith("Markdown source links were omitted")
+
+
+def test_markdown_source_permalink_quotes_the_original_repository_path(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    roadmap = project / "blueprint/roadmap"
+    (roadmap / "top.md").rename(roadmap / "top lemma é.md")
+    _edit(roadmap / "README.md", "(top.md)", "(top%20lemma%20%C3%A9.md)")
+    commit = _commit_project(project)
+    output = tmp_path / "out"
+
+    render_site(project / "blueprint", output, lean_root=project, repository_url=_REPOSITORY)
+
+    page = (output / "roadmap/README.md").read_text(encoding="utf-8")
+    assert f"/blob/{commit}/blueprint/roadmap/top%20lemma%20%C3%A9.md" in page
+    assert ".autoform-publication" not in page and "autoform-blueprint-" not in page
+
+
+def test_decomposed_file_names_link_to_the_spelling_git_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    roadmap = project / "blueprint/roadmap"
+    # NFD é, as some Cocoa apps write it, and U+212B ANGSTROM SIGN, which NFC would replace but Git keeps.
+    name = "Poincare\u0301\u212b"
+    (roadmap / "top.md").rename(roadmap / f"{name}.md")
+    (project / "Project/Basic.lean").rename(project / f"Project/{name}.lean")
+    (project / "blueprint/sources").mkdir()
+    (project / "blueprint/sources" / f"{name}.md").write_text("# Notes\n", encoding="utf-8")
+    _edit(roadmap / "README.md", "(top.md)", f"({name}.md)")
+    _edit(roadmap / "README.md", "# Roadmap", f"# Roadmap\n\nSee [notes](../sources/{name}.md).")
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    subprocess.run(["git", "config", "core.precomposeunicode", "true"], cwd=project, check=True)
+    commit = _git_commit(project, "fixture")
+    output = tmp_path / "out"
+    run = subprocess.run
+
+    def precomposed_ls_tree(command, *args, **kwargs):
+        # macOS Git prints the composed spelling it committed; elsewhere Git keeps names as written.
+        completed = run(command, *args, **kwargs)
+        if command[:2] == ["git", "ls-tree"]:
+            completed.stdout = completed.stdout.replace("e\u0301".encode(), "\u00e9".encode())
+        return completed
+
+    monkeypatch.setattr(lean_module.subprocess, "run", precomposed_ls_tree)
+
+    report = render_site(project / "blueprint", output, lean_root=project, repository_url=_REPOSITORY, ref=commit)
+
+    chapter = (output / "roadmap/README.md").read_text(encoding="utf-8")
+    committed = "Poincar%C3%A9%E2%84%AB"
+    assert f"/blob/{commit}/Project/{committed}.lean#L5" in chapter
+    assert f"/blob/{commit}/blueprint/roadmap/{committed}.md" in chapter
+    assert f"/blob/{commit}/blueprint/sources/{committed}.md" in chapter
+    assert report.warnings == []
+
+
+def test_a_source_note_link_names_the_committed_spelling_however_it_was_typed() -> None:
+    from autoform_cli.render import _SourceBase
+
+    committed = "blueprint/sources/Poincar\u00e9\u212b.md"
+    base = _SourceBase(_REPOSITORY, "abc", "blueprint/sources", {"blueprint/sources/Poincar\u00e9\u00c5.md": committed})
+
+    # Keyed by NFC form, so a decomposed é in the link still finds it.
+    assert base.href(("Poincare\u0301\u212b.md",)) == (
+        f"{_REPOSITORY}/blob/abc/blueprint/sources/Poincar%C3%A9%E2%84%AB.md"
+    )
+
+
+def test_in_repo_outputs_never_supply_lean_source_links(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/proofs.lean").write_text("theorem BlueprintProof : True := trivial\n", encoding="utf-8")
+    _edit(project / "blueprint/roadmap/top.md", "lean: Project.top", "lean: BlueprintProof")
+    commit = _commit_project(project)
+
+    for name in ("aaa-output", "zzz-output"):
+        render_site(project / "blueprint", project / name, lean_root=project, repository_url=_REPOSITORY)
+        page = (project / name / "roadmap/README.md").read_text(encoding="utf-8")
+        assert f"{_REPOSITORY}/blob/{commit}/blueprint/proofs.lean#L1" in page
+
+
+def test_audit_and_render_skip_a_site_and_its_mkdocs_copy_alike(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    proofs = project / "blueprint/Proofs.lean"
+    proofs.write_text("theorem BlueprintProof : True := trivial\n", encoding="utf-8")
+    render_site(project / "blueprint", project / "site-src", lean_root=project)
+    # What `mkdocs build` does with the template's docs_dir and site_dir.
+    shutil.copytree(project / "site-src", project / "site")
+    proofs.write_text("theorem RenamedProof : True := trivial\n", encoding="utf-8")
+    render_site(project / "blueprint", project / "site-src", lean_root=project)
+    rendered = json.loads((project / "site-src" / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))
+    audited: list[str] = []
+
+    def snapshot_project_sources(root):
+        snapshot = lean_module.snapshot_project_sources(root)
+        audited.append(snapshot.revision)
+        return snapshot
+
+    monkeypatch.setattr(audit_module, "snapshot_project_sources", snapshot_project_sources)
+    _edit(project / "blueprint/roadmap/top.md", "lean: Project.top", "lean: BlueprintProof")
+    result = audit_blueprint(project / "blueprint", lean_root=project)
+
+    assert audited == [rendered["lean_source_revision"]]
+    assert ("lean-target-not-found", "Lean declaration target was not found: BlueprintProof") in {
+        (finding.code, finding.reason) for finding in result.findings
+    }
+
+
+def test_a_capture_during_a_render_skips_the_stage_being_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/Proofs.lean").write_text("theorem BlueprintProof : True := trivial\n", encoding="utf-8")
+    copy2 = shutil.copy2
+    captured: list[list[str]] = []
+
+    def copy_then_capture(source, target, *args, **kwargs):
+        result = copy2(source, target, *args, **kwargs)
+        if str(target).endswith(".lean"):
+            snapshot = lean_module.snapshot_project_sources(project)
+            captured.append(sorted(path.as_posix() for path, _data in snapshot.source_files))
+        return result
+
+    monkeypatch.setattr(render_module.shutil, "copy2", copy_then_capture)
+    render_site(project / "blueprint", project / "site-src", lean_root=project)
+
+    assert captured == [["Project/Basic.lean", "blueprint/Proofs.lean"]]
+
+
+def test_a_capture_while_render_rewrites_its_manifest_skips_the_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/Proofs.lean").write_text("theorem BlueprintProof : True := trivial\n", encoding="utf-8")
+    write_bytes, replace = Path.write_bytes, os.replace
+    captured: list[list[str]] = []
+
+    def capture() -> None:
+        snapshot = lean_module.snapshot_project_sources(project)
+        captured.append(sorted(path.as_posix() for path, _data in snapshot.source_files))
+
+    def truncate_capture_then_write(self: Path, data: bytes) -> int:
+        if self.name == render_module.PUBLICATION_MANIFEST:
+            open(self, "wb").close()  # where an in-place write leaves the file first
+            capture()
+        return write_bytes(self, data)
+
+    def capture_around_replace(source, target, *args, **kwargs) -> None:
+        manifest = Path(target).name == render_module.PUBLICATION_MANIFEST
+        if manifest:
+            capture()
+        replace(source, target, *args, **kwargs)
+        if manifest:
+            capture()
+
+    monkeypatch.setattr(Path, "write_bytes", truncate_capture_then_write)
+    monkeypatch.setattr(render_module.os, "replace", capture_around_replace)
+    render_site(project / "blueprint", project / "site-src", lean_root=project)
+
+    assert captured
+    assert all(files == ["Project/Basic.lean", "blueprint/Proofs.lean"] for files in captured), captured
+
+
+def test_an_edit_during_a_render_publishes_the_captured_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    top = project / "blueprint/roadmap/top.md"
+    render_pages = render_module._render_pages
+
+    def edit_then_render(*args, **kwargs):
+        _edit(top, "The main result.", "Edited mid-render.")
+        return render_pages(*args, **kwargs)
+
+    monkeypatch.setattr(render_module, "_render_pages", edit_then_render)
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    chapter = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+    assert "The main result." in chapter and "Edited mid-render." not in chapter
+
+
+def test_a_heading_shown_as_code_is_not_a_page_title() -> None:
+    text = "```markdown\n# Not the title\n```\n\n# Title\n\nBody.\n"
+
+    assert _first_h1(text) == "Title"
+    assert _document_body(text).startswith("```markdown\n# Not the title\n```")
+
+
+def test_a_fence_that_never_closes_does_not_hide_the_page_title() -> None:
+    # The site and article_parts read a fence without a closing line as text.
+    text = "Intro.\n\n```lean\n\n# Title\n\nBody.\n"
+
+    assert _first_h1(text) == "Title"
+    assert _document_body(text) == "Intro.\n\n```lean\n\n\nBody."

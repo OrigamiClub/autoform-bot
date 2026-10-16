@@ -15,12 +15,24 @@ def create_repl_server(runtime: LeanRuntimeClient) -> FastMCP:
 
     @server.tool
     def run_lean_code(project_dir: str, code: str, timeout: float | None = None) -> str:
-        """Compile a Lean snippet in a project's persistent REPL.
+        """Compile a Lean snippet in a fresh Lean REPL process for the project.
+
+        ``import Mathlib`` is added in front unless the snippet starts with
+        ``module`` or ``prelude`` or already has ``import Mathlib``. Imports
+        must come from Mathlib, Aesop, Batteries, or LeanSearchClient.
+
+        Each call starts Lean and loads its imports from scratch, including an
+        added ``import Mathlib``, so even a one-line snippet takes at least as
+        long as that import.
 
         Args:
             project_dir: Absolute path to the Lake project root.
             code: Lean code to execute.
-            timeout: Optional timeout in seconds.
+            timeout: Optional seconds for the call once the runtime admits its
+                project: waiting for a free slot, the header check, starting
+                Lean, the imports, and the code. Waiting for admission comes
+                first and is not counted. The default and maximum are 240
+                seconds unless the operator changes them.
         """
         return runtime.request(
             "repl.run",
@@ -29,7 +41,13 @@ def create_repl_server(runtime: LeanRuntimeClient) -> FastMCP:
 
     @server.tool
     def get_repl_status(project_dir: str) -> str:
-        """Return pool capacity, memory use, and shutdown state.
+        """Return pool capacity, memory use, lifecycle state, and shutdown state.
+
+        State is ``cold``, ``warming``, ``warm``, or ``retiring``; ``warm``
+        means the project's slots are cached, not that a REPL process stays
+        alive. Memory use counts only processes of calls in progress, so it is
+        zero between calls; retiring reports zero and ``shutdown: true`` while
+        verified cleanup remains in progress.
 
         Args:
             project_dir: Absolute path to the Lake project root.

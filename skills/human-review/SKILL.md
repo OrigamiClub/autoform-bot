@@ -15,6 +15,14 @@ existing Autoform vault and site configuration; hand missing infrastructure to
 Setup. Keep the Markdown vault as the source of truth and regenerate only
 derived review views.
 
+There is no `autoform` on `PATH` in a Lean project. Run every `autoform` and
+`autoform-visualize` command, from `<PROJECT>`, as
+`uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform` followed by its arguments
+(with `autoform-visualize` in place of `autoform` for the graph), where
+`<AUTOFORM_PLUGIN_ROOT>` is the absolute plugin root: the directory that holds
+this skill's `skills/` folder, along with `pyproject.toml` and `autoform_cli/`.
+Give a subagent that root and this prefix with its task.
+
 Regenerate the review views from `<PROJECT>`: validate the blueprint, refresh
 the Mermaid graph with `autoform-visualize` so Obsidian shows current
 dependencies, render the site source, then strict-build the site. Follow the
@@ -26,13 +34,32 @@ rather than a reason to refuse to render.
 Stop on structural failures and present them before asking for mathematical
 judgment. For vault review, point the user to `blueprint/README.md`, coverage,
 chapter pages, and `blueprint/dependencies.md` in Obsidian. For browser review,
-serve the built site over localhost and provide the overview, progress, project
-graph, relevant chapter graph, and node-neighborhood links.
+run `autoform dashboard <PROJECT> --site-dir site` so the same site deployed to
+GitHub Pages is served on loopback with local-only live claim badges. Provide
+the overview, including its progress summary, plus the project graph, relevant
+chapter graph, and node-neighborhood links.
 
 Guide the review from coarse to fine: declared scope and exclusions, milestone
-book, progress summary, cross-chapter graph, chapter graph, then individual node
-and Lean-source links. Record each human decision as `approve`, `revise`, or
+book, landing-page progress summary, cross-chapter graph, chapter graph, then
+individual node and Lean-source links. Record each human decision as `approve`, `revise`, or
 `block`, with the exact page or node and rationale. Separate validator output
 from the person's judgment. Do not silently apply requested revisions: hand
-mathematical-plan changes to Roadmap, Lean implementation changes to
-Orchestrate, and autonomous rubric scoring to Agent Review.
+mathematical-plan changes and Lean implementation changes to Roadmap, which
+records the decision and retracts the affected article so Formalize takes it up
+under the [revision contract](../../autoform_cli/README.md#revision-contract),
+and autonomous rubric scoring to Agent Review.
+
+Treat the landing page's `Scoped roadmap` percentage as completion among
+formalizable leaf targets that are fully proved, including every dependency
+recursively. This requires proofs for theorems and bodies for definitions. A
+target marked `mathlib: true` follows the authored status contract; the marker
+is an author assertion, not audit verification that the declaration is in
+Mathlib. Treat the percentage never as whole-source completion. Read the
+adjacent declared source coverage and its linked coverage contract before
+making scope claims. A statement-only theorem remains incomplete whether it is
+blocked or ready to prove. In a project that allows open statements, a
+conditionally proved target, whose proof rests on an open statement without a
+recorded Lean proof, is not complete either: it is never fully proved, so it
+counts toward the percentage's total but not its completed share, as does
+every target that depends on it. Present it as conditional, naming the open
+statements in its `Assumes` row, never as proved or sorry-free.
