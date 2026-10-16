@@ -358,10 +358,10 @@ def _lookup_module(client: Client, module: str, env: str | None) -> tuple[str, s
         return None
     # A theorem module's slug replaced every '.' with '_', so try the slug as
     # an exact name, then search by its last segment and compare slugs.
-    candidates = list(client.get("/theorems", theorem_name=name, env=env).get("theorems", []))  # type: ignore[union-attr]
-    candidates += client.get("/theorems", q=name.rsplit("_", 1)[-1], env=env, limit=_PAGE).get(  # type: ignore[union-attr]
-        "theorems", []
-    )
+    exact = client.get("/theorems", theorem_name=name, env=env)
+    by_segment = client.get("/theorems", q=name.rsplit("_", 1)[-1], env=env, limit=_PAGE)
+    candidates = list(exact.get("theorems", []))  # type: ignore[union-attr]
+    candidates += by_segment.get("theorems", [])  # type: ignore[union-attr]
     for item in candidates:
         if theorem_slug(item.get("theorem_name", "")) == name and item.get("status") != "Definition":
             detail = client.get(f"/theorems/{item['theorem_id']}")
@@ -792,12 +792,11 @@ def upload_proposal(client: Client, spec: dict, proposal_id: str | None = None) 
     meta = spec["proposal"]
     if proposal_id:
         proposal = client.get(f"/mission-proposals/{proposal_id}")
-        if proposal.get("status") not in EDITABLE_PROPOSAL:  # type: ignore[union-attr]
-            raise Prove2MeError(
-                f"proposal {proposal_id} is {proposal.get('status')!r} and can no longer be edited"  # type: ignore[union-attr]
-            )
-        if meta.get("env") and not str(proposal.get("env") or "").startswith(meta["env"]):  # type: ignore[union-attr]
-            raise Prove2MeError(f"proposal {proposal_id} targets env {proposal.get('env')}, not {meta.get('env')}")  # type: ignore[union-attr]
+        status, env = proposal.get("status"), proposal.get("env")  # type: ignore[union-attr]
+        if status not in EDITABLE_PROPOSAL:
+            raise Prove2MeError(f"proposal {proposal_id} is {status!r} and can no longer be edited")
+        if meta.get("env") and not str(env or "").startswith(meta["env"]):
+            raise Prove2MeError(f"proposal {proposal_id} targets env {env}, not {meta.get('env')}")
         patch = {key: meta[key] for key in ("description", "mission_type", "field_ids", "visibility") if key in meta}
         if patch:
             client.request("PATCH", f"/mission-proposals/{proposal_id}", json=patch)

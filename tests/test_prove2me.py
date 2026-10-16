@@ -263,7 +263,10 @@ def test_fetch_mirrors_the_target_and_its_platform_imports(tmp_path: Path) -> No
     (tmp_path / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": "c5ea"}]}))
     api = FakeApi({
         ("GET", "/theorems/leaf"): TARGET,
-        ("GET", "/theorems/h"): {"theorem_name": "P01.helper", "formal_statement": "theorem P01.helper : True := sorry"},
+        ("GET", "/theorems/h"): {
+            "theorem_name": "P01.helper",
+            "formal_statement": "theorem P01.helper : True := sorry",
+        },
         ("GET", "/theorems"): _definitions,
     })
 
@@ -370,9 +373,10 @@ def test_dry_run_reports_gates_and_never_submits(cli_api, tmp_path: Path, capsys
     good = tmp_path / "good.lean"
     good.write_text("theorem solution : True := trivial\n")
 
-    assert main(["prove2me", "verify", "leaf", str(bad), "--dry-run", "--skip-compile", "--workspace", str(tmp_path)]) == 1
+    flags = ["--dry-run", "--skip-compile", "--workspace", str(tmp_path)]
+    assert main(["prove2me", "verify", "leaf", str(bad), *flags]) == 1
     assert "sorry" in capsys.readouterr().out
-    assert main(["prove2me", "verify", "leaf", str(good), "--dry-run", "--skip-compile", "--workspace", str(tmp_path)]) == 0
+    assert main(["prove2me", "verify", "leaf", str(good), *flags]) == 0
     assert "nothing submitted" in capsys.readouterr().out
     assert not any(request.method != "GET" for request in api.requests if request.url.path != "/api/v1/agent/refresh")
 
@@ -451,7 +455,8 @@ def test_check_publish_rejects_sorry_in_definitions() -> None:
     definition = {"definition_name": "helper", "definition_title": "Helper", "definition": "def helper : Nat := sorry"}
 
     assert any("sorry-free" in problem for problem in prove2me.check_publish("definition", definition))
-    assert any("must match" in p for p in prove2me.check_publish("definition", {**definition, "definition_name": "a.b"}))
+    renamed = {**definition, "definition_name": "a.b"}
+    assert any("must match" in p for p in prove2me.check_publish("definition", renamed))
 
 
 def test_publish_sends_the_parent_environment_and_waits_for_each_job(
@@ -567,13 +572,18 @@ def test_check_proposal_warns_about_what_blocks_submission_later() -> None:
 
 def test_compile_proposal_writes_drafts_where_imports_resolve_and_never_clobbers(tmp_path: Path, monkeypatch) -> None:
     builds: list[list[str]] = []
-    monkeypatch.setattr(prove2me.subprocess, "run",
-                        lambda command, **kwargs: builds.append(command) or subprocess.CompletedProcess(command, 0, "", ""))
+    monkeypatch.setattr(
+        prove2me.subprocess,
+        "run",
+        lambda command, **kwargs: builds.append(command) or subprocess.CompletedProcess(command, 0, "", ""),
+    )
 
     ok, _ = prove2me.compile_proposal(PROPOSAL["items"], tmp_path, 60)
 
     assert ok
-    assert builds == [["lake", "build", "Definitions.Def_P01_helper", "Theorems.Thm_P01_child", "Theorems.Thm_P01_goal"]]
+    assert builds == [
+        ["lake", "build", "Definitions.Def_P01_helper", "Theorems.Thm_P01_child", "Theorems.Thm_P01_goal"]
+    ]
     goal = (tmp_path / "Theorems" / "Thm_P01_goal.lean").read_text()
     assert goal.startswith(prove2me.DRAFT_MARKER + "import Definitions.Def_P01_helper\n\nnamespace P01")
     assert prove2me.compile_proposal(PROPOSAL["items"], tmp_path, 60)[0]  # an earlier draft is rewritten
@@ -682,7 +692,8 @@ def test_propose_dry_run_and_env_mismatch_never_upload(cli_api, tmp_path: Path, 
     spec = tmp_path / "proposal.json"
     spec.write_text(json.dumps(PROPOSAL))
     monkeypatch.setattr(prove2me, "compile_proposal", lambda *a, **k: pytest.fail("compiled despite mismatch"))
-    (tmp_path / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": C5EA["mathlib_rev"]}]}))
+    manifest = {"packages": [{"name": "mathlib", "rev": C5EA["mathlib_rev"]}]}
+    (tmp_path / "lake-manifest.json").write_text(json.dumps(manifest))
 
     assert main(["prove2me", "propose", str(spec), "--workspace", str(tmp_path)]) == 1
     assert "setup --env 0df444a" in capsys.readouterr().out
