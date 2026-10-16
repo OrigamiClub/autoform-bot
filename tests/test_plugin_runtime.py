@@ -23,6 +23,7 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
         "human-review",
         "agent-review",
         "develop-plugin",
+        "prove2me",
     }
 
     review_dir = repo_root / "skills" / "agent-review"
@@ -78,6 +79,7 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
         "human-review",
         "agent-review",
         "develop-plugin",
+        "prove2me",
     ]
     for command in muse["capabilities"]["commands"]:
         assert (repo_root / command["path"]).is_file()
@@ -163,6 +165,7 @@ def test_copied_plugin_project_entrypoints_need_no_autoform_on_path(repo_root, t
         ".lake/",
         "site/",
         "site-src/",
+        ".autoform-publication-*/",
         "*.log",
         ".claude/worktrees/",
     ]
@@ -195,6 +198,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             "autoform_cli/__main__.py",
             "autoform_cli/graph.py",
             "autoform_cli/probes/skeleton_probe.lean",
+            "autoform_cli/probes/unused_hypotheses.lean",
             "autoform_cli/project/README.md",
             "autoform_cli/project/_lake_metadata.py",
             "autoform_cli/project/_snapshot.py",
@@ -202,15 +206,20 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             "autoform_cli/project/create.py",
             "autoform_cli/project/creation-release-lean-v4.32.2-mathlib-v4.32.2.json",
             "autoform_cli/project/release-manifest-lean-v4.32.2-mathlib-v4.32.2.json",
+            "autoform_cli/project/creation-release-lean-v4.34.1-mathlib-v4.34.1.json",
+            "autoform_cli/project/release-manifest-lean-v4.34.1-mathlib-v4.34.1.json",
+            "autoform_cli/project/libraries.json",
             "autoform_cli/project/releases.json",
             "servers/lean_client.py",
             "servers/lean_runtime.py",
             "servers/lsp/server.py",
             "servers/repl/core.py",
+            "servers/repl/parse_header.lean",
             "servers/repl/server.py",
         } <= names
         assert "autoform_cli/lake.py" not in names
         assert "autoform_cli/templates/github/autoform_audit.py" in names
+        assert "autoform_cli/templates/github/CODEOWNERS.autoform.example" in names
         assert "autoform_cli/assets/blueprint-live.js" in names
         assert not any(
             name.startswith(("scripts/", "autoform/", "visualization/", "servers/lean/", "servers/search/"))

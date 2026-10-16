@@ -1,9 +1,12 @@
-"""Read-only planning for durable roadmap article identifiers."""
+"""Planning, and applying, durable roadmap article identifiers."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,6 +96,108 @@ def plan_article_ids(blueprint_dir: str | Path) -> ArticleIdentityPlan:
     )
 
 
+class ArticleIdWriteError(GraphValidationError):
+    """Applying a plan stopped; ``written`` names the articles it had already changed."""
+
+    def __init__(self, issues: list[str] | tuple[str, ...], written: tuple[ArticleIdentityEntry, ...] = ()) -> None:
+        super().__init__(issues)
+        self.written = written
+
+
+def write_article_ids(blueprint_dir: str | Path) -> tuple[ArticleIdentityEntry, ...]:
+    """Add each planned ID to the frontmatter of the article that lacks one.
+
+    The ID goes in as the first frontmatter line; an article without
+    frontmatter gets a block holding only the ID. Nothing else in the file
+    changes. An article is written only while its bytes still have the hash
+    the plan was made from, so an article edited meanwhile is refused: every
+    article is checked before the first is written, and again just before its
+    own replacement. The plan is deterministic, so after such a refusal,
+    running the command again completes it.
+    """
+
+    plan = plan_article_ids(blueprint_dir)
+    blueprint = Path(blueprint_dir).expanduser().resolve()
+    pending = [entry for entry in plan.entries if not entry.assigned]
+    prepared: list[tuple[ArticleIdentityEntry, Path, bytes, int]] = []
+    issues: list[str] = []
+    for entry in pending:
+        path = blueprint / entry.article_path
+        try:
+            content, mode = _read_regular(path)
+        except OSError as error:
+            issues.append(f"{entry.article_path}: cannot read article: {error}")
+            continue
+        if hashlib.sha256(content).hexdigest() != entry.source_sha256:
+            issues.append(f"{entry.article_path}: changed while the plan was made; run the command again")
+            continue
+        if content.startswith(b"\xef\xbb\xbf"):
+            issues.append(f"{entry.article_path}: starts with a byte-order mark; remove it and run again")
+            continue
+        prepared.append((entry, path, _with_article_id(content, entry.article_id), mode))
+    if issues:
+        raise ArticleIdWriteError(issues)
+
+    written: list[ArticleIdentityEntry] = []
+    for entry, path, content, mode in prepared:
+        try:
+            _replace_if_unchanged(path, entry.source_sha256, content, mode)
+        except OSError as error:
+            raise ArticleIdWriteError(
+                [f"{entry.article_path}: not written: {error}"], tuple(written)
+            ) from None
+        written.append(entry)
+    return tuple(written)
+
+
+def _read_regular(path: Path) -> tuple[bytes, int]:
+    """The bytes and permission bits of a regular file, refusing anything else."""
+
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(f"not a regular file: {path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            return source.read(), stat.S_IMODE(metadata.st_mode)
+    finally:
+        os.close(descriptor)
+
+
+def _with_article_id(content: bytes, article_id: str) -> bytes:
+    """Insert ``article_id`` as the first frontmatter key, keeping the file's line endings."""
+
+    text = content.decode("utf-8")
+    # Split as graph._parse_node does, so both agree on where the frontmatter is.
+    first = text.splitlines(keepends=True)[0] if text else ""
+    opener = first.splitlines()[0] if first else ""
+    ending = first[len(opener) :]
+    newline = ending if ending in ("\r\n", "\r") else "\n"
+    line = f"article_id: {article_id}{newline}"
+    if opener.strip() == "---" and ending:
+        return (first + line + text[len(first) :]).encode("utf-8")
+    return (f"---{newline}{line}---{newline}{newline}" + text).encode("utf-8")
+
+
+def _replace_if_unchanged(path: Path, expected_sha256: str, content: bytes, mode: int) -> None:
+    """Replace *path* from a same-directory temporary file, unless it changed since it was planned."""
+
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.chmod(mode)
+        current, _ = _read_regular(path)
+        if hashlib.sha256(current).hexdigest() != expected_sha256:
+            raise OSError("the article changed while the plan was applied; run the command again")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _proposed_id(path_id: str, source_sha256: str) -> str:
     digest = hashlib.sha256(b"autoform-article-id/v1\0")
     encoded_path = path_id.encode("utf-8")
@@ -105,8 +210,10 @@ def _proposed_id(path_id: str, source_sha256: str) -> str:
 
 __all__ = [
     "IDENTITY_PLAN_SCHEMA",
+    "ArticleIdWriteError",
     "ArticleIdentityEntry",
     "ArticleIdentityPlan",
     "GraphValidationError",
     "plan_article_ids",
+    "write_article_ids",
 ]

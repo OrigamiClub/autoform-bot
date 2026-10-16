@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,8 +10,10 @@ import pytest
 from autoform_cli.__main__ import main
 from autoform_cli.graph import (
     GraphValidationError,
+    _containment_cycles,
     load_graph,
 )
+from autoform_cli.runtime import RuntimeProjectionError, load_runtime_graph
 
 
 def _node_text(body: str, **metadata: str) -> str:
@@ -124,6 +127,9 @@ def test_resolves_links_relative_to_each_node(tmp_path: Path) -> None:
             _node_text("# Result\n## Depends on\n[x](../../outside.md)\n"),
             "escapes the blueprint directory",
         ),
+        (_node_text("# Result\n## Depends on\n[x](http://[oops/a.md)\n"), "relative Markdown path"),
+        (_node_text("# Result\n## Depends on\n[x](%00.md)\n"), "contains an invalid path"),
+        pytest.param(_node_text("# Result\n## Depends on\n[x](" + "a" * 300 + ".md)\n"), "does not exist", id="long-name"),
     ],
 )
 def test_rejects_invalid_nodes(tmp_path: Path, body: str, message: str) -> None:
@@ -133,6 +139,41 @@ def test_rejects_invalid_nodes(tmp_path: Path, body: str, message: str) -> None:
 
     with pytest.raises(GraphValidationError, match=message):
         load_graph(blueprint)
+
+
+def test_a_dependency_through_a_symlink_loop_is_reported_alike_on_every_python(tmp_path: Path) -> None:
+    # Before Python 3.13 resolving a loop raises; from 3.13 it returns the looping path.
+    blueprint = tmp_path / "blueprint"
+    _node(blueprint, "result.md", "# Result\n## Depends on\n[x](../loop.md)\n[y](../../outer.md)\n")
+    try:
+        (blueprint / "loop.md").symlink_to("loop.md")
+        (tmp_path / "outer.md").symlink_to("outer.md")
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(GraphValidationError) as caught:
+        load_graph(blueprint)
+
+    assert caught.value.issues == (
+        "result: dependency target does not exist: '../loop.md'",
+        "result: dependency target escapes the blueprint directory: '../../outer.md'",
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="permissions do not bind root")
+def test_a_dependency_under_an_unreadable_directory_is_an_issue(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _node(blueprint, "result.md", "# Result\n## Depends on\n[x](../locked/a.md)\n")
+    locked = blueprint / "locked"
+    locked.mkdir()
+    locked.chmod(0)
+    try:
+        with pytest.raises(GraphValidationError) as caught:
+            load_graph(blueprint)
+    finally:
+        locked.chmod(0o755)
+
+    assert caught.value.issues == ("result: dependency target does not exist: '../locked/a.md'",)
 
 
 def test_rejects_self_edge(tmp_path: Path) -> None:
@@ -207,6 +248,63 @@ def test_ignores_links_in_code_fences_and_other_sections(tmp_path: Path) -> None
     assert load_graph(blueprint).nodes["only"].dependencies == ()
 
 
+def test_a_comment_opener_inside_a_code_fence_hides_no_dependency(tmp_path: Path) -> None:
+    # The page shows the section below the fence, so the graph must keep its edge.
+    blueprint = tmp_path / "blueprint"
+    _node(blueprint, "base.md", "# Base\n")
+    _node(
+        blueprint,
+        "only.md",
+        """# Only
+
+```html
+<!-- an example of markup
+```
+
+## Depends on
+- [Base](base.md)
+
+````markdown
+```python
+[Inside the outer fence](missing.md)
+```
+````
+""",
+    )
+
+    assert load_graph(blueprint).nodes["only"].dependencies == ("base",)
+
+
+@pytest.mark.parametrize(
+    "fence",
+    [
+        "```lean\nexample : True := trivial\n``` -- end\n",
+        "```lean\nexample : True := trivial\n",
+        "~~~\n[Shown as text](base.md)\n",
+    ],
+)
+def test_a_fence_that_never_closes_hides_no_dependency(tmp_path: Path, fence: str) -> None:
+    # The page draws a fence without a closing line as plain text, so the links
+    # below it are on the page and stay in the graph.
+    blueprint = tmp_path / "blueprint"
+    _node(blueprint, "base.md", "# Base\n")
+    _node(blueprint, "only.md", f"# Only\n\n## Depends on\n\n{fence}\n- [Base](base.md)\n")
+
+    assert set(load_graph(blueprint).nodes["only"].dependencies) == {"base"}
+
+
+def test_a_fence_closes_only_on_a_bare_fence_line(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _node(blueprint, "base.md", "# Base\n")
+    _node(
+        blueprint,
+        "only.md",
+        "# Only\n\n## Depends on\n\n```lean\n``` -- not the end\n[Hidden](missing.md)\n```\n\n- [Base](base.md)\n",
+    )
+
+    assert load_graph(blueprint).nodes["only"].dependencies == ("base",)
+
+
 def test_requires_blueprint_and_roadmap_directories(tmp_path: Path) -> None:
     with pytest.raises(GraphValidationError, match="blueprint directory does not exist"):
         load_graph(tmp_path / "absent")
@@ -247,6 +345,24 @@ def test_rejects_noncanonical_readme_case_with_actionable_error(tmp_path: Path, 
     message = str(caught.value)
     assert relative in message
     assert "must be named exactly README.md" in message
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="permissions do not bind root")
+@pytest.mark.parametrize("relative", ["", "chapter"], ids=["roadmap", "chapter"])
+def test_a_roadmap_directory_that_cannot_be_listed_is_refused(tmp_path: Path, relative: str) -> None:
+    """A glob skipped it, and its articles were missing from the graph without a word."""
+    blueprint = tmp_path / "blueprint"
+    _roadmap_page(blueprint, "README.md", "# Roadmap\n")
+    _node(blueprint, "chapter/result.md", "# Result\n")
+    directory = (blueprint / "roadmap" / relative).resolve()
+    directory.chmod(0)
+    try:
+        with pytest.raises(GraphValidationError) as caught:
+            load_graph(blueprint)
+    finally:
+        directory.chmod(0o755)
+
+    assert f"cannot list roadmap directory {directory}: Permission denied" in caught.value.issues
 
 
 def test_splits_statement_and_proof_dependencies(tmp_path: Path) -> None:
@@ -374,6 +490,28 @@ def test_rejects_formalized_work_the_lean_does_not_show(
     assert raised.value.issues == issues
 
 
+def test_a_link_shown_as_indented_code_is_neither_edge_nor_source(tmp_path: Path) -> None:
+    # The page shows an indented block as code, so its links are not on the
+    # page. A list item's indented continuation is still part of the list.
+    blueprint = tmp_path / "blueprint"
+    source = blueprint / "sources" / "paper.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("# Paper\n", encoding="utf-8")
+    for name in ("base", "other", "third"):
+        _node(blueprint, f"chapter/{name}.md", f"# {name.title()}\n")
+    _node(
+        blueprint,
+        "chapter/result.md",
+        "# Result\n\n## Depends on\n\nThe syntax:\n\n    [Base](base.md)\n\n- [Other](other.md)\n\n"
+        "    [Third](third.md)\n\n## Sources\n\nFor example:\n\n    [Paper](../../sources/paper.md#result)\n",
+        origin="cited",
+    )
+
+    node = load_graph(blueprint).nodes["chapter/result"]
+    assert set(node.dependencies) == {"chapter/other", "chapter/third"}
+    assert node.sources == ()
+
+
 def test_records_origin_and_source_links_without_treating_them_as_edges(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     source = blueprint / "sources" / "paper.md"
@@ -420,6 +558,193 @@ def test_check_cli_reports_validation_errors(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "error: bad: missing H1 title" in result.stdout
+
+
+def test_check_rejects_sources_links_that_name_no_file_in_the_blueprint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue #207: the Pages workflow runs check, not audit.
+
+    In the issue's project, without `sources/`, such a link surfaced only as a
+    strict MkDocs failure naming the chapter page that absorbed the article; with
+    the directory, a missing note became a repository link that 404s. Check now
+    applies audit's rule that a Sources path names a file in the blueprint, and
+    leaves fragments and other schemes to audit; it only warns that work and
+    search omit a link with another scheme.
+    """
+    blueprint = tmp_path / "blueprint"
+    sources = "# Result\n\n## Sources\n\n- [Paper](../sources/paper.md#lemma-3)\n"
+    _node(blueprint, "result.md", sources)
+
+    assert main(["check", str(blueprint)]) == 1
+    assert capsys.readouterr().out == (
+        "error: result: source target does not resolve to a file: '../sources/paper.md#lemma-3'\n"
+    )
+
+    (blueprint / "sources").mkdir()
+    (blueprint / "sources" / "paper.md").write_text("# Paper\n", encoding="utf-8")
+    sources += "- [Book](https://example.org/book)\n- [Author](mailto:author@example.org)\n"
+    _node(blueprint, "result.md", sources)
+
+    assert main(["check", str(blueprint)]) == 0
+    # The note, its fragment and the https link stay in the projection.
+    assert [line for line in capsys.readouterr().out.splitlines() if line.startswith("warning:")] == [
+        "warning: result: work and search omit this source target, which is neither an http(s) link "
+        "nor a path inside the blueprint: 'mailto:author@example.org'"
+    ]
+
+    (tmp_path / "slides.pdf").write_bytes(b"%PDF-1.4\n")
+    rejected = (
+        "- [Notes](../sources/)\n- [Slides](../../slides.pdf)\n- [Bad](../sources/%00.md)\n"
+        "- [Host](http://[oops/paper.md)\n"
+    )
+    _node(blueprint, "result.md", sources + rejected)
+
+    assert main(["check", str(blueprint)]) == 1
+    assert capsys.readouterr().out == (
+        "error: result: source target does not resolve to a file: '../sources/'\n"
+        "error: result: source target escapes the blueprint directory: '../../slides.pdf'\n"
+        "error: result: source target contains an invalid path: '../sources/%00.md'\n"
+        "error: result: source target contains an invalid path: 'http://[oops/paper.md'\n"
+    )
+
+
+def test_check_warns_about_a_mathlib_file_search_reports_as_null(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _node(blueprint, "result.md", "# Result\n", mathlib_file="../Outside.lean")
+    _node(blueprint, "kept.md", "# Kept\n", mathlib_file="Mathlib\\Kept.lean")
+
+    assert main(["check", str(blueprint)]) == 0
+    assert [line for line in capsys.readouterr().out.splitlines() if line.startswith("warning:")] == [
+        "warning: result: search reports mathlib_file as null, since it is not a portable relative path: "
+        "'../Outside.lean'"
+    ]
+
+
+def test_check_warns_about_an_article_whose_byte_order_mark_hides_its_frontmatter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    marked = _node(blueprint, "result.md", "# Result\n", lean="Demo.result")
+    marked.write_bytes(b"\xef\xbb\xbf" + marked.read_bytes())
+    _node(blueprint, "kept.md", "# Kept\n", lean="Demo.kept")
+
+    assert main(["check", str(blueprint)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    # Like #325's warnings, it follows the whole summary.
+    assert lines[0].startswith("OK: ")
+    assert [line for line in lines if line.startswith("warning:")] == lines[-1:] == [
+        "warning: result: starts with a byte-order mark, so frontmatter on its first line is read as text "
+        "and its keys are ignored; remove the mark"
+    ]
+
+
+def test_check_prints_its_warnings_after_the_whole_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _node(blueprint, "base.md", "# Base\n\n## Sources\n\n- [Author](mailto:author@example.org)\n", lean="Project.base")
+    lean_root = tmp_path / "lean"
+    lean_root.mkdir()
+    (lean_root / "Base.lean").write_text("def Project.base : Nat := 0\n", encoding="utf-8")
+
+    assert main(["check", str(blueprint), "--lean-root", str(lean_root)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert sum(line.startswith("warning:") for line in lines) == 1
+    assert lines[-2:] == [
+        "    1 declaration(s) resolved in the Lean sources",
+        "warning: base: work and search omit this source target, which is neither an http(s) link "
+        "nor a path inside the blueprint: 'mailto:author@example.org'",
+    ]
+
+
+def test_check_refuses_a_symlinked_readme_instead_of_hanging(tmp_path: Path) -> None:
+    """Issue #58: this README made `a` and `a/b` each other's parent, and check never returned."""
+    blueprint = tmp_path / "blueprint"
+    _roadmap_page(blueprint, "README.md", "# Root\n")
+    _roadmap_page(blueprint, "a/b/README.md", "# B\n")
+    _roadmap_page(blueprint, "a/b/notes.txt", "# A\n")
+    try:
+        (blueprint / "roadmap" / "a" / "README.md").symlink_to("b/notes.txt")
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "autoform_cli", "check", str(blueprint)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 1
+    assert "error: roadmap contains a symbolic link: roadmap/a/README.md" in result.stdout
+    assert str(tmp_path) not in result.stdout
+
+
+def test_check_and_runtime_refuse_the_same_roadmap_symlinks(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _node(blueprint, "base.md", "# Base\n")
+    outside = tmp_path / "figure.png"
+    outside.write_bytes(b"png")
+    try:
+        (blueprint / "roadmap" / "figure.png").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(GraphValidationError, match="roadmap contains a symbolic link: roadmap/figure.png"):
+        load_graph(blueprint)
+    with pytest.raises(RuntimeProjectionError, match="roadmap contains a symbolic link: roadmap/figure.png"):
+        load_runtime_graph(blueprint)
+
+
+def test_check_and_runtime_refuse_a_symlinked_roadmap_directory(tmp_path: Path) -> None:
+    _roadmap_page(tmp_path / "real", "README.md", "# Root\n")
+    blueprint = tmp_path / "blueprint"
+    blueprint.mkdir()
+    try:
+        (blueprint / "roadmap").symlink_to(tmp_path / "real" / "roadmap", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(GraphValidationError, match="roadmap contains a symbolic link: roadmap$"):
+        load_graph(blueprint)
+    with pytest.raises(RuntimeProjectionError, match="roadmap contains a symbolic link: roadmap$"):
+        load_runtime_graph(blueprint)
+
+
+def test_a_readme_symlink_outside_the_roadmap_contains_nothing(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _roadmap_page(project / "blueprint", "README.md", "# Root\n")
+    _roadmap_page(project / "blueprint", "a.md", "# A\n")
+    try:
+        (project / "README.md").symlink_to("blueprint/roadmap/README.md")
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    assert load_graph(project / "blueprint").nodes["roadmap"].parent is None
+
+
+def test_load_graph_refuses_a_containment_cycle_before_depths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _roadmap_page(blueprint, "README.md", "# Root\n")
+    _roadmap_page(blueprint, "a.md", "# A\n")
+    monkeypatch.setattr("autoform_cli.graph._article_parents", lambda *_: {"roadmap": "a", "a": "roadmap"})
+    monkeypatch.setattr("autoform_cli.graph._article_depth", lambda *_: pytest.fail("depth walked a containment cycle"))
+
+    with pytest.raises(GraphValidationError, match="a: containment cycle: a -> roadmap -> a"):
+        load_graph(blueprint)
+
+
+def test_containment_cycles_are_reported_once_per_cycle() -> None:
+    parents: dict[str, str | None] = {"a": "a/b", "a/b": "a", "c": "a", "roadmap": None}
+
+    assert _containment_cycles(parents) == ["a: containment cycle: a -> a/b -> a"]
+    assert _containment_cycles({"a": "roadmap", "roadmap": None}) == []
 
 
 def test_check_cli_reports_source_index_io_failure_before_success(
@@ -521,6 +846,196 @@ def test_a_chapter_whose_articles_are_all_in_buckets_is_still_refused(tmp_path: 
         load_graph(tmp_path / "blueprint")
 
     assert "orphan: chapter directory holds 1 article(s) but no README.md" in str(caught.value)
+
+
+@pytest.mark.parametrize("name", ["agents.md", "AGENTS.md"])
+def test_agents_filenames_remain_ordinary_articles(tmp_path: Path, name: str) -> None:
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    roadmap.mkdir(parents=True)
+    (roadmap / name).write_text(f"# {name}\n", encoding="utf-8")
+
+    graph = load_graph(tmp_path / "blueprint")
+
+    assert list(graph.nodes) == [Path(name).stem]
+
+
+def test_implementation_notes_are_keyed_by_durable_article_id(tmp_path: Path) -> None:
+    """A hidden per-article note survives a roadmap path move."""
+    blueprint = tmp_path / "blueprint"
+    roadmap = blueprint / "roadmap"
+    (roadmap / "chapter").mkdir(parents=True)
+    (roadmap / "moved").mkdir()
+    (roadmap / "README.md").write_text("---\n---\n\n# Roadmap\n", encoding="utf-8")
+    (roadmap / "chapter" / "README.md").write_text("---\n---\n\n# Chapter\n", encoding="utf-8")
+    (roadmap / "moved" / "README.md").write_text("---\n---\n\n# Moved\n", encoding="utf-8")
+    article_id = "af_0123456789abcdef01234567"
+    (roadmap / "chapter" / "result.md").write_text(
+        f"---\narticle_id: {article_id}\ndeclaration: theorem\n---\n\n# Result\n",
+        encoding="utf-8",
+    )
+    notes = blueprint / ".implementation-notes"
+    notes.mkdir()
+    (notes / f"{article_id}.md").write_text(
+        "Mathlib has no `Project.result` yet.\n", encoding="utf-8"
+    )
+    (notes / ".DS_Store").write_bytes(b"finder metadata")
+
+    graph = load_graph(blueprint)
+    assert sorted(graph.nodes) == ["chapter", "chapter/result", "moved", "roadmap"]
+
+    (roadmap / "chapter" / "result.md").rename(roadmap / "moved" / "result.md")
+
+    moved = load_graph(blueprint)
+    assert moved.nodes["moved/result"].article_id == article_id
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents", "message"),
+    [
+        ("result.md", "route\n", "must be named <article_id>.md"),
+        ("af_0123456789abcdef01234567.txt", "route\n", "must be named <article_id>.md"),
+        (
+            "af_111111111111111111111111.md",
+            "route\n",
+            "names no roadmap article; restore the article_id of an article that still exists",
+        ),
+        ("af_0123456789abcdef01234567.md", "\n", "empty implementation note"),
+        ("af_0123456789abcdef01234567.md", "\ufeff\u200b\n", "empty implementation note"),
+    ],
+)
+def test_implementation_notes_fail_closed(
+    tmp_path: Path, filename: str, contents: str, message: str
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    roadmap = blueprint / "roadmap"
+    roadmap.mkdir(parents=True)
+    article_id = "af_0123456789abcdef01234567"
+    (roadmap / "result.md").write_text(
+        f"---\narticle_id: {article_id}\ndeclaration: theorem\n---\n\n# Result\n",
+        encoding="utf-8",
+    )
+    notes = blueprint / ".implementation-notes"
+    notes.mkdir()
+    (notes / filename).write_text(contents, encoding="utf-8")
+
+    with pytest.raises(GraphValidationError, match=message):
+        load_graph(blueprint)
+
+
+def test_implementation_notes_directory_has_canonical_spelling(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    roadmap = blueprint / "roadmap"
+    roadmap.mkdir(parents=True)
+    article_id = "af_0123456789abcdef01234567"
+    (roadmap / "result.md").write_text(
+        f"---\narticle_id: {article_id}\ndeclaration: theorem\n---\n\n# Result\n",
+        encoding="utf-8",
+    )
+    notes = blueprint / ".Implementation-Notes"
+    notes.mkdir()
+    (notes / f"{article_id}.md").write_text("route\n", encoding="utf-8")
+
+    with pytest.raises(GraphValidationError, match="noncanonical implementation notes"):
+        load_graph(blueprint)
+
+
+def test_implementation_note_must_be_utf8(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    roadmap = blueprint / "roadmap"
+    roadmap.mkdir(parents=True)
+    article_id = "af_0123456789abcdef01234567"
+    (roadmap / "result.md").write_text(
+        f"---\narticle_id: {article_id}\ndeclaration: theorem\n---\n\n# Result\n",
+        encoding="utf-8",
+    )
+    notes = blueprint / ".implementation-notes"
+    notes.mkdir()
+    (notes / f"{article_id}.md").write_bytes(b"\xff")
+
+    with pytest.raises(GraphValidationError, match="cannot read implementation note"):
+        load_graph(blueprint)
+
+
+def test_implementation_note_must_not_be_a_symlink(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    roadmap = blueprint / "roadmap"
+    roadmap.mkdir(parents=True)
+    article_id = "af_0123456789abcdef01234567"
+    (roadmap / "result.md").write_text(
+        f"---\narticle_id: {article_id}\ndeclaration: theorem\n---\n\n# Result\n",
+        encoding="utf-8",
+    )
+    notes = blueprint / ".implementation-notes"
+    notes.mkdir()
+    target = tmp_path / "note.md"
+    target.write_text("route\n", encoding="utf-8")
+    try:
+        (notes / f"{article_id}.md").symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(GraphValidationError, match="must be a regular file"):
+        load_graph(blueprint)
+
+
+def test_hidden_entries_beside_implementation_notes_are_ignored(tmp_path: Path) -> None:
+    """Editors leave hidden lock symlinks, such as Emacs's `.#<name>`, beside a note."""
+    blueprint = tmp_path / "blueprint"
+    roadmap = blueprint / "roadmap"
+    roadmap.mkdir(parents=True)
+    article_id = "af_0123456789abcdef01234567"
+    (roadmap / "result.md").write_text(
+        f"---\narticle_id: {article_id}\ndeclaration: theorem\n---\n\n# Result\n",
+        encoding="utf-8",
+    )
+    notes = blueprint / ".implementation-notes"
+    notes.mkdir()
+    (notes / f"{article_id}.md").write_text("route\n", encoding="utf-8")
+    try:
+        (notes / f".#{article_id}.md").symlink_to("user@host.4242:1760000000")
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    assert list(load_graph(blueprint).nodes) == ["result"]
+
+
+def test_implementation_notes_directory_must_not_be_a_symlink(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    roadmap = blueprint / "roadmap"
+    roadmap.mkdir(parents=True)
+    article_id = "af_0123456789abcdef01234567"
+    (roadmap / "result.md").write_text(
+        f"---\narticle_id: {article_id}\ndeclaration: theorem\n---\n\n# Result\n",
+        encoding="utf-8",
+    )
+    target = tmp_path / "notes"
+    target.mkdir()
+    try:
+        (blueprint / ".implementation-notes").symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(GraphValidationError, match="directory must not be a symlink"):
+        load_graph(blueprint)
+
+
+def test_article_error_does_not_misreport_its_note_as_orphaned(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    roadmap = blueprint / "roadmap"
+    roadmap.mkdir(parents=True)
+    article_id = "af_0123456789abcdef01234567"
+    (roadmap / "result.md").write_text(
+        f"---\narticle_id: {article_id}\ndeclaration: theorem\n---\n\nNo H1.\n",
+        encoding="utf-8",
+    )
+    notes = blueprint / ".implementation-notes"
+    notes.mkdir()
+    (notes / f"{article_id}.md").write_text("route\n", encoding="utf-8")
+
+    with pytest.raises(GraphValidationError) as caught:
+        load_graph(blueprint)
+
+    assert caught.value.issues == ("result: missing H1 title",)
 
 
 @pytest.mark.parametrize(

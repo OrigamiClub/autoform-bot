@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import replace
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,14 @@ import pytest
 from autoform_cli import scaffold as scaffold_module
 from autoform_cli.__main__ import main
 from autoform_cli.graph import load_graph
-from autoform_cli.project import ProjectCreateError, create_project, inspect_project, load_release_catalog
+from autoform_cli.project import (
+    LibraryCatalog,
+    ProjectCreateError,
+    create_project,
+    inspect_project,
+    load_library_catalog,
+    load_release_catalog,
+)
 from autoform_cli.project import create as create_module
 from autoform_cli.scaffold import DEFAULT_AUTOFORM_SOURCE
 
@@ -28,6 +36,7 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
 _RELEASE = "lean-v4.32.2-mathlib-v4.32.2"
+_CATALOG = load_release_catalog().releases
 _SOURCE = "https://example.test/owner/autoform.git"
 _CORE_FILES = ("lean-toolchain", "lakefile.toml", "lake-manifest.json", "src/Project.lean")
 _UNLISTED_LAKEFILE = (
@@ -52,15 +61,22 @@ def _no_checkout_pin(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scaffold_module, "plugin_pin", lambda _templates=None: ("", ""))
 
 
+def _fails(target: str | Path, code: str, **options: object) -> ProjectCreateError:
+    """Expect *code* from creating *target*, whatever the attempt left behind."""
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, **{"package": "Project", "release_id": _RELEASE, **options})
+    assert raised.value.code == code
+    return raised.value
+
+
 def _refused(target: Path, code: str, **options: object) -> ProjectCreateError:
     """Expect *code* from creating *target*, leaving its parent exactly as it was: no target, no stage."""
 
     before = sorted(target.parent.iterdir())
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, **{"package": "Project", "release_id": _RELEASE, **options})
-    assert raised.value.code == code
+    error = _fails(target, code, **options)
     assert sorted(target.parent.iterdir()) == before
-    return raised.value
+    return error
 
 
 @pytest.mark.parametrize(
@@ -104,7 +120,9 @@ def test_creation_omits_workflows_without_a_usable_checkout_pin(
     result = create_project(target, package="Project", release_id=_RELEASE)
 
     assert not result.workflows_pinned
-    assert not (target / ".github").exists()
+    assert (target / ".github/CODEOWNERS.autoform.example").is_file()
+    assert not (target / ".github/autoform_audit.py").exists()
+    assert not (target / ".github/workflows").exists()
 
 
 def test_an_explicit_source_never_inherits_the_checkout_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -117,7 +135,9 @@ def test_an_explicit_source_never_inherits_the_checkout_commit(tmp_path: Path, m
     result = create_project(target, package="Project", release_id=_RELEASE, autoform_source=_SOURCE)
 
     assert not result.workflows_pinned
-    assert not (target / ".github").exists()
+    assert (target / ".github/CODEOWNERS.autoform.example").is_file()
+    assert not (target / ".github/autoform_audit.py").exists()
+    assert not (target / ".github/workflows").exists()
 
 
 @pytest.mark.parametrize(
@@ -176,8 +196,9 @@ def test_creation_with_an_explicit_pin_stays_offline(
 
 def test_unsafe_local_templates_use_the_project_error_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     templates = tmp_path / "templates"
-    templates.mkdir()
-    (templates / "escape").symlink_to(tmp_path / "missing")
+    shutil.copytree(create_module._TEMPLATES, templates)
+    (templates / "README.md").unlink()
+    (templates / "README.md").symlink_to(tmp_path / "missing")
     monkeypatch.setattr(create_module, "_TEMPLATES", templates)
 
     _refused(tmp_path / "Project", "project-create-validation-failed")
@@ -190,6 +211,36 @@ def test_incomplete_local_templates_are_not_published(tmp_path: Path, monkeypatc
     monkeypatch.setattr(create_module, "_TEMPLATES", templates)
 
     _refused(tmp_path / "Project", "project-create-validation-failed")
+
+
+def test_stray_files_in_local_templates_are_not_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Finder's binary .DS_Store failed creation, and an editor's UTF-8 backup was published.
+    templates = tmp_path / "templates"
+    shutil.copytree(create_module._TEMPLATES, templates)
+    (templates / ".DS_Store").write_bytes(b"\x00\x00\x00\x01Bud1\x00\x00\x10\x00\xff\xfe")
+    (templates / "README.md~").write_text("# Stale backup\n", encoding="utf-8")
+    monkeypatch.setattr(create_module, "_TEMPLATES", templates)
+
+    result = create_project(tmp_path / "Project", package="Project", release_id=_RELEASE)
+
+    assert ".DS_Store" not in result.written
+    assert "README.md~" not in result.written
+
+
+@pytest.mark.parametrize("relative", _CORE_FILES)
+def test_a_template_cannot_replace_a_core_project_file(
+    relative: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = tmp_path / "templates"
+    shutil.copytree(create_module._TEMPLATES, templates)
+    (templates / relative).parent.mkdir(exist_ok=True)
+    (templates / relative).write_text("template\n", encoding="utf-8")
+    monkeypatch.setattr(create_module, "_TEMPLATES", templates)
+    monkeypatch.setattr(scaffold_module, "_TEMPLATE_PATHS", scaffold_module._TEMPLATE_PATHS | {relative})
+
+    error = _refused(tmp_path / "Project", "project-create-validation-failed")
+
+    assert error.message == create_module._CONTRACTS_MESSAGE
 
 
 def test_group_writable_installed_templates_publish_canonical_modes(
@@ -237,6 +288,7 @@ def test_creates_complete_supported_project(tmp_path: Path) -> None:
         ".lake/",
         "site/",
         "site-src/",
+        ".autoform-publication-*/",
         "*.log",
         ".claude/worktrees/",
     ]
@@ -318,6 +370,11 @@ def test_creates_complete_supported_project(tmp_path: Path) -> None:
         "Sort",
         "Prop",
         "Init",
+        "LakeMain",
+        "Leanc",
+        "LeanChecker",
+        "LeanIR",
+        "LEANIR",
         "Mathlib",
         "MathlibTest",
         "MATHLIB",
@@ -359,6 +416,30 @@ def test_every_release_has_creation_contracts() -> None:
             "Qq",
             "Std",
         }
+
+
+@pytest.mark.parametrize("resource", ["manifest\ue000.json", "manifest\U0001f600.json"])
+def test_release_metadata_names_its_manifest_below_the_surrogate_range(
+    monkeypatch: pytest.MonkeyPatch, resource: str
+) -> None:
+    release = load_release_catalog().recommended
+    name = f"creation-release-{release.id}.json"
+    payload = json.loads(create_module.files("autoform_cli.project").joinpath(name).read_bytes())
+    payload["lake_manifest"] = resource
+
+    class Resources:
+        def joinpath(self, _name: str) -> Resources:
+            return self
+
+        def read_bytes(self) -> bytes:
+            return json.dumps(payload).encode()
+
+    monkeypatch.setattr(create_module, "files", lambda _package: Resources())
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_module._load_creation_release_descriptor(release)
+
+    assert raised.value.code == "project-create-validation-failed"
 
 
 @pytest.mark.parametrize("missing", ["Aesop", "Archive", "Counterexamples"])
@@ -406,10 +487,7 @@ def test_package_name_reserves_the_longest_lake_artifact_filename(tmp_path: Path
     result = create_project(tmp_path / "Accepted", package=boundary, release_id=_RELEASE)
 
     assert result.package == boundary
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(tmp_path / "Rejected", package=f"{boundary}A", release_id=_RELEASE)
-    assert raised.value.code == "project-name-invalid"
-    assert not (tmp_path / "Rejected").exists()
+    _refused(tmp_path / "Rejected", "project-name-invalid", package=f"{boundary}A")
 
 
 def test_open_parent_descriptor_rechecks_the_generated_module_filename_limit(
@@ -424,11 +502,32 @@ def test_open_parent_descriptor_rechecks_the_generated_module_filename_limit(
 
 
 def test_rejects_unknown_release_before_writing(tmp_path: Path) -> None:
-    target = tmp_path / "project"
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id="unknown")
-    assert raised.value.code == "project-release-unknown"
-    assert not target.exists()
+    _refused(tmp_path / "project", "project-release-unknown", release_id="unknown")
+
+
+def test_listing_a_release_does_not_change_the_recommended_one() -> None:
+    # The bundled example and its tests are pinned to the recommended release.
+    assert load_release_catalog().recommended.id == _RELEASE
+
+
+@pytest.mark.parametrize("release", _CATALOG, ids=lambda release: release.id)
+def test_creates_a_locked_supported_project_on_each_release(tmp_path: Path, release) -> None:
+    target = tmp_path / "Project"
+    result = create_project(target, package="Project", release_id=release.id)
+
+    assert result.release == release.id
+    assert result.warnings == ()
+    assert (target / "lean-toolchain").read_text(encoding="utf-8") == f"{release.lean_toolchain}\n"
+    assert f'rev = "{release.mathlib_rev}"' in (target / "lakefile.toml").read_text(encoding="utf-8")
+    manifest = json.loads((target / "lake-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["name"] == "Project"
+    assert {entry["name"]: entry["inputRev"] for entry in manifest["packages"] if not entry["inherited"]} == {
+        "mathlib": release.mathlib_rev
+    }
+    inspection = inspect_project(target)
+    assert inspection.ok
+    assert inspection.compatibility.status == "supported"
+    assert inspection.compatibility.release == release.id
 
 
 def test_omitted_release_uses_the_recommended_release(tmp_path: Path) -> None:
@@ -492,24 +591,23 @@ def test_unlisted_pair_threads_the_mathlib_revision(tmp_path: Path, toolchain: s
         ]
 
 
-@pytest.mark.parametrize(
-    ("toolchain", "revision"),
-    [
-        ("v4.32.2", None),
-        ("leanprover/lean4:v4.32.2", "v4.32.2"),
-        ("v4.32.2", "905b95818eb32af7874a58b427f50c1711a5e96c"),
-        ("v4.32.2", "905B95818EB32AF7874A58B427F50C1711A5E96C"),
-    ],
-)
-def test_catalog_pair_given_as_versions_uses_the_bundled_lock(
-    tmp_path: Path, toolchain: str, revision: str | None
-) -> None:
+@pytest.mark.parametrize("spelling", ["tag", "full toolchain", "commit", "upper-case commit"])
+@pytest.mark.parametrize("release", _CATALOG, ids=lambda release: release.id)
+def test_catalog_pair_given_as_versions_uses_the_bundled_lock(tmp_path: Path, release, spelling: str) -> None:
+    # Setup passes a library's Lean and locked Mathlib commit; a listed pair must still get its lock.
+    tag = release.lean_toolchain.removeprefix("leanprover/lean4:")
+    toolchain, revision = {
+        "tag": (tag, None),
+        "full toolchain": (release.lean_toolchain, release.mathlib_rev),
+        "commit": (tag, release.mathlib_commit),
+        "upper-case commit": (tag, release.mathlib_commit.upper()),
+    }[spelling]
     result = create_project(
         tmp_path / "Versions", package="Project", release_id=None, lean_toolchain=toolchain, mathlib_rev=revision
     )
-    create_project(tmp_path / "Release", package="Project", release_id=_RELEASE)
+    create_project(tmp_path / "Release", package="Project", release_id=release.id)
 
-    assert result.release == _RELEASE
+    assert result.release == release.id
     assert result.warnings == ()
     for relative in _CORE_FILES:
         assert (tmp_path / "Versions" / relative).read_bytes() == (tmp_path / "Release" / relative).read_bytes()
@@ -628,28 +726,6 @@ def test_catalog_releases_meet_the_lean_floor() -> None:
         assert create_module._version_warnings(version) == ()
 
 
-def test_unlisted_plan_must_not_carry_a_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    target = tmp_path / "Project"
-    original = create_module._build_project_plan
-    bundle = create_module._load_release_bundle(load_release_catalog().recommended)
-
-    def add_manifest(*args, **kwargs):
-        plan, pinned = original(*args, **kwargs)
-        manifest = type(plan[0])("lake-manifest.json", create_module._lake_manifest("Project", bundle), 0o644)
-        return tuple(sorted((*plan, manifest), key=lambda item: item.relative)), pinned
-
-    monkeypatch.setattr(create_module, "_build_project_plan", add_manifest)
-
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=None, lean_toolchain="v4.30.0")
-
-    assert raised.value.code == "project-create-validation-failed"
-    assert not target.exists()
-    stages = list(tmp_path.glob(".autoform-new-*"))
-    assert len(stages) == 1
-    assert (stages[0] / "lake-manifest.json").is_file()
-
-
 def test_long_valid_target_name_does_not_expand_the_stage_name(tmp_path: Path) -> None:
     name_limit = os.pathconf(tmp_path, "PC_NAME_MAX")
     if name_limit < 64:
@@ -666,9 +742,7 @@ def test_long_valid_target_name_does_not_expand_the_stage_name(tmp_path: Path) -
 def test_embedded_nul_target_uses_the_stable_error_contract(tmp_path: Path, capsys) -> None:
     target = os.fspath(tmp_path / "bad\0name")
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-    assert raised.value.code == "project-target-invalid"
+    _fails(target, "project-target-invalid")
 
     assert main(["project", "new", target, "--package", "Project", "--release", _RELEASE, "--json"]) == 1
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "project-target-invalid"
@@ -676,10 +750,7 @@ def test_embedded_nul_target_uses_the_stable_error_contract(tmp_path: Path, caps
 
 @pytest.mark.parametrize("target", ["", ".", "..", "/"])
 def test_target_must_name_a_directory(target: str) -> None:
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-target-invalid"
+    _fails(target, "project-target-invalid")
 
 
 @pytest.mark.parametrize("kind", ["file", "directory", "symlink", "broken-symlink"])
@@ -695,22 +766,17 @@ def test_never_overwrites_existing_target(tmp_path: Path, kind: str) -> None:
         if kind == "symlink":
             real.mkdir()
         target.symlink_to(real, target_is_directory=True)
-    before = sorted(
-        (path.relative_to(tmp_path).as_posix(), path.read_bytes())
-        for path in tmp_path.rglob("*")
-        if path.is_file() and not path.is_symlink()
-    )
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
+    def snapshot() -> list[tuple[str, bytes]]:
+        return sorted(
+            (path.relative_to(tmp_path).as_posix(), path.read_bytes())
+            for path in tmp_path.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        )
 
-    assert raised.value.code == "project-target-exists"
-    after = sorted(
-        (path.relative_to(tmp_path).as_posix(), path.read_bytes())
-        for path in tmp_path.rglob("*")
-        if path.is_file() and not path.is_symlink()
-    )
-    assert after == before
+    before = snapshot()
+    _refused(target, "project-target-exists")
+    assert snapshot() == before
 
 
 def test_macos_tmp_alias_is_rejected_but_private_tmp_is_supported() -> None:
@@ -723,10 +789,7 @@ def test_macos_tmp_alias_is_rejected_but_private_tmp_is_supported() -> None:
     parent.mkdir(mode=0o700)
     parent.chmod(0o755)
     try:
-        with pytest.raises(ProjectCreateError) as raised:
-            create_project(Path("/tmp") / name / "Project", package="Project", release_id=_RELEASE)
-        assert raised.value.code == "project-path-is-symlink"
-        assert not (parent / "Project").exists()
+        _refused(Path("/tmp") / name / "Project", "project-path-is-symlink")
 
         create_project(parent / "Project", package="Project", release_id=_RELEASE)
         assert inspect_project(parent / "Project").ok
@@ -738,9 +801,7 @@ def test_rejects_nonsticky_shared_parent(tmp_path: Path) -> None:
     parent = tmp_path / "shared"
     parent.mkdir(mode=0o777)
     parent.chmod(0o777)
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(parent / "Project", package="Project", release_id=_RELEASE)
-    assert raised.value.code == "project-parent-unsafe"
+    _refused(parent / "Project", "project-parent-unsafe")
 
 
 def test_rechecks_parent_mode_on_the_open_descriptor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -795,33 +856,12 @@ def test_injected_build_failure_preserves_the_empty_stage(tmp_path: Path, monkey
         raise OSError("injected")
 
     monkeypatch.setattr(create_module, "_materialize_project", fail)
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-    assert raised.value.code == "project-create-failed"
-    assert ".autoform-new-* stage may remain" in raised.value.message
+    error = _fails(target, "project-create-failed")
+    assert ".autoform-new-* stage may remain" in error.message
     assert not target.exists()
     stages = list(tmp_path.glob(".autoform-new-*"))
     assert len(stages) == 1
     assert not list(stages[0].iterdir())
-
-
-def test_injected_validation_failure_preserves_stage_for_safe_recovery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target = tmp_path / "project"
-
-    def fail(*args, **kwargs):
-        raise ProjectCreateError("project-create-validation-failed", "invalid")
-
-    monkeypatch.setattr(create_module, "_validate_staged_project", fail)
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-    assert raised.value.code == "project-create-validation-failed"
-    assert ".autoform-new-* stage may remain" in raised.value.message
-    assert not target.exists()
-    stages = list(tmp_path.glob(".autoform-new-*"))
-    assert len(stages) == 1
-    assert (stages[0] / "lean-toolchain").is_file()
 
 
 def test_invalid_planned_roadmap_is_never_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -829,42 +869,31 @@ def test_invalid_planned_roadmap_is_never_published(tmp_path: Path, monkeypatch:
     original = create_module._build_project_plan
 
     def corrupt(*args, **kwargs):
-        plan, pinned = original(*args, **kwargs)
-        changed = tuple(
+        return tuple(
             type(item)(item.relative, b"No H1 title.\n", item.mode)
             if item.relative == "blueprint/roadmap/README.md"
             else item
-            for item in plan
+            for item in original(*args, **kwargs)
         )
-        return changed, pinned
 
     monkeypatch.setattr(create_module, "_build_project_plan", corrupt)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-validation-failed"
-    assert not target.exists()
-    assert not list(tmp_path.glob(".autoform-new-*"))
+    _refused(target, "project-create-validation-failed")
 
 
-@pytest.mark.parametrize("corruption", ["container", "relative", "content", "mode"])
-def test_plan_requires_exact_types_and_safe_file_modes_before_writing(
+@pytest.mark.parametrize("corruption", ["relative", "mode"])
+def test_plan_requires_safe_paths_and_file_modes_before_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str
 ) -> None:
     original = create_module._build_project_plan
 
     def corrupt(*args, **kwargs):
-        plan, pinned = original(*args, **kwargs)
-        if corruption == "container":
-            return list(plan), pinned
-        first, *rest = plan
+        first, *rest = original(*args, **kwargs)
         changed = {
             "relative": type(first)(Path(first.relative), first.content, first.mode),
-            "content": type(first)(first.relative, memoryview(first.content), first.mode),
             "mode": type(first)(first.relative, first.content, 0o666),
         }[corruption]
-        return (changed, *rest), pinned
+        return (changed, *rest)
 
     monkeypatch.setattr(create_module, "_build_project_plan", corrupt)
 
@@ -907,19 +936,19 @@ def test_close_failure_after_publish_reports_that_the_target_exists(
     monkeypatch.setattr(create_module, "_reopen_bound_parent", reopen)
     monkeypatch.setattr(create_module.os, "close", close_after_publish)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-commit-uncertain"
-    assert "target names the published project" in raised.value.message
-    assert "parent directory was synced" in raised.value.message
-    assert "final descriptor cleanup failed" in raised.value.message
+    error = _fails(target, "project-create-commit-uncertain")
+    assert "target names the published project" in error.message
+    assert "parent directory was synced" in error.message
+    assert "final descriptor cleanup failed" in error.message
     assert inspect_project(target).ok
     assert not list(tmp_path.glob(".autoform-new-*"))
 
 
+@pytest.mark.parametrize(
+    "failure", [OSError("injected fsync failure"), KeyboardInterrupt], ids=["fsync-error", "interrupt"]
+)
 def test_fsync_failure_after_publish_reports_that_the_target_exists(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: BaseException | type[BaseException]
 ) -> None:
     target = tmp_path / "project"
     original_rename = create_module._rename_noreplace
@@ -936,47 +965,15 @@ def test_fsync_failure_after_publish_reports_that_the_target_exists(
         nonlocal failed
         if published and not failed:
             failed = True
-            raise OSError("injected fsync failure")
+            raise failure
         original_fsync(descriptor)
 
     monkeypatch.setattr(create_module, "_rename_noreplace", publish)
     monkeypatch.setattr(create_module.os, "fsync", fail_after_publish)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-commit-uncertain"
-    assert "target names the published project" in raised.value.message
-    assert "parent-directory sync was not confirmed" in raised.value.message
-    assert inspect_project(target).ok
-    assert not list(tmp_path.glob(".autoform-new-*"))
-
-
-def test_interrupt_after_publish_reports_that_the_target_exists(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target = tmp_path / "project"
-    original_rename = create_module._rename_noreplace
-    original_fsync = create_module.os.fsync
-    published = False
-
-    def publish(*args):
-        nonlocal published
-        original_rename(*args)
-        published = True
-
-    def interrupt_after_publish(descriptor):
-        if published:
-            raise KeyboardInterrupt
-        original_fsync(descriptor)
-
-    monkeypatch.setattr(create_module, "_rename_noreplace", publish)
-    monkeypatch.setattr(create_module.os, "fsync", interrupt_after_publish)
-
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-commit-uncertain"
+    error = _fails(target, "project-create-commit-uncertain")
+    assert "target names the published project" in error.message
+    assert "parent-directory sync was not confirmed" in error.message
     assert inspect_project(target).ok
     assert not list(tmp_path.glob(".autoform-new-*"))
 
@@ -993,10 +990,7 @@ def test_rename_exception_after_commit_reports_that_the_target_exists(
 
     monkeypatch.setattr(create_module, "_rename_noreplace", commit_then_fail)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-commit-uncertain"
+    _fails(target, "project-create-commit-uncertain")
     assert inspect_project(target).ok
     assert not list(tmp_path.glob(".autoform-new-*"))
 
@@ -1015,11 +1009,8 @@ def test_detached_stage_after_publication_attempt_reports_uncertain_commit(
 
     monkeypatch.setattr(create_module, "_rename_noreplace", commit_move_then_fail)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-commit-uncertain"
-    assert "neither the target nor the preserved stage names the project" in raised.value.message
+    error = _fails(target, "project-create-commit-uncertain")
+    assert "neither the target nor the preserved stage names the project" in error.message
     assert not target.exists()
     assert inspect_project(moved).ok
 
@@ -1032,11 +1023,8 @@ def test_publication_capability_error_remains_actionable(tmp_path: Path, monkeyp
 
     monkeypatch.setattr(create_module, "_rename_noreplace", unavailable)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-safety-unavailable"
-    assert ".autoform-new-* stage may remain" in raised.value.message
+    error = _fails(target, "project-create-safety-unavailable")
+    assert ".autoform-new-* stage may remain" in error.message
     assert not target.exists()
     assert len(list(tmp_path.glob(".autoform-new-*"))) == 1
 
@@ -1071,11 +1059,8 @@ def test_late_target_race_remains_distinguishable(tmp_path: Path, monkeypatch: p
 
     monkeypatch.setattr(create_module, "_rename_noreplace", lose_race)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-target-exists"
-    assert ".autoform-new-* stage may remain" in raised.value.message
+    error = _fails(target, "project-target-exists")
+    assert ".autoform-new-* stage may remain" in error.message
     assert (target / "KEEP").read_text(encoding="utf-8") == "keep\n"
     assert len(list(tmp_path.glob(".autoform-new-*"))) == 1
 
@@ -1109,7 +1094,7 @@ def test_requested_parent_rebind_before_publish_preserves_the_stage(
     parent.mkdir(mode=0o700)
     parent.chmod(0o755)
     target = parent / "Project"
-    original = create_module._validate_staged_project
+    original = create_module._materialize_project
 
     def rebind(*args, **kwargs) -> None:
         original(*args, **kwargs)
@@ -1117,13 +1102,10 @@ def test_requested_parent_rebind_before_publish_preserves_the_stage(
         parent.mkdir(mode=0o700)
         parent.chmod(0o755)
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", rebind)
+    monkeypatch.setattr(create_module, "_materialize_project", rebind)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-parent-changed"
-    assert ".autoform-new-* stage may remain" in raised.value.message
+    error = _fails(target, "project-parent-changed")
+    assert ".autoform-new-* stage may remain" in error.message
     assert not (parent / "Project").exists()
     stages = list(moved.glob(".autoform-new-*"))
     assert len(stages) == 1
@@ -1152,13 +1134,11 @@ def test_requested_parent_rebind_after_parent_sync_reports_exact_state(
 
     monkeypatch.setattr(create_module, "_reopen_bound_parent", rebind)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
+    error = _fails(target, "project-create-commit-uncertain")
 
     assert calls == 2
-    assert raised.value.code == "project-create-commit-uncertain"
-    assert "was published and its original parent directory was synced" in raised.value.message
-    assert "requested parent path no longer names that directory" in raised.value.message
+    assert "was published and its original parent directory was synced" in error.message
+    assert "requested parent path no longer names that directory" in error.message
     assert not (parent / "Project").exists()
     assert inspect_project(moved / "Project").ok
 
@@ -1181,18 +1161,15 @@ def test_postpublish_parent_recheck_failure_does_not_claim_a_rebind(
 
     monkeypatch.setattr(create_module, "_reopen_bound_parent", fail_second)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-commit-uncertain"
-    assert "could not reopen the requested parent path" in raised.value.message
-    assert "no longer names" not in raised.value.message
+    error = _fails(target, "project-create-commit-uncertain")
+    assert "could not reopen the requested parent path" in error.message
+    assert "no longer names" not in error.message
     assert inspect_project(target).ok
 
 
 def test_workspace_substitution_fails_before_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
-    original = create_module._validate_staged_project
+    original = create_module._materialize_project
 
     def substitute(*args, **kwargs) -> None:
         original(*args, **kwargs)
@@ -1202,35 +1179,12 @@ def test_workspace_substitution_fails_before_publication(tmp_path: Path, monkeyp
         stage.mkdir(mode=0o700)
         (stage / "FOREIGN").write_text("foreign\n", encoding="utf-8")
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", substitute)
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-    assert raised.value.code == "project-create-failed"
+    monkeypatch.setattr(create_module, "_materialize_project", substitute)
+    _fails(target, "project-create-failed", release_id=_RELEASE)
     assert not target.exists()
     assert any(path.name == "FOREIGN" for path in tmp_path.rglob("FOREIGN"))
-
-
-def test_corrupt_core_plan_is_rejected_without_path_based_inspection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target = tmp_path / "project"
-    original = create_module._build_project_plan
-
-    def corrupt(*args, **kwargs):
-        plan, pinned = original(*args, **kwargs)
-        changed = tuple(
-            type(item)(item.relative, b"leanprover/lean4:v0.0.0\n", item.mode)
-            if item.relative == "lean-toolchain"
-            else item
-            for item in plan
-        )
-        return changed, pinned
-
-    monkeypatch.setattr(create_module, "_build_project_plan", corrupt)
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-    assert raised.value.code == "project-create-validation-failed"
-    assert not target.exists()
+    # The renamed stage is refused before its chmod, so the written tree stays private.
+    assert stat.S_IMODE(next(tmp_path.glob(".autoform-new-*-owned")).stat().st_mode) == 0o700
 
 
 def test_stage_path_substitution_never_writes_to_symlink_target(
@@ -1250,10 +1204,7 @@ def test_stage_path_substitution_never_writes_to_symlink_target(
 
     monkeypatch.setattr(create_module, "_materialize_project", substitute)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-failed"
+    _fails(target, "project-create-failed")
     assert not target.exists()
     assert (victim / "KEEP").read_text(encoding="utf-8") == "keep\n"
     assert sorted(path.name for path in victim.iterdir()) == ["KEEP"]
@@ -1261,19 +1212,90 @@ def test_stage_path_substitution_never_writes_to_symlink_target(
 
 def test_stage_open_failure_preserves_the_owned_empty_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
-    original = create_module._open_stage
+    original = create_module._open_directory
 
     def fail_first_open(parent_descriptor: int, stage_name: str) -> int:
         if stage_name.startswith(".autoform-new-"):
             raise OSError("injected stage open failure")
         return original(parent_descriptor, stage_name)
 
-    monkeypatch.setattr(create_module, "_open_stage", fail_first_open)
+    monkeypatch.setattr(create_module, "_open_directory", fail_first_open)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
+    _fails(target, "project-create-failed")
+    assert not target.exists()
+    stages = list(tmp_path.glob(".autoform-new-*"))
+    assert len(stages) == 1
+    assert not list(stages[0].iterdir())
 
-    assert raised.value.code == "project-create-failed"
+
+def test_stage_substitution_is_refused_before_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "project"
+    original = create_module._open_directory
+
+    def substitute_after_open(parent_descriptor: int, name: str) -> int:
+        descriptor = original(parent_descriptor, name)
+        if name.startswith(".autoform-new-"):
+            (tmp_path / name).rename(tmp_path / f"{name}-owned")
+            (tmp_path / name).mkdir(mode=0o700)
+        return descriptor
+
+    monkeypatch.setattr(create_module, "_open_directory", substitute_after_open)
+
+    error = _fails(target, "project-create-failed")
+    assert ".autoform-new-* stage may remain" in error.message
+    assert not target.exists()
+    # Neither the replacement nor the opened stage, now under its -owned name, received a file.
+    stages = list(tmp_path.glob(".autoform-new-*"))
+    assert len(stages) == 2
+    assert not any(list(stage.iterdir()) for stage in stages)
+
+
+@pytest.mark.parametrize(
+    ("mode", "entries"), [(0o700, {"private.txt"}), (0o755, set())], ids=["nonempty-0700", "empty-0755"]
+)
+def test_swapped_in_stage_directory_is_refused_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int, entries: set[str]
+) -> None:
+    target = tmp_path / "project"
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    for name in entries:
+        (decoy / name).write_text("private\n", encoding="utf-8")
+    decoy.chmod(mode)
+    original = create_module._open_directory
+
+    def swap_before_open(parent_descriptor: int, name: str) -> int:
+        if name.startswith(".autoform-new-") and decoy.exists():
+            (tmp_path / name).rename(tmp_path / "original-stage")
+            decoy.rename(tmp_path / name)
+        return original(parent_descriptor, name)
+
+    monkeypatch.setattr(create_module, "_open_directory", swap_before_open)
+
+    error = _fails(target, "project-create-failed")
+    assert ".autoform-new-* stage may remain" in error.message
+    assert not target.exists()
+    (swapped,) = tmp_path.glob(".autoform-new-*")
+    assert stat.S_IMODE(swapped.stat().st_mode) == mode
+    assert {path.name for path in swapped.iterdir()} == entries
+    assert not list((tmp_path / "original-stage").iterdir())
+
+
+def test_foreign_owned_stage_is_refused_before_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "project"
+    original = create_module._create_stage
+    euid = os.geteuid()
+
+    def foreign_stage(parent_descriptor: int) -> str:
+        name = original(parent_descriptor)
+        # From here on the stage looks like a directory another uid put in its place.
+        monkeypatch.setattr(create_module.os, "geteuid", lambda: euid + 1)
+        return name
+
+    monkeypatch.setattr(create_module, "_create_stage", foreign_stage)
+
+    error = _fails(target, "project-create-failed")
+    assert ".autoform-new-* stage may remain" in error.message
     assert not target.exists()
     stages = list(tmp_path.glob(".autoform-new-*"))
     assert len(stages) == 1
@@ -1282,21 +1304,20 @@ def test_stage_open_failure_preserves_the_owned_empty_stage(tmp_path: Path, monk
 
 def test_failure_path_never_attempts_recursive_deletion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
+    original = create_module._materialize_project
 
     def fail(*args, **kwargs):
+        original(*args, **kwargs)
         raise OSError("injected")
 
     def forbidden(*args, **kwargs):
         raise AssertionError("project creation attempted destructive cleanup")
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", fail)
+    monkeypatch.setattr(create_module, "_materialize_project", fail)
     monkeypatch.setattr(create_module.os, "unlink", forbidden)
     monkeypatch.setattr(create_module.os, "rmdir", forbidden)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-failed"
+    _fails(target, "project-create-failed")
     assert not target.exists()
 
 
@@ -1307,7 +1328,7 @@ def test_failure_cleanup_never_recurses_into_a_foreign_directory(
     victim = tmp_path / "victim"
     victim.mkdir()
     (victim / "KEEP").write_text("keep\n", encoding="utf-8")
-    original = create_module._validate_staged_project
+    original = create_module._materialize_project
 
     def substitute(*args, **kwargs):
         original(*args, **kwargs)
@@ -1316,11 +1337,8 @@ def test_failure_cleanup_never_recurses_into_a_foreign_directory(
         victim.rename(stage / "blueprint")
         raise OSError("injected")
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", substitute)
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-failed"
+    monkeypatch.setattr(create_module, "_materialize_project", substitute)
+    _fails(target, "project-create-failed")
     assert not target.exists()
     stages = list(tmp_path.glob(".autoform-new-*"))
     assert len(stages) == 1
@@ -1339,10 +1357,7 @@ def test_hard_linked_planned_file_is_not_published(tmp_path: Path, monkeypatch: 
 
     monkeypatch.setattr(create_module, "_materialize_project", add_alias)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-failed"
+    _fails(target, "project-create-failed")
     assert not target.exists()
     assert alias.stat().st_nlink == 2
 
@@ -1360,30 +1375,24 @@ def test_noncanonical_generated_directory_mode_is_not_published(
 
     monkeypatch.setattr(create_module, "_materialize_project", make_world_writable)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-failed"
+    _fails(target, "project-create-failed")
     assert not target.exists()
     stage = next(tmp_path.glob(".autoform-new-*"))
     assert stat.S_IMODE((stage / "blueprint").stat().st_mode) == 0o777
 
 
-def test_mutation_after_validation_is_not_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mutated_stage_is_not_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
-    original = create_module._validate_staged_project
+    original = create_module._materialize_project
 
     def mutate(*args, **kwargs):
         original(*args, **kwargs)
         stage = next(tmp_path.glob(".autoform-new-*"))
         (stage / "lean-toolchain").write_text("mutated\n", encoding="utf-8")
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", mutate)
+    monkeypatch.setattr(create_module, "_materialize_project", mutate)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-failed"
+    _fails(target, "project-create-failed")
     assert not target.exists()
 
 
@@ -1615,13 +1624,7 @@ def test_cli_postcommit_output_is_ascii_and_backslash_safe(tmp_path: Path) -> No
 
 @pytest.mark.parametrize("name", [os.fsdecode(b"project-\xff"), "project-\ud800"])
 def test_surrogate_target_is_rejected_before_writing(tmp_path: Path, name: str) -> None:
-    target = os.fspath(tmp_path / name)
-
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-target-invalid"
-    assert not list(tmp_path.iterdir())
+    _refused(tmp_path / name, "project-target-invalid")
 
 
 def test_cli_threads_the_explicit_workflow_pin(tmp_path: Path, capsys) -> None:
@@ -1692,9 +1695,8 @@ def test_empty_version_options_are_not_defaults(tmp_path: Path, versions: dict[s
 
 
 def test_version_conflict_and_floor_messages_name_the_problem(tmp_path: Path) -> None:
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(tmp_path / "Project", package="Project", release_id=_RELEASE, mathlib_rev="master")
-    assert raised.value.message == "Choose a catalog release or a Lean toolchain and Mathlib revision, not both."
+    error = _refused(tmp_path / "Project", "project-version-invalid", mathlib_rev="master")
+    assert error.message == "Choose a catalog release or a Lean toolchain and Mathlib revision, not both."
 
     result = create_project(tmp_path / "Old", package="Project", release_id=None, lean_toolchain="v4.26.0")
     message = dict(result.warnings)["project-lean-below-minimum"]
@@ -1719,12 +1721,7 @@ def test_group_writable_parent_is_refused_with_a_remedy(tmp_path: Path) -> None:
     parent.mkdir(mode=0o700)
     parent.chmod(0o775)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(parent / "Project", package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-parent-unsafe"
-    assert "chmod g-w,o-w" in raised.value.message
-    assert not list(parent.iterdir())
+    assert "chmod g-w,o-w" in _refused(parent / "Project", "project-parent-unsafe").message
 
 
 _NEEDS_PERMISSIONS = pytest.mark.skipif(
@@ -1739,9 +1736,7 @@ def test_untraversable_ancestor_is_a_stable_error(tmp_path: Path, capsys) -> Non
     target = os.fspath(locked / "sub" / "Project")
     locked.chmod(0o600)
     try:
-        with pytest.raises(ProjectCreateError) as raised:
-            create_project(target, package="Project", release_id=_RELEASE)
-        assert raised.value.code == "project-parent-inaccessible"
+        _fails(target, "project-parent-inaccessible")
 
         assert main(["project", "new", target, "--package", "Project", "--json"]) == 1
         assert json.loads(capsys.readouterr().out)["error"]["code"] == "project-parent-inaccessible"
@@ -1756,12 +1751,10 @@ def test_unreadable_parent_is_inaccessible_not_a_symlink(tmp_path: Path) -> None
     parent.mkdir(mode=0o700)
     parent.chmod(0o300)
     try:
-        with pytest.raises(ProjectCreateError) as raised:
-            create_project(parent / "Project", package="Project", release_id=_RELEASE)
+        _fails(parent / "Project", "project-parent-inaccessible")
     finally:
         parent.chmod(0o700)
 
-    assert raised.value.code == "project-parent-inaccessible"
     assert not list(parent.iterdir())
 
 
@@ -1777,14 +1770,12 @@ def test_parent_permission_failures_name_the_missing_permission(tmp_path: Path, 
     target = os.fspath(parent / "Project")
     parent.chmod(mode)
     try:
-        with pytest.raises(ProjectCreateError) as raised:
-            create_project(target, package="Project", release_id=_RELEASE)
+        error = _fails(target, "project-parent-inaccessible")
         assert main(["project", "new", target, "--package", "Project", "--json"]) == 1
     finally:
         parent.chmod(0o700)
 
-    assert raised.value.code == "project-parent-inaccessible"
-    assert needed in raised.value.message
+    assert needed in error.message
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "project-parent-inaccessible"
     assert not list(parent.iterdir())
 
@@ -1800,10 +1791,7 @@ def test_parent_permission_failures_name_the_missing_permission(tmp_path: Path, 
 def test_missing_or_non_directory_parent_is_a_stable_error(tmp_path: Path, relative: str, code: str) -> None:
     (tmp_path / "file").write_text("", encoding="utf-8")
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(tmp_path / relative, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == code
+    _fails(tmp_path / relative, code)
 
 
 @pytest.mark.parametrize(
@@ -1822,10 +1810,7 @@ def test_overlong_parent_component_is_a_stable_error(tmp_path: Path) -> None:
     name_limit = os.pathconf(tmp_path, "PC_NAME_MAX")
     target = tmp_path / ("p" * (name_limit + 1)) / "Project"
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-parent-invalid"
+    _fails(target, "project-parent-invalid")
 
 
 def test_symlinked_parent_at_open_is_reported_as_a_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1836,11 +1821,7 @@ def test_symlinked_parent_at_open_is_reported_as_a_link(tmp_path: Path, monkeypa
     target = link / "Project"
     monkeypatch.setattr(create_module, "_validate_target", lambda _target: target)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-path-is-symlink"
-    assert not list(real.iterdir())
+    _refused(target, "project-path-is-symlink")
 
 
 def test_static_parent_alias_is_rejected_without_resolving_it(tmp_path: Path) -> None:
@@ -1849,11 +1830,7 @@ def test_static_parent_alias_is_rejected_without_resolving_it(tmp_path: Path) ->
     alias = tmp_path / "alias"
     alias.symlink_to(real, target_is_directory=True)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(alias / "Project", package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-path-is-symlink"
-    assert not list(real.iterdir())
+    _refused(alias / "Project", "project-path-is-symlink")
 
 
 def test_alias_cannot_be_swapped_after_resolution_before_link_inspection(
@@ -1877,10 +1854,7 @@ def test_alias_cannot_be_swapped_after_resolution_before_link_inspection(
 
     monkeypatch.setattr(Path, "resolve", resolve_then_replace)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(alias / "Project", package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-path-is-symlink"
+    _fails(alias / "Project", "project-path-is-symlink")
     assert not stale_resolution_observed
     assert not (first / "Project").exists()
     assert not (alias / "Project").exists()
@@ -1907,10 +1881,7 @@ def test_retargeted_parent_alias_never_publishes_at_the_old_destination(
 
     monkeypatch.setattr(create_module, "_validate_package", validate_then_retarget)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-path-is-symlink"
+    _fails(target, "project-path-is-symlink")
     assert not (first / "Project").exists()
     assert not (second / "Project").exists()
     assert not list(first.glob(".autoform-new-*"))
@@ -1935,13 +1906,9 @@ def test_file_swapped_in_before_open_is_not_called_a_link(
 
     monkeypatch.setattr(create_module, "_validate_package", validate_then_swap)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(parent / "Project", package="Project", release_id=_RELEASE)
+    error = _fails(parent / "Project", "project-parent-invalid")
 
-    assert (raised.value.code, raised.value.message) == (
-        "project-parent-invalid",
-        "The target parent or one of its ancestors is not a directory.",
-    )
+    assert error.message == "The target parent or one of its ancestors is not a directory."
     assert swapped.is_file()
 
 
@@ -2092,3 +2059,152 @@ def test_cli_warnings_follow_the_created_line_on_a_shared_pipe(tmp_path: Path) -
         "warning[project-lean-below-minimum",
         "warning[project-release-unlisted",
     ]
+
+
+_ATLAS_RELEASE = "lean-v4.34.1-mathlib-v4.34.1"
+_ATLAS_GIT = "https://github.com/facebookresearch/atlas-lean"
+_ATLAS_COMMIT = "d2d6fc8d34f246eb9acdcca2c1c4085800db6d74"
+_ATLAS_ENTRY = {
+    "url": _ATLAS_GIT, "type": "git", "subDir": None, "scope": "", "rev": _ATLAS_COMMIT, "name": "atlas",
+    "manifestFile": "lake-manifest.json", "inputRev": _ATLAS_COMMIT, "inherited": False,
+    "configFile": "lakefile.toml",
+}
+_CSLIB_ENTRY = {
+    "url": "https://github.com/leanprover/cslib", "type": "git", "subDir": None, "scope": "leanprover",
+    "rev": "7c8f6c0f67015df29b152fdcffaf7850db2e9185", "name": "cslib", "manifestFile": "lake-manifest.json",
+    "inputRev": "v4.34.1", "inherited": True, "configFile": "lakefile.toml",
+}
+_CREATION_KEYS = {
+    "lean_toolchain", "mathlib_rev", "ok", "package", "release", "schema", "target", "warnings",
+    "workflows_pinned", "written",
+}
+
+
+def test_library_project_is_complete_and_locked(tmp_path: Path) -> None:
+    target = tmp_path / "Gauss"
+    result = create_project(target, package="Gauss", release_id=None, library="atlas")
+
+    assert result.release == _ATLAS_RELEASE
+    assert result.warnings == ()
+    payload = result.as_dict()
+    assert payload["schema"] == "autoform-project-creation/v1"
+    assert set(payload) == _CREATION_KEYS | {"library"}
+    assert payload["library"] == {"git": _ATLAS_GIT, "name": "atlas", "rev": _ATLAS_COMMIT}
+    assert (target / "lean-toolchain").read_text(encoding="utf-8") == "leanprover/lean4:v4.34.1\n"
+    assert (target / "lakefile.toml").read_text(encoding="utf-8") == (
+        'name = "Gauss"\n'
+        'version = "0.1.0"\n'
+        'defaultTargets = ["Gauss"]\n\n'
+        "[[require]]\n"
+        'name = "mathlib"\n'
+        'git = "https://github.com/leanprover-community/mathlib4"\n'
+        'rev = "v4.34.1"\n\n'
+        "[[lean_lib]]\n"
+        'name = "Gauss"\n'
+        'srcDir = "src"\n\n'
+        "[[require]]\n"
+        'name = "atlas"\n'
+        f'git = "{_ATLAS_GIT}"\n'
+        f'rev = "{_ATLAS_COMMIT}"\n'
+    )
+    manifest = json.loads((target / "lake-manifest.json").read_text(encoding="utf-8"))
+    bundled = json.loads(
+        files("autoform_cli.project")
+        .joinpath(f"release-manifest-{_ATLAS_RELEASE}.json")
+        .read_text(encoding="utf-8")
+    )
+    assert manifest["name"] == "Gauss"
+    assert [entry["name"] for entry in manifest["packages"]] == [
+        "atlas", "mathlib", "cslib", "plausible", "LeanSearchClient", "importGraph", "proofwidgets", "aesop",
+        "Qq", "batteries", "Cli",
+    ]
+    by_name = {entry["name"]: entry for entry in manifest["packages"]}
+    assert [by_name[entry["name"]] for entry in bundled["packages"]] == bundled["packages"]
+    assert by_name["atlas"] == _ATLAS_ENTRY
+    assert by_name["cslib"] == _CSLIB_ENTRY
+    inspection = inspect_project(target)
+    assert inspection.ok
+    assert inspection.compatibility.status == "supported"
+    assert inspection.compatibility.release == _ATLAS_RELEASE
+    assert not list(tmp_path.glob(".autoform-new-*"))
+
+
+def test_without_a_library_the_creation_result_keeps_its_shape(tmp_path: Path) -> None:
+    result = create_project(tmp_path / "Project", package="Project", release_id=_ATLAS_RELEASE)
+
+    assert set(result.as_dict()) == _CREATION_KEYS
+    assert result.library is None
+    assert "atlas" not in (tmp_path / "Project" / "lakefile.toml").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "versions",
+    [
+        {"release_id": _ATLAS_RELEASE},
+        {"release_id": None, "lean_toolchain": "v4.34.1"},
+        {"release_id": None, "lean_toolchain": "v4.34.1", "mathlib_rev": "v4.34.1"},
+        {"release_id": None, "mathlib_rev": "v4.34.1"},
+    ],
+)
+def test_library_refuses_version_options_before_writing(tmp_path: Path, versions: dict[str, str | None]) -> None:
+    _refused(tmp_path / "Project", "project-version-invalid", library="atlas", **versions)
+
+
+@pytest.mark.parametrize("library", ["", "ATLAS", "Atlas", "mathlib", "atlas-lean", 7])
+def test_unknown_library_is_refused_before_writing(tmp_path: Path, library: object) -> None:
+    _refused(tmp_path / "Project", "project-library-unknown", release_id=None, library=library)
+
+
+@pytest.mark.parametrize(
+    "package",
+    ["MathlibExt", "CSLibExt", "WantedExt", "MathlibExtTest", "CSLibExtTest", "Cslib", "CslibTests", "CSLIB",
+     "Atlas", "ATLAS", "Mathlib"],
+)
+def test_library_roots_and_packages_are_reserved(tmp_path: Path, package: str) -> None:
+    _refused(tmp_path / "Project", "project-name-invalid", package=package, release_id=None, library="atlas")
+
+
+def test_library_roots_are_reserved_only_with_the_library(tmp_path: Path) -> None:
+    create_project(tmp_path / "Project", package="WantedExt", release_id=_ATLAS_RELEASE)
+
+
+def _catalog_with_packages(*packages: dict) -> LibraryCatalog:
+    atlas = load_library_catalog().get("atlas")
+    return LibraryCatalog((replace(atlas, manifest_packages=(_ATLAS_ENTRY, *packages)),))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {**_CSLIB_ENTRY, "rev": "7c8f6c0f"},  # not a full commit
+        {**_CSLIB_ENTRY, "url": "http://github.com/leanprover/cslib"},
+        {**_CSLIB_ENTRY, "extra": 1},
+        {**_CSLIB_ENTRY, "name": "batteries"},  # the release already locks it
+        {**_CSLIB_ENTRY, "name": "Mathlib"},  # case-folded duplicate
+    ],
+)
+def test_malformed_library_entries_are_refused_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: dict
+) -> None:
+    monkeypatch.setattr(create_module, "load_library_catalog", lambda: _catalog_with_packages(extra))
+    _refused(tmp_path / "Project", "project-create-validation-failed", release_id=None, library="atlas")
+
+
+def test_cli_creates_a_library_project(tmp_path: Path, capsys) -> None:
+    assert main(["project", "new", str(tmp_path / "Json"), "--package", "Gauss", "--library", "atlas", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["release"] == _ATLAS_RELEASE
+    assert payload["library"] == {"git": _ATLAS_GIT, "name": "atlas", "rev": _ATLAS_COMMIT}
+
+    assert main(["project", "new", str(tmp_path / "Text"), "--package", "Gauss", "--library", "atlas"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == f"Created Gauss at Text ({_ATLAS_RELEASE})"
+    assert lines[1] == f"Library: atlas @ {_ATLAS_COMMIT} ({_ATLAS_GIT})"
+
+
+def test_cli_refuses_a_library_with_a_release(tmp_path: Path, capsys) -> None:
+    target = tmp_path / "Gauss"
+    argv = ["project", "new", str(target), "--package", "Gauss", "--library", "atlas", "--release", _ATLAS_RELEASE]
+    assert main([*argv, "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "project-version-invalid"
+    assert not target.exists()

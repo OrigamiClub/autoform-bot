@@ -6,12 +6,14 @@ nothing is a validation error rather than a broken link -- the job
 ``leanblueprint checkdecls`` does for LaTeX blueprints.
 
 The scanner is a lexical pass, not an elaborator. It tracks ``namespace`` and
-comment nesting, which is enough for declarations written in the ordinary way,
-and deliberately reports nothing it cannot see rather than guessing.
+comment nesting and stops at ``#exit``, which is enough for declarations
+written in the ordinary way, and deliberately reports nothing it cannot see
+rather than guessing.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -20,7 +22,7 @@ import stat
 import subprocess
 import time
 import unicodedata
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -38,12 +40,21 @@ from ._tree_snapshot import (
 )
 
 _NAMESPACE = re.compile(r"^\s*namespace\s+(.+)$")
-_SECTION = re.compile(r"^\s*section\b\s*(\S*)")
+#: ``section`` in every form that opens one, e.g. ``@[expose] public section``.
+_SECTION = re.compile(
+    r"^\s*(?:@\[[^\]]*\]\s*)*(?:(?:public|private|meta|noncomputable)\s+)*section\b\s*(\S*)"
+)
+_MUTUAL = re.compile(r"^\s*mutual\s*$")
 _END = re.compile(r"^\s*end\b\s*(\S*)")
+_EXIT = re.compile(r"^\s*#exit\b")
+# The ``*_wanted`` commands are Batteries' ``Batteries.Util.ProofWanted``: each
+# states a result whose proof or construction is deferred. ``alias`` is
+# Batteries' ``Batteries.Tactic.Alias``.
 _DECLARATION = re.compile(
     r"^\s*(?:@\[[^\]]*\]\s*)*"
-    r"(?:(?:private|protected|noncomputable|partial|unsafe|scoped|local)\s+)*"
-    r"(theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom|irreducible_def)\s+(.+)$"
+    r"(?:(?:public|private|protected|noncomputable|partial|unsafe|scoped|local)\s+)*"
+    r"(theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom|irreducible_def"
+    r"|theorem_wanted|proof_wanted|def_wanted|instance_wanted|alias)\s+(.+)$"
 )
 _IGNORED_DIRECTORIES = frozenset(
     {
@@ -53,7 +64,6 @@ _IGNORED_DIRECTORIES = frozenset(
         ".obsidian",
         ".trash",
         ".venv",
-        "lake-packages",
     }
 )
 # ``Build`` can be a Lean namespace directory, so only this spelling is ignored.
@@ -75,6 +85,27 @@ MANAGED_OUTPUT_SCHEMAS = frozenset(
         ("passages", PASSAGE_SCHEMA),
     }
 )
+#: Render marks each finished site with this manifest. ``mkdocs`` copies it
+#: into its own output, so both folders hold rendered copies, never sources.
+PUBLICATION_MANIFEST = "publication.json"
+PUBLICATION_SCHEMA = "autoform-publication/v2"
+#: Render never writes a larger manifest, so the next render can always read it.
+PUBLICATION_MANIFEST_MAX_BYTES = 8 * 1024 * 1024
+
+@dataclass(frozen=True, slots=True)
+class Alias:
+    """What an ``alias`` command points at, as its source writes it."""
+
+    #: The names its target can mean, in the order Lean tries them: in the
+    #: current namespace, in each enclosing one, then at the root. Empty when
+    #: the target is on neither the alias's line nor the next nonblank one.
+    candidates: tuple[str, ...]
+    #: Whether the target is one component, such as ``t`` rather than ``A.t``:
+    #: Lean then skips a ``protected`` declaration in the namespaces it tries.
+    atomic: bool
+    #: ``alias ⟨mp, mpr⟩ := t``: each name is a theorem, whatever ``t`` is.
+    iff: bool
+
 
 @dataclass(frozen=True, slots=True)
 class Declaration:
@@ -84,6 +115,9 @@ class Declaration:
     path: Path
     line: int
     keyword: str
+    #: Whether ``protected`` is written before the keyword, on its line or above.
+    protected: bool = False
+    alias: Alias | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,9 +128,50 @@ class SourceIndex:
     declarations: dict[str, Declaration]
     source_digest: str
     line_counts: dict[Path, int] = field(default_factory=dict)
+    #: For a name more than one file declares, the files after the one
+    #: ``find`` returns.
+    elsewhere: dict[str, tuple[Path, ...]] = field(default_factory=dict)
 
     def find(self, name: str) -> Declaration | None:
         return self.declarations.get(name)
+
+    def reached(self, declaration: Declaration) -> Declaration | None:
+        """The declaration ``declaration`` stands for: itself, or what an alias names through any chain.
+
+        ``None`` when the index cannot be sure what an alias's target is. Each
+        step goes to an earlier line of the same file, so a chain always ends.
+        """
+
+        while declaration.alias is not None:
+            target = self.alias_target(declaration)
+            if target is None:
+                return None
+            declaration = target
+        return declaration
+
+    def alias_target(self, declaration: Declaration) -> Declaration | None:
+        """The declaration an alias's target names, when the index can be sure which.
+
+        Lean takes the first candidate it can see, so a candidate the index
+        lacks may be declared outside the project, and one in another file may
+        or may not be imported: either way the answer is ``None``. A candidate
+        below the alias in its file is not declared yet, so Lean looks further
+        out. A ``protected`` candidate is skipped for a one-component target,
+        except when it is also private, written or under the module system;
+        not knowing which, the answer is ``None`` again.
+        """
+
+        assert declaration.alias is not None
+        for candidate in declaration.alias.candidates:
+            found = self.declarations.get(candidate)
+            if found is None or found.path != declaration.path:
+                return None
+            if found.line >= declaration.line:
+                continue
+            if found.protected and declaration.alias.atomic:
+                return None
+            return found
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,11 +190,10 @@ class BoundProjectSources:
 
     root: Path
     tree: BoundDirectoryTree
-    excluded: tuple[PurePosixPath, ...]
 
     def capture(self) -> IndexedSourceSnapshot:
         snapshot = self.tree.capture()
-        return _indexed_source_snapshot(self.root, snapshot, self.excluded)
+        return _indexed_source_snapshot(self.root, snapshot)
 
     def verify(self) -> None:
         self.tree.verify()
@@ -148,15 +222,44 @@ def index_failure_message(error: OSError) -> str:
     return "Lean sources could not be indexed"
 
 
+def resolve_lean_root(lean_root: str | Path) -> Path:
+    """Resolve *lean_root* to the directory it names.
+
+    Raises :class:`LeanSourceError` naming why the root cannot be used, for
+    example when it does not exist or lies under a folder that cannot be
+    searched.
+    """
+
+    try:
+        root = directory_binding.lexical_absolute_path(lean_root).resolve()
+        metadata = os.stat(root)
+    except RuntimeError as error:
+        # An unknown ~user, or before Python 3.13 a symbolic link loop.
+        raise LeanSourceError("Lean root cannot be resolved") from error
+    except (FileNotFoundError, NotADirectoryError) as error:
+        raise LeanSourceError("Lean root does not exist or is not a directory") from error
+    except PermissionError as error:
+        raise LeanSourceError("permission denied while resolving the Lean root") from error
+    except (OSError, ValueError) as error:
+        if getattr(error, "errno", None) == errno.ELOOP:
+            # Python 3.13 and later resolve a symbolic link loop without raising.
+            raise LeanSourceError("Lean root cannot be resolved") from error
+        raise LeanSourceError("Lean root cannot be inspected") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise LeanSourceError("Lean root does not exist or is not a directory")
+    return root
+
+
 def index_project(
     root: str | Path, *, exclude_roots: Iterable[str | Path] = ()
 ) -> SourceIndex:
-    """Scan ``*.lean`` beneath *root* and index declarations by full name."""
+    """Scan ``*.lean`` beneath *root* and index declarations by full name.
+
+    Raises :class:`LeanSourceError` when the root cannot be used or its
+    sources cannot be read.
+    """
+    root_path = resolve_lean_root(root)
     requested_root = directory_binding.lexical_absolute_path(root)
-    root_path = requested_root.resolve()
-    if not root_path.is_dir():
-        digest = hashlib.sha256(b"autoform-lean-source-index/v1\0").hexdigest()
-        return SourceIndex(root=root_path, declarations={}, source_digest=digest)
     remapped_exclusions = tuple(
         _remap_resolved_root_exclusion(requested_root, root_path, value)
         for value in exclude_roots
@@ -242,26 +345,58 @@ def snapshot_project_sources(
     of times.
     """
 
-    exclusions = tuple(exclude_roots)
+    bound, snapshot = _open_stable_project_sources(
+        root,
+        exclude_roots=tuple(exclude_roots),
+        limits=limits,
+    )
+    bound.close()
+    return snapshot
+
+
+def _open_stable_project_sources(
+    root: str | Path,
+    *,
+    exclude_roots: tuple[str | Path, ...],
+    limits: TreeCaptureLimits,
+) -> tuple[BoundProjectSources, IndexedSourceSnapshot]:
+    """Open and capture a Lean root, retrying a bounded number of changed attempts.
+
+    The caller owns the returned binding.  When every attempt changed, the error
+    names each changed root-relative path the attempts reported, once, in order.
+    """
+
     changed: TreeChangedError | None = None
+    changed_paths: list[str] = []
     for attempt in range(_SNAPSHOT_ATTEMPTS):
         if attempt:
             time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS * attempt)
+        bound: BoundProjectSources | None = None
         try:
-            with bind_project_sources(
+            bound = open_project_sources(
                 root,
-                exclude_roots=exclusions,
+                exclude_roots=exclude_roots,
                 limits=limits,
-            ) as bound:
-                return bound.capture()
-        except TreeChangedError as error:
-            changed = error
-        except TreeSnapshotError as error:
-            raise LeanSourceError(str(error)) from error
+            )
+            return bound, bound.capture()
+        except BaseException as error:
+            if bound is not None:
+                bound.close()
+            if isinstance(error, TreeChangedError):
+                changed = error
+                if error.relative is not None and error.relative not in changed_paths:
+                    changed_paths.append(error.relative)
+                continue
+            if isinstance(error, TreeSnapshotError):
+                raise LeanSourceError(str(error)) from error
+            raise
     lasting = _lasting_root_failure(root)
     if lasting is not None:
         raise LeanSourceError(lasting) from changed
-    raise LeanSourceError("Lean sources kept changing while they were indexed") from changed
+    message = "Lean sources kept changing while they were indexed"
+    if changed_paths:
+        message += "; changed: " + ", ".join(changed_paths)
+    raise LeanSourceError(message) from changed
 
 
 def _lasting_root_failure(root: str | Path) -> str | None:
@@ -295,26 +430,6 @@ def project_source_revision(
     ).revision
 
 
-@contextmanager
-def bind_project_sources(
-    root: str | Path,
-    *,
-    exclude_roots: Iterable[str | Path] = (),
-    limits: TreeCaptureLimits = TreeCaptureLimits(),
-) -> Iterator[BoundProjectSources]:
-    """Retain a Lean root while one or more source snapshots are consumed."""
-
-    bound = open_project_sources(
-        root,
-        exclude_roots=exclude_roots,
-        limits=limits,
-    )
-    try:
-        yield bound
-    finally:
-        bound.close()
-
-
 def open_project_sources(
     root: str | Path,
     *,
@@ -345,7 +460,7 @@ def open_project_sources(
     except BaseException:
         tree.close()
         raise
-    return BoundProjectSources(root_path, tree, excluded)
+    return BoundProjectSources(root_path, tree)
 
 
 @contextmanager
@@ -362,37 +477,15 @@ def bind_project_source_snapshot(
     open so a caller can verify and recapture it after using the evidence.
     """
 
-    exclusions = tuple(exclude_roots)
-    changed: TreeChangedError | None = None
-    for attempt in range(_SNAPSHOT_ATTEMPTS):
-        if attempt:
-            time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS * attempt)
-        bound: BoundProjectSources | None = None
-        try:
-            bound = open_project_sources(root, exclude_roots=exclusions, limits=limits)
-            snapshot = bound.capture()
-        except TreeChangedError as error:
-            changed = error
-            if bound is not None:
-                bound.close()
-            continue
-        except TreeSnapshotError as error:
-            if bound is not None:
-                bound.close()
-            raise LeanSourceError(str(error)) from error
-        except BaseException:
-            if bound is not None:
-                bound.close()
-            raise
-        try:
-            yield bound, snapshot
-        finally:
-            bound.close()
-        return
-    lasting = _lasting_root_failure(root)
-    if lasting is not None:
-        raise LeanSourceError(lasting) from changed
-    raise LeanSourceError("Lean sources kept changing while they were indexed") from changed
+    bound, snapshot = _open_stable_project_sources(
+        root,
+        exclude_roots=tuple(exclude_roots),
+        limits=limits,
+    )
+    try:
+        yield bound, snapshot
+    finally:
+        bound.close()
 
 
 def _project_exclusions(
@@ -438,13 +531,10 @@ def _lean_tree_selection(
             excluded,
         ),
         descend=lambda path: not _lean_path_is_excluded(path, excluded),
-        byte_limit=lambda path: (
-            _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT
-            if _is_managed_output_manifest_name(path.name)
-            else None
-        ),
         record_omitted=False,
         limits=limits,
+        # Only Lean inputs and the folders holding them must stay stable.
+        unselected_may_change=True,
         opaque_markers=(
             # A nested Git checkout is another source tree.  Treat the
             # presence of either a worktree/submodule .git file or a clone's
@@ -460,6 +550,14 @@ def _lean_tree_selection(
                 _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT,
                 _is_managed_output_manifest_bytes,
             ),
+            # A rendered site, and mkdocs' copy of one, holds copies of the
+            # blueprint's files. Render marks its stage before copying into it;
+            # mkdocs can copy files into site/ before it copies the manifest.
+            OpaqueDirectoryMarker(
+                PUBLICATION_MANIFEST,
+                PUBLICATION_MANIFEST_MAX_BYTES,
+                _is_complete_publication,
+            ),
         ),
     )
 
@@ -471,19 +569,17 @@ def _lean_snapshot_includes(
 ) -> bool:
     if _lean_path_is_excluded(relative, excluded):
         return False
+    # The suffix is compared exactly, as Lake's module globs, skeleton and the
+    # servers do, so ``A.LEAN`` is not a Lean source even on a case-insensitive
+    # volume where ``import A`` could open it.
     if stat.S_ISLNK(mode):
+        # Editor lock links (``.#Name.lean``) are never read, so they are skipped;
+        # any other ``.lean`` link, live or dangling, is captured and refused.
         return (
-            relative.suffix.casefold() == ".lean"
+            relative.suffix == ".lean"
             and not relative.name.startswith(".#")
         )
-    return (
-        stat.S_ISDIR(mode)
-        or relative.suffix.casefold() == ".lean"
-        or (
-            len(relative.parts) > 1
-            and _is_managed_output_manifest_name(relative.name)
-        )
-    )
+    return stat.S_ISDIR(mode) or relative.suffix == ".lean"
 
 
 def _lean_path_is_excluded(
@@ -507,99 +603,33 @@ def _folded_path(path: PurePosixPath) -> tuple[str, ...]:
     return tuple(unicodedata.normalize("NFC", part).casefold() for part in path.parts)
 
 
-def _indexed_source_snapshot(
-    root: Path,
-    snapshot: TreeSnapshot,
-    excluded: tuple[PurePosixPath, ...],
-) -> IndexedSourceSnapshot:
-    managed_output_manifests: dict[
-        PurePosixPath,
-        list[tuple[str, bytes | None]],
-    ] = {}
-
-    def add_manifest(relative: str, kind: str, data: bytes | None = None) -> None:
-        path = PurePosixPath(relative)
-        if len(path.parts) > 1 and _is_managed_output_manifest_name(path.name):
-            managed_output_manifests.setdefault(path.parent, []).append((kind, data))
-
-    for relative, data in snapshot.files:
-        add_manifest(relative, "file", data)
-    for relative, _target in snapshot.symlinks:
-        add_manifest(relative, "symlink")
-    for relative, _mode in snapshot.special:
-        add_manifest(relative, "special")
-    for relative in snapshot.placeholders:
-        add_manifest(relative, "placeholder")
-    for relative in snapshot.directories:
-        add_manifest(relative, "directory")
-
-    # An unrecognized manifest marks nothing; its directory stays Lean source.
-    ignored_roots: set[PurePosixPath] = {
-        PurePosixPath(relative)
-        for relative in snapshot.opaque_directories
-        if relative
-    }
-    for parent in sorted(
-        managed_output_manifests,
-        key=lambda path: (len(path.parts), path.as_posix()),
-    ):
-        if _path_is_within_roots(parent, ignored_roots):
-            continue
-        manifests = managed_output_manifests[parent]
-        if (
-            len(manifests) == 1
-            and manifests[0][0] == "file"
-            and manifests[0][1] is not None
-            and _is_managed_output_manifest_bytes(manifests[0][1])
-        ):
-            ignored_roots.add(parent)
-
-    def in_ignored_root(relative_text: str) -> bool:
-        return _path_is_within_roots(PurePosixPath(relative_text), ignored_roots)
-
-    # Editor lock links (``.#Name.lean``) are never read, so they are skipped;
-    # any other ``.lean`` link, live or dangling, is refused.
-    tolerated_links = frozenset(
-        relative
-        for relative, _target in snapshot.symlinks
-        if PurePosixPath(relative).suffix.casefold() == ".lean"
-        and not in_ignored_root(relative)
-        and PurePosixPath(relative).name.startswith(".#")
-    )
-    unsupported = [
-        (relative, reason)
-        for relative, reason in snapshot.unsupported_entries()
-        if not in_ignored_root(relative)
-        and PurePosixPath(relative).suffix.casefold() == ".lean"
-        and relative not in tolerated_links
-    ]
+def _indexed_source_snapshot(root: Path, snapshot: TreeSnapshot) -> IndexedSourceSnapshot:
+    # The Lean selection captures only .lean entries outside excluded folders,
+    # so every captured entry is a source and the snapshot's own revisions
+    # cover exactly the Lean inputs and the folders holding them.
+    unsupported = snapshot.unsupported_entries()
     if unsupported:
         relative, reason = unsupported[0]
         raise LeanSourceError(f"unsafe Lean source {relative}: {reason}")
 
     declarations: dict[str, Declaration] = {}
+    elsewhere: dict[str, tuple[Path, ...]] = {}
     line_counts: dict[Path, int] = {}
     source_files: list[tuple[Path, bytes]] = []
     digest = hashlib.sha256(b"autoform-lean-source-index/v1\0")
     for relative_text, data in snapshot.files:
-        relative = PurePosixPath(relative_text)
-        if relative.suffix.casefold() != ".lean" or _lean_path_is_excluded(
-            relative,
-            excluded,
-        ):
-            continue
-        if _path_is_within_roots(relative, ignored_roots):
-            continue
-        relative_path = Path(relative.as_posix())
+        relative_path = Path(relative_text)
         _update_source_digest(digest, relative_path, data)
         source_files.append((relative_path, data))
         try:
             text = data.decode("utf-8")
         except UnicodeError:
             continue
-        line_counts[relative_path] = len(text.splitlines())
-        for declaration in _scan(text, relative_path):
-            declarations.setdefault(declaration.name, declaration)
+        found, line_counts[relative_path] = _scan(text, relative_path)
+        for declaration in found:
+            first = declarations.setdefault(declaration.name, declaration)
+            if first.path != relative_path and relative_path not in elsewhere.get(declaration.name, ()):
+                elsewhere[declaration.name] = (*elsewhere.get(declaration.name, ()), relative_path)
     source_digest = digest.hexdigest()
     return IndexedSourceSnapshot(
         SourceIndex(
@@ -607,66 +637,12 @@ def _indexed_source_snapshot(
             declarations=declarations,
             source_digest=source_digest,
             line_counts=line_counts,
+            elsewhere=elsewhere,
         ),
         source_digest,
-        _lean_generation_revision(snapshot, ignored_roots, tolerated_links),
+        snapshot.generation_revision,
         tuple(source_files),
     )
-
-
-def _lean_generation_revision(
-    snapshot: TreeSnapshot,
-    ignored_roots: set[PurePosixPath],
-    tolerated_links: frozenset[str],
-) -> str:
-    """Hash only effective Lean inputs and their ancestor directories."""
-
-    def retained_entry(relative_text: str) -> bool:
-        relative = PurePosixPath(relative_text)
-        return relative.suffix.casefold() == ".lean" and not _path_is_within_roots(
-            relative,
-            ignored_roots,
-        )
-
-    files = tuple(entry for entry in snapshot.files if retained_entry(entry[0]))
-    symlinks = tuple(
-        entry
-        for entry in snapshot.symlinks
-        if retained_entry(entry[0]) and entry[0] not in tolerated_links
-    )
-    special = tuple(entry for entry in snapshot.special if retained_entry(entry[0]))
-    placeholders = tuple(path for path in snapshot.placeholders if retained_entry(path))
-    omitted = tuple(entry for entry in snapshot.omitted if retained_entry(entry[0]))
-    retained_paths = {
-        PurePosixPath(relative)
-        for relative, _value in (*files, *symlinks, *special, *omitted)
-    }
-    retained_paths.update(PurePosixPath(relative) for relative in placeholders)
-    retained_directories = {PurePosixPath()}
-    for path in retained_paths:
-        retained_directories.update(path.parents)
-
-    directories = tuple(
-        path
-        for path in snapshot.directories
-        if PurePosixPath(path) in retained_directories
-    )
-    retained_identity_paths = set(directories)
-    retained_identity_paths.update(path.as_posix() for path in retained_paths)
-    filtered = TreeSnapshot(
-        root_identity=snapshot.root_identity,
-        directories=directories,
-        files=files,
-        symlinks=symlinks,
-        special=special,
-        placeholders=placeholders,
-        omitted=omitted,
-        identities=tuple(
-            entry for entry in snapshot.identities if entry[0] in retained_identity_paths
-        ),
-        opaque_directories=(),
-    )
-    return filtered.generation_revision
 
 
 def _is_managed_output_manifest_bytes(data: bytes) -> bool:
@@ -688,15 +664,16 @@ def _is_managed_output_manifest_bytes(data: bytes) -> bool:
     )
 
 
-def _is_managed_output_manifest_name(name: str) -> bool:
-    return unicodedata.normalize("NFC", name).casefold() == _MANAGED_OUTPUT_MANIFEST
-
-
-def _path_is_within_roots(
-    path: PurePosixPath,
-    roots: set[PurePosixPath],
-) -> bool:
-    return any(candidate in roots for candidate in (path, *path.parents))
+def _is_complete_publication(data: bytes) -> bool:
+    try:
+        value = json.loads(data)
+    except (ValueError, RecursionError):
+        return False
+    return (
+        isinstance(value, dict)
+        and value.get("schema") in {"autoform-publication/v1", PUBLICATION_SCHEMA}
+        and value.get("complete") is True
+    )
 
 
 def _update_source_digest(digest, relative: Path, data: bytes) -> None:
@@ -707,14 +684,18 @@ def _update_source_digest(digest, relative: Path, data: bytes) -> None:
     digest.update(data)
 
 
-def _scan(text: str, relative: Path) -> list[Declaration]:
+def _scan(text: str, relative: Path) -> tuple[list[Declaration], int]:
+    """The declarations in ``text`` and the number of its lines Lean reads."""
     found: list[Declaration] = []
     namespaces: list[str] = []
     scopes: list[str | None] = []
 
-    for number, line in enumerate(_without_lean_comments(text).splitlines(), start=1):
+    lines = _without_lean_comments(text).splitlines()
+    for number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
+        if _EXIT.match(line):
+            return found, number - 1
 
         namespace_match = _NAMESPACE.match(line)
         if namespace_match:
@@ -725,8 +706,7 @@ def _scan(text: str, relative: Path) -> list[Declaration]:
             scopes.append(name)
             continue
 
-        section_match = _SECTION.match(line)
-        if section_match:
+        if _SECTION.match(line) or _MUTUAL.match(line):
             scopes.append(None)
             continue
 
@@ -741,12 +721,37 @@ def _scan(text: str, relative: Path) -> list[Declaration]:
         declaration_match = _DECLARATION.match(line)
         if declaration_match:
             keyword = declaration_match.group(1)
+            # Modifiers may also stand on the lines above the keyword.
+            header = [line[: declaration_match.start(1)]]
+            for above in range(number - 2, -1, -1):
+                if not _MODIFIER_LINE.fullmatch(lines[above]):
+                    break
+                header.append(lines[above])
+            protected = "protected" in _ATTRIBUTE_LIST.sub(" ", " ".join(header)).split()
+            if keyword == "alias":
+                following = next((lines[later] for later in range(number, len(lines)) if lines[later].strip()), "")
+                found.extend(
+                    _aliases(declaration_match.group(2), following, namespaces, relative, number, protected)
+                )
+                continue
             name = _name_token(declaration_match.group(2))
             if name is None:
                 continue
-            qualified = ".".join([*namespaces, name])
-            found.append(Declaration(qualified, relative, number, keyword))
-    return found
+            found.append(Declaration(_qualified(namespaces, name), relative, number, keyword, protected))
+    return found, len(lines)
+
+
+_ATTRIBUTE_LIST = re.compile(r"@\[[^\]]*\]")
+#: A line holding only attribute lists and modifiers, or nothing.
+_MODIFIER_LINE = re.compile(
+    r"\s*(?:(?:@\[[^\]]*\]|public|private|protected|noncomputable|partial|unsafe|scoped|local)\s*)*"
+)
+
+
+def _qualified(namespaces: list[str], name: str) -> str:
+    """The full name of ``name`` declared in ``namespaces``; ``_root_.`` leaves them out."""
+
+    return name.removeprefix("_root_.") if name.startswith("_root_.") else ".".join([*namespaces, name])
 
 
 _NAME_TOKEN = re.compile(r"(?:«[^«»]*»|[^\s:(){}\[\]⦃⦄,«»])+")
@@ -759,8 +764,73 @@ def _name_token(text: str) -> str | None:
     return match.group() if match and text[match.end() : match.end() + 1] not in ("«", "»") else None
 
 
+#: A name as ``alias`` takes one: it starts with a letter, ``_`` or ``«``.
+_ALIAS_NAME = r"(?:«[^«»]*»|[^\W\d])(?:«[^«»]*»|[^\s:(){}\[\]⦃⦄,«»⟨⟩])*"
+#: What follows ``alias``: one name, or ``⟨mp, mpr⟩`` naming the two directions
+#: of an iff, either of which may be ``_``; then ``:=`` and, unless it is on the
+#: next line, the target.
+_ALIAS = re.compile(
+    rf"(?:⟨\s*(?P<mp>{_ALIAS_NAME})\s*,\s*(?P<mpr>{_ALIAS_NAME})\s*⟩|(?P<name>{_ALIAS_NAME}))\s*:="
+    rf"(?:\s*(?P<target>{_ALIAS_NAME}))?"
+)
+_ALIAS_TARGET = re.compile(rf"\s*({_ALIAS_NAME})")
+
+
+def _aliases(
+    text: str, following: str, namespaces: list[str], relative: Path, line: int, protected: bool
+) -> list[Declaration]:
+    """The declarations one ``alias`` command makes.
+
+    ``text`` is what follows the keyword, and ``following`` the next nonblank
+    line, where a long alias puts its target.
+    """
+
+    match = _ALIAS.match(text)
+    if match is None:
+        return []
+    target = match["target"]
+    if target is None and not text[match.end() :].strip():
+        next_line = _ALIAS_TARGET.match(following)
+        target = next_line.group(1) if next_line else None
+    if target is None:
+        candidates: tuple[str, ...] = ()
+    elif target.startswith("_root_."):
+        candidates = (target.removeprefix("_root_."),)
+    else:
+        parts = [part for namespace in namespaces for part in namespace.split(".")]
+        candidates = tuple(".".join([*parts[:depth], target]) for depth in range(len(parts), -1, -1))
+    atomic = target is not None and _ONE_COMPONENT.fullmatch(target) is not None
+    iff = match["name"] is None
+    alias = Alias(candidates, atomic, iff)
+    return [
+        Declaration(_qualified(namespaces, name), relative, line, "alias", protected, alias)
+        for name in ([match["mp"], match["mpr"]] if iff else [match["name"]])
+        if name != "_"
+    ]
+
+
+_ONE_COMPONENT = re.compile(r"(?:«[^«»]*»|[^.«»])+")
+
+
 _RAW_OPEN = re.compile(r'r(#*)"')
 _CHAR_LITERAL = re.compile(r"'(?:\\.|[^'\\\n])*'")
+# Where a comment, literal, or interpolation brace can start. The text between
+# two of these positions is copied as one slice, not character by character.
+_CODE_EVENT = re.compile(r"""--|/-|r#*"|["«']""")
+_INTERPOLATION_EVENT = re.compile(r"""--|/-|r#*"|["«'{}]""")
+_COMMENT_EVENT = re.compile(r"-/|/-")
+_LITERAL_EVENTS: dict[tuple[str, bool, bool], re.Pattern[str]] = {}
+
+
+def _literal_event(close: str, interpolated: bool) -> re.Pattern[str]:
+    """Where a literal ended by *close* can next close, escape, or interpolate."""
+
+    key = (close[0], close in {'"', "'"}, interpolated)
+    pattern = _LITERAL_EVENTS.get(key)
+    if pattern is None:
+        chars = close[0] + ("\\" if key[1] else "") + ("{" if interpolated else "")
+        pattern = _LITERAL_EVENTS[key] = re.compile(f"[{re.escape(chars)}]")
+    return pattern
 
 
 def _without_lean_comments(text: str) -> str:
@@ -771,9 +841,16 @@ def _without_lean_comments(text: str) -> str:
     index = 0
     while index < len(text):
         top = stack[-1] if stack else None
-        char = text[index]
         if top is not None and top[0] is not None:
             close, interpolated = top
+            event = _literal_event(close, interpolated).search(text, index)
+            if event is None:
+                out.append(text[index:])
+                break
+            if event.start() > index:
+                out.append(text[index : event.start()])
+                index = event.start()
+            char = text[index]
             if text.startswith(close, index):
                 out.append(close)
                 index += len(close)
@@ -788,6 +865,14 @@ def _without_lean_comments(text: str) -> str:
             out.append(char)
             index += 1
             continue
+        event = (_CODE_EVENT if top is None else _INTERPOLATION_EVENT).search(text, index)
+        if event is None:
+            out.append(text[index:])
+            break
+        if event.start() > index:
+            out.append(text[index : event.start()])
+            index = event.start()
+        char = text[index]
         if text.startswith("--", index):
             newline = text.find("\n", index + 2)
             if newline < 0:
@@ -800,14 +885,14 @@ def _without_lean_comments(text: str) -> str:
             depth, index = 1, index + (3 if text[index + 2 : index + 3] in {"-", "!"} else 2)
             out.append(" ")
             while index < len(text) and depth:
-                pair = text[index : index + 2]
-                if pair in {"-/", "/-"}:
-                    depth += 1 if pair == "/-" else -1
-                    index += 2
-                    continue
-                if text[index] == "\n":
-                    out.append("\n")
-                index += 1
+                pair = _COMMENT_EVENT.search(text, index)
+                end = len(text) if pair is None else pair.start()
+                out.append("\n" * text.count("\n", index, end))
+                if pair is None:
+                    index = end
+                    break
+                depth += 1 if pair.group() == "/-" else -1
+                index = pair.end()
             continue
         raw = _RAW_OPEN.match(text, index)
         if raw:
@@ -857,6 +942,12 @@ class SourceLinker:
     repository_url: str | None = None
     ref: str | None = None
     linkable_paths: frozenset[Path] | None = None
+    indexed: bool = True
+    """False when the sources were not read, so no name was looked up."""
+    links_blueprint: bool = False
+    """True when the blueprint's files are in ``ref``'s commit too, so links into it show the published bytes."""
+    spellings: Mapping[str, str] = field(default_factory=dict)
+    """Committed path of each repository path whose name Git stores under another spelling."""
 
     def location(self, name: str) -> Declaration | None:
         return self.index.find(name)
@@ -874,67 +965,30 @@ class SourceLinker:
             )
         ):
             return None
+        relative = declaration.path.as_posix()
         path = "/".join(
             quote_from_bytes(os.fsencode(part), safe="")
-            for part in declaration.path.parts
+            for part in self.spellings.get(relative, relative).split("/")
         )
         return f"{self.repository_url}/blob/{self.ref}/{path}#L{declaration.line}"
 
 
-def build_linker(
-    lean_root: str | Path,
-    *,
-    repository_url: str | None = None,
-    ref: str | None = None,
-    exclude_roots: Iterable[str | Path] = (),
-    source_index: SourceIndex | None = None,
-    detect_missing: bool = True,
-) -> SourceLinker:
-    """Index *lean_root* and resolve repository coordinates.
-
-    A supplied source snapshot never inherits a live Git ref; callers must bind
-    that ref explicitly if they want permalinks.
-    """
-    requested_root = directory_binding.lexical_absolute_path(lean_root)
-    resolved_root = requested_root.resolve()
-    remapped_exclusions = tuple(
-        _remap_resolved_root_exclusion(requested_root, resolved_root, value)
-        for value in exclude_roots
-    )
-    if source_index is not None and source_index.root != resolved_root:
-        raise ValueError("captured source index belongs to a different Lean root")
-    resolved_repository_url = repository_url
-    resolved_ref = ref
-    linkable_paths: frozenset[Path] | None = None
-    index = source_index
-    if source_index is None:
-        if detect_missing and ref is None:
-            snapshot, detected_url, detected_ref, linkable_paths = _capture_link_state(
-                resolved_root,
-                remapped_exclusions,
-            )
-            index = snapshot.index
-            resolved_repository_url = repository_url or detected_url
-            resolved_ref = detected_ref
-        else:
-            index = index_project(
-                resolved_root,
-                exclude_roots=remapped_exclusions,
-            )
-    if detect_missing and resolved_repository_url is None:
-        resolved_repository_url = detect_repository_url(resolved_root)
-    assert index is not None
+def build_linker(lean_root: str | Path) -> SourceLinker:
+    """Index *lean_root* and resolve repository coordinates."""
+    resolved_root = resolve_lean_root(lean_root)
+    snapshot, repository_url, ref, linkable_paths = _capture_link_state(resolved_root)
+    if repository_url is None:
+        repository_url = detect_repository_url(resolved_root)
     return SourceLinker(
-        index=index,
-        repository_url=resolved_repository_url,
-        ref=resolved_ref,
+        index=snapshot.index,
+        repository_url=repository_url,
+        ref=ref,
         linkable_paths=linkable_paths,
     )
 
 
 def _capture_link_state(
     root: Path,
-    exclude_roots: Iterable[str | Path],
 ) -> tuple[
     IndexedSourceSnapshot,
     str | None,
@@ -943,7 +997,6 @@ def _capture_link_state(
 ]:
     """Capture source bytes and prove which ones belong to one stable commit."""
 
-    exclusions = tuple(exclude_roots)
     last_snapshot: IndexedSourceSnapshot | None = None
     last_url: str | None = None
     for attempt in range(_SNAPSHOT_ATTEMPTS):
@@ -951,7 +1004,7 @@ def _capture_link_state(
             time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS * attempt)
         before_url = detect_repository_url(root)
         before_ref = detect_ref(root)
-        snapshot = snapshot_project_sources(root, exclude_roots=exclusions)
+        snapshot = snapshot_project_sources(root)
         last_snapshot = snapshot
         last_url = before_url
         after_url = detect_repository_url(root)
@@ -1011,12 +1064,97 @@ def _committed_source_paths(
     return frozenset(linkable)
 
 
+def verify_repository_snapshot(
+    root: str | Path,
+    requested_ref: str,
+    files: Iterable[tuple[Path, bytes]],
+    *,
+    required_directories: Iterable[Path] = (),
+    reasons: list[str] | None = None,
+    spellings: dict[str, str] | None = None,
+) -> str | None:
+    """Return the commit whose tree holds every captured file, byte for byte.
+
+    A clean checkout that Git converts on the way out (LFS, eol attributes) is
+    accepted by hashing the captured bytes through Git's clean filter. Otherwise
+    ``None``, with the first reason appended to *reasons*, naming paths relative
+    to the repository only. The shared Git runner strips ambient overrides.
+    Given *spellings*, a file Git committed under another spelling of its name
+    is accepted too, and its committed path recorded there (``_git_tree_oids``).
+    """
+
+    def refuse(reason: str) -> None:
+        if reasons is not None:
+            reasons.append(reason)
+
+    root = Path(root).resolve()
+    commit = _git(root, "rev-parse", "--verify", "--end-of-options", f"{requested_ref}^{{commit}}")
+    algorithm = _git(root, "rev-parse", "--show-object-format")
+    if commit is None or algorithm not in {"sha1", "sha256"}:
+        return refuse(f"{requested_ref!r} does not name a commit in a local Git repository")
+    prefix = _git(root, "rev-parse", "--show-prefix")
+    if prefix:  # tree paths start at the top level, so nothing below could match
+        return refuse(
+            f"the Lean root is the subdirectory {prefix.rstrip('/')} of its Git repository; "
+            "links need the repository top level"
+        )
+    captured: dict[str, bytes] = {}
+    try:
+        for path, data in files:
+            relative = path.relative_to(root).as_posix()
+            if captured.setdefault(relative, data) != data:
+                return refuse(f"two captured files claim {relative}")
+        directories = [path.relative_to(root).as_posix() for path in required_directories]
+    except ValueError:
+        return refuse("a captured file or directory is outside the repository")
+    blobs = _git_tree_oids(root, commit, tuple(sorted(captured)), spellings)
+    if blobs is None:
+        return refuse("the commit's tree could not be read")
+    for path, data in captured.items():
+        if path not in blobs:
+            return refuse(f"{path} is not a file in commit {commit[:12]}")
+        framed = b"blob " + str(len(data)).encode("ascii") + b"\0" + data
+        if hashlib.new(algorithm, framed).hexdigest() != blobs[path] and (
+            _git_clean_blob_id(root, path, data) != blobs[path]
+        ):
+            return refuse(f"{path} differs from commit {commit[:12]}")
+    if any(_git(root, "cat-file", "-t", f"{commit}:{directory}") != "tree" for directory in directories):
+        return refuse(f"a required directory is not in commit {commit[:12]}")
+    return commit
+
+
+def _git_clean_blob_id(root: Path, path: str, data: bytes) -> str | None:
+    """Hash captured bytes as Git would store them at *path* (clean filter, eol)."""
+
+    try:
+        result = subprocess.run(
+            ["git", "hash-object", "--stdin", f"--path={path}"],
+            cwd=str(root),
+            input=data,
+            capture_output=True,
+            env=_git_environment(),
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    output = result.stdout.decode("ascii", "replace").strip()
+    return output if result.returncode == 0 and output else None
+
+
 def _git_tree_oids(
     root: Path,
     commit: str,
     paths: tuple[str, ...],
+    spellings: dict[str, str] | None = None,
 ) -> dict[str, str] | None:
-    """Read raw tree object IDs for exact paths without Git's quoting layer."""
+    """Read raw blob IDs of regular files at exact paths without Git's quoting layer.
+
+    macOS Git with ``core.precomposeUnicode`` finds a name decomposed on disk
+    under the composed spelling it committed, which is not always NFC, and
+    prints that spelling. Given *spellings*, such a record is matched to the
+    path asked for by NFC form, and the committed path recorded under it.
+    """
 
     result: dict[str, str] = {}
     for start in range(0, len(paths), 128):
@@ -1025,7 +1163,15 @@ def _git_tree_oids(
             continue
         try:
             completed = subprocess.run(
-                ["git", "ls-tree", "-rz", "--full-tree", commit, "--", *batch],
+                [
+                    "git",
+                    "ls-tree",
+                    "-rz",
+                    "--full-tree",
+                    commit,
+                    "--",
+                    *(f":(literal){path}" for path in batch),
+                ],
                 cwd=str(root),
                 capture_output=True,
                 env=_git_environment(),
@@ -1036,14 +1182,20 @@ def _git_tree_oids(
             return None
         if completed.returncode != 0:
             return None
+        asked = set(batch)
+        composed = {} if spellings is None else {unicodedata.normalize("NFC", path): path for path in batch}
         for record in completed.stdout.split(b"\0"):
             if not record:
                 continue
             header, separator, encoded_path = record.partition(b"\t")
             fields = header.split()
-            if not separator or len(fields) != 3 or fields[1] != b"blob":
+            if not separator or len(fields) != 3 or fields[0] not in {b"100644", b"100755"}:
                 continue
-            result[os.fsdecode(encoded_path)] = fields[2].decode("ascii")
+            printed = os.fsdecode(encoded_path)
+            path = printed if printed in asked else composed.get(unicodedata.normalize("NFC", printed), printed)
+            result[path] = fields[2].decode("ascii")
+            if spellings is not None and path != printed:
+                spellings[path] = printed
     return result
 
 
@@ -1161,11 +1313,15 @@ def _git_environment() -> dict[str, str]:
 
 __all__ = [
     "IndexedSourceSnapshot",
+    "Alias",
     "Declaration",
     "LeanSourceError",
     "MANAGED_OUTPUT_SCHEMAS",
     "PACKET_SCHEMA",
     "PASSAGE_SCHEMA",
+    "PUBLICATION_MANIFEST",
+    "PUBLICATION_MANIFEST_MAX_BYTES",
+    "PUBLICATION_SCHEMA",
     "SourceIndex",
     "SourceLinker",
     "bind_project_source_snapshot",
@@ -1176,6 +1332,8 @@ __all__ = [
     "index_failure_message",
     "index_project",
     "project_source_revision",
+    "resolve_lean_root",
     "snapshot_project_sources",
     "strip_lean_comments",
+    "verify_repository_snapshot",
 ]

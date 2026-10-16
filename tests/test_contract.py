@@ -28,7 +28,14 @@ from autoform_cli.runtime import load_runtime_graph
 from autoform_cli.status import STATES, derive
 from autoform_cli.work import WorkError, assumption_contract, list_ready_work
 from tests.test_impact import _lean_toolchain_available
-from tests.test_lake_artifact_audit import _TEMPLATE, _load_helper, _run, _write
+from tests.test_lake_artifact_audit import (
+    _TEMPLATE,
+    _ends_with_the_success_line,
+    _load_helper,
+    _run,
+    _run_probe,
+    _write,
+)
 
 
 _SEEDS = range(30)
@@ -68,9 +75,11 @@ def _generate(rng: random.Random) -> list[_Spec]:
         lean = None
         if rng.random() < 0.6:
             lean = f"Gen.{name}" if rng.random() < 0.8 else f"Gen.{name}, Gen.{name}_aux"
-        # The loader requires lean: for a formalized statement or proof.
-        statements = [None] + (["formalized"] if lean else []) + (["retracted"] if lean and not mathlib else [])
+        statements = [None, "formalized"] + (["retracted"] if lean and not mathlib else [])
         statement = rng.choices(statements, weights=[35, 45, 20][: len(statements)])[0]
+        # The loader requires lean: for a formalized statement or proof.
+        if statement == "formalized" and lean is None:
+            lean = f"Gen.{name}"
         statement_dependencies: list[str] = []
         proof_dependencies: list[str] = []
         for earlier in names[:index]:
@@ -165,7 +174,10 @@ _LOAD_FAULTS = {
         {"statement": "formalized", "lean": None},
         "{name}: statement: formalized needs the lean: declaration that formalizes it",
     ),
-    "proof without statement": ({"statement": None, "proof": True}, "{name}: proof: formalized needs statement: formalized"),
+    "proof without statement": (
+        {"statement": None, "proof": True},
+        "{name}: proof: formalized needs statement: formalized",
+    ),
 }
 
 
@@ -251,7 +263,7 @@ def _check_roadmap(
     ]
     if missing:
         seen.add("work:missing-article-id")
-        with pytest.raises(WorkError, match=re.escape(", ".join(sorted(missing)) + " (plan IDs")):
+        with pytest.raises(WorkError, match=re.escape(", ".join(sorted(missing)) + " (add them with")):
             list_ready_work(project)
     else:
         frontier = list_ready_work(project)
@@ -287,6 +299,8 @@ def _check_roadmap(
         status = statuses[name]
         assert article.declarations == tuple(declaration_names(spec.lean or ""))
         assert (article.state, article.assumes) == (status.key, status.assumes)
+        if len(article.assumes) >= 2:
+            seen.add("contract:assumes-several")
         assert set(article.allowed_open_declarations) <= open_declarations, name
         allowed = {
             declaration
@@ -344,7 +358,7 @@ def test_random_roadmaps_keep_the_wiki_and_lean_contract(repo_root: Path, tmp_pa
     expected = {f"forbidden:{state.key}" for state in STATES if state.key != "conditional"}
     expected |= {f"allowed:{state.key}" for state in STATES}
     expected |= {"work:statement", "work:proof", "work:missing-article-id"}
-    expected |= {"contract:open", "contract:retracted-open", "contract:mathlib"}
+    expected |= {"contract:open", "contract:retracted-open", "contract:mathlib", "contract:assumes-several"}
     expected |= {f"invalid:{fault}" for fault in _LOAD_FAULTS}
     assert expected <= seen, sorted(expected - seen)
 
@@ -428,7 +442,7 @@ def test_the_site_never_claims_more_than_the_audit_of_a_real_build(repo_root: Pa
     assert packed.returncode == 0, packed.stdout + packed.stderr
 
     # The verify workflow's steps: read the policy, write the contract, prepare
-    # the open-statement probe, and run it in the project's Lean environment.
+    # the open-statement probe, and run it as the audit step does.
     helper = [sys.executable, str(repo_root / _TEMPLATE)]
     policy = subprocess.run([*helper, "--policy", "blueprint"], cwd=project, capture_output=True, text=True)
     assert (policy.returncode, policy.stdout) == (0, "allowed\n"), policy.stderr
@@ -442,10 +456,11 @@ def test_the_site_never_claims_more_than_the_audit_of_a_real_build(repo_root: Pa
         text=True,
     )
     assert prepared.returncode == 0, prepared.stderr
-    audited = _run(project, "lake", "env", "lean", str(probe))
+    audited = _run_probe(project, probe)
     output = audited.stdout + audited.stderr
     assert audited.returncode == 0, output
     assert "kernel trust clean except declared open statements (" in output
+    assert _ends_with_the_success_line(audited.stdout), audited.stdout
 
     reported: dict[str, set[str]] = {}
     for verdict, declaration, article in _AUDIT_LINE.findall(output):

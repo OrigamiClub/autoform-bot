@@ -1,11 +1,21 @@
 name: tests
 
 on:
+  # main tests each merged commit. scratch/ branches run CI on a branch with no
+  # pull request; every other branch runs through pull_request.
   push:
+    branches: [main, "scratch/**"]
   pull_request:
 
 permissions:
   contents: read
+
+# A newer commit on a pull request cancels the run for the older one. Each push
+# gets a group of its own: runs that share a group wait one at a time, and a
+# newer one cancels any still waiting, so runs on main would skip commits.
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -56,6 +66,11 @@ jobs:
           timeout --signal=TERM --kill-after=30s 10m \
             elan toolchain install "$(tr -d '\r\n' < tests/fixtures/skeleton-project/lean-toolchain)"
           command -v lake
+      - name: Install the library fixture's Lean toolchain
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=30s 10m \
+            elan toolchain install "$(tr -d '\r\n' < tests/fixtures/library-project/lean-toolchain)"
       - name: Build a project from the bundled creation release
         run: |
           set -euo pipefail
@@ -66,6 +81,79 @@ jobs:
           cd "$generated_project"
           timeout --signal=TERM --kill-after=30s 20m lake exe cache get
           timeout --signal=TERM --kill-after=30s 10m lake build
+      - name: Audit the created project as its workflow does
+        run: |
+          set -euo pipefail
+          # The template's helper, so the step audits this checkout's probe on a
+          # build that imports all of Mathlib.
+          helper="$PWD/autoform_cli/templates/github/autoform_audit.py"
+          archive="$RUNNER_TEMP/autoform-created-root.tgz"
+          probe="$RUNNER_TEMP/autoform-created-probe.lean"
+          output="$RUNNER_TEMP/autoform-created-probe.out"
+          cd "$RUNNER_TEMP/autoform-created-project"
+          lake pack "$archive"
+          python3 "$helper" GeneratedProject "$archive" "$probe"
+          lean_path="$(lake env printenv LEAN_PATH)"
+          AUTOFORM_AUDIT_LEAN_PATH="$lean_path" LEAN_ABORT_ON_PANIC=1 \
+            timeout --signal=TERM --kill-after=30s 15m lean "$probe" | tee "$output"
+          if ! tail -n 1 "$output" | grep -Eq '^kernel trust clean \('; then
+            echo "the audit probe did not end with its success line" >&2
+            exit 1
+          fi
+      - name: Run the impact probe against real Lean
+        run: timeout --signal=TERM --kill-after=30s 10m uv run pytest -q tests/test_impact.py
+        env:
+          AUTOFORM_REQUIRE_REAL_LEAN_TESTS: "1"
+      - name: Run the unused-hypotheses probe against real Lean
+        run: timeout --signal=TERM --kill-after=30s 10m uv run pytest -q tests/test_unused_hypotheses.py
+        env:
+          AUTOFORM_REQUIRE_REAL_LEAN_TESTS: "1"
+      - name: Run the library index generator against real Lean
+        run: timeout --signal=TERM --kill-after=30s 30m uv run pytest -q tests/test_library_generate.py
+        env:
+          AUTOFORM_REQUIRE_REAL_LIBRARY_TESTS: "1"
+      - name: Run the open-statement audit and contract against real Lean
+        run: timeout --signal=TERM --kill-after=30s 10m uv run pytest -q tests/test_lake_artifact_audit.py tests/test_contract.py
+        env:
+          AUTOFORM_REQUIRE_REAL_LEAN_TESTS: "1"
+      - name: Run the LSP lifecycle and diagnostics checks against real Lean
+        run: >-
+          timeout --signal=TERM --kill-after=30s 10m uv run pytest -q -k real_lean
+          tests/test_lsp_protocol.py tests/test_batch_diagnostics.py
+        env:
+          AUTOFORM_REQUIRE_REAL_LEAN_TESTS: "1"
+          AUTOFORM_REAL_LEAN_MATHLIB_PROJECT: ${{ runner.temp }}/autoform-created-project
+
+  real-lean-skeleton:
+    name: real Lean skeleton suite (fixture toolchain)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.1"
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install locked development environment
+        run: timeout --signal=TERM --kill-after=30s 3m uv sync --frozen --extra dev --extra repl
+      - name: Install pinned Elan
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=15s 2m curl -sSfL \
+            https://github.com/leanprover/elan/releases/download/v4.2.3/elan-x86_64-unknown-linux-gnu.tar.gz \
+            -o elan.tar.gz
+          echo "df0b2b3a439961ffcbb3985214365ffe40f49bc871df04dff268c7d8e21ca8b2  elan.tar.gz" \
+            | sha256sum --check --strict
+          tar xzf elan.tar.gz
+          ./elan-init -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Install the fixture's Lean toolchain
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=30s 10m \
+            elan toolchain install "$(tr -d '\r\n' < tests/fixtures/skeleton-project/lean-toolchain)"
+          command -v lake
       - name: Run the skeleton suite against real Lean
         run: >-
           timeout --signal=TERM --kill-after=30s 25m uv run pytest -q
@@ -73,14 +161,47 @@ jobs:
           tests/test_project_inspect.py::test_stale_inherited_mathlib_is_ignored_by_real_lake
         env:
           AUTOFORM_REQUIRE_REAL_LEAN_TESTS: "1"
-      - name: Run the impact probe against real Lean
-        run: timeout --signal=TERM --kill-after=30s 10m uv run pytest -q tests/test_impact.py
+
+  real-repl:
+    name: real REPL (fixture toolchain)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.1"
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install pinned Elan
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=15s 2m curl -sSfL \
+            https://github.com/leanprover/elan/releases/download/v4.2.3/elan-x86_64-unknown-linux-gnu.tar.gz \
+            -o elan.tar.gz
+          echo "df0b2b3a439961ffcbb3985214365ffe40f49bc871df04dff268c7d8e21ca8b2  elan.tar.gz" \
+            | sha256sum --check --strict
+          tar xzf elan.tar.gz
+          ./elan-init -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Build the REPL fixture
+        working-directory: tests/fixtures/repl-smoke
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=30s 5m \
+            elan toolchain install "$(tr -d '\r\n' < lean-toolchain)"
+          timeout --signal=TERM --kill-after=30s 8m lake build Mathlib Secret @repl/repl
+      - name: Install the minimum supported Lean toolchain
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=30s 5m \
+            elan toolchain install "$(tr -d '\r\n' < tests/fixtures/minimum-lean/lean-toolchain)"
+      - name: Install locked development environment
+        run: timeout --signal=TERM --kill-after=30s 3m uv sync --frozen --extra dev --extra repl
+      - name: Run the REPL suite against the pinned upstream REPL
+        run: timeout --signal=TERM --kill-after=30s 10m uv run pytest -q tests/test_real_repl.py
         env:
-          AUTOFORM_REQUIRE_REAL_LEAN_TESTS: "1"
-      - name: Run the open-statement audit and contract against real Lean
-        run: timeout --signal=TERM --kill-after=30s 10m uv run pytest -q tests/test_lake_artifact_audit.py tests/test_contract.py
-        env:
-          AUTOFORM_REQUIRE_REAL_LEAN_TESTS: "1"
+          AUTOFORM_RUN_REAL_REPL_TESTS: "1"
 
   windows-hardening:
     name: Windows inspection, subprocess, and publication hardening
@@ -102,6 +223,7 @@ jobs:
           tests/test_project_inspect.py
           tests/test_scaffold.py::test_scaffold_merges_autoform_rules_into_lake_gitignore
           tests/test_scaffold.py::test_windows_cross_interface_gitignore_identity_ignores_ctime_only
+          tests/test_scaffold.py::test_scaffold_refuses_case_variants_of_managed_paths
           tests/test_skeleton.py::test_bounded_command_rejects_excess_output
           tests/test_skeleton.py::test_bounded_command_caps_stdout_and_stderr_together
           tests/test_skeleton.py::test_bounded_command_rejects_invalid_utf8

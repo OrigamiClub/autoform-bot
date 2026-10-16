@@ -10,18 +10,19 @@ a second graph file that could drift from the book.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from .lean import declaration_names
+from .markdown import mask_code_and_comments
 
 
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _LINK = re.compile(r"(?<!!)\[[^\]]+\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
-_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
 _INLINE_CODE = re.compile(r"(`+).*?\1")
 ARTICLE_ID_PATTERN = re.compile(r"af_[0-9a-f]{24}\Z")
 _FRONTMATTER_KEYS = frozenset(
@@ -51,6 +52,7 @@ _FALSE = frozenset({"false", "no"})
 _STATEMENT_SECTION = "depends on"
 _PROOF_SECTION = "proof depends on"
 _SOURCES_SECTION = "sources"
+IMPLEMENTATION_NOTES_DIR = ".implementation-notes"
 
 
 class GraphValidationError(ValueError):
@@ -197,10 +199,15 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
                     open_statements = policy == "allowed"
             parsed.append(node)
 
+    if not issues:
+        issues.extend(_implementation_note_issues(blueprint, article_ids))
     if issues:
         raise GraphValidationError(issues)
 
-    parents = _article_parents(parsed)
+    parents = _article_parents(parsed, blueprint / "roadmap")
+    issues.extend(_containment_cycles(parents))
+    if issues:
+        raise GraphValidationError(issues)
     nodes: dict[str, Node] = {}
     for parsed_node in parsed:
 
@@ -263,26 +270,43 @@ def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
     if not roadmap_root.is_dir():
         return [], [f"roadmap directory does not exist: {roadmap_root}"]
 
+    symlink_issues = roadmap_symlink_issues(blueprint)
+    if symlink_issues:
+        # Containment and ids are read from paths, so one symbolic link can make two
+        # pages each other's parent; refuse the layout before anything is read.
+        return [], symlink_issues
+
     issues: list[str] = []
     sources: list[_NodeSource] = []
     roadmap_root = roadmap_root.resolve()
-    entries = sorted(roadmap_root.rglob("*"))
-    for path in entries:
-        if path.is_file() and path.name.casefold() == "readme.md" and path.name != "README.md":
-            relative = path.relative_to(roadmap_root).as_posix()
-            issues.append(
-                f"{relative}: noncanonical README filename; container pages must be named exactly README.md "
-                "for portable behavior on case-sensitive filesystems"
-            )
 
+    def unlistable(exc: OSError) -> None:
+        issues.append(f"cannot list roadmap directory {exc.filename}: {exc.strerror}")
+
+    # Unlike a glob, a walk reports each directory it cannot list.
+    entries = sorted(
+        Path(directory, name) for directory, _, files in os.walk(roadmap_root, onerror=unlistable) for name in files
+    )
+    issues.sort()  # a walk visits directories in arbitrary order
     for path in entries:
-        if not path.is_file() or path.suffix != ".md":
+        if path.suffix != ".md" and path.name.casefold() != "readme.md":
             continue
+        relative = path.relative_to(roadmap_root).as_posix()
         try:
+            if not stat.S_ISREG(path.stat().st_mode):
+                continue
+            if path.name.casefold() == "readme.md" and path.name != "README.md":
+                issues.append(
+                    f"{relative}: noncanonical README filename; container pages must be named exactly README.md "
+                    "for portable behavior on case-sensitive filesystems"
+                )
+            if path.suffix != ".md":
+                continue
             content = path.read_bytes()
             text = content.decode("utf-8")
+        except FileNotFoundError:
+            continue  # removed since the walk
         except (OSError, UnicodeError) as exc:
-            relative = path.relative_to(roadmap_root).as_posix()
             issues.append(f"{relative}: cannot read roadmap page: {exc}")
             continue
         node_id = _article_id(path, roadmap_root)
@@ -296,6 +320,20 @@ def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
 
     issues.extend(_chapter_issues(roadmap_root))
     return sources, issues
+
+
+def roadmap_symlink_issues(blueprint: Path) -> list[str]:
+    """Report the symbolic links among ``roadmap/`` and every path beneath it.
+
+    Graph loading and runtime projection share this policy, so ``autoform check``
+    accepts exactly the roadmaps the runtime does.
+    """
+
+    roadmap = blueprint / "roadmap"
+    # os.path.islink is False for a path it cannot stat, which discovery then reports; Path.is_symlink raises
+    # before 3.14.
+    paths = [roadmap] if roadmap.is_symlink() else [path for path in sorted(roadmap.rglob("*")) if os.path.islink(path)]
+    return [f"roadmap contains a symbolic link: {path.relative_to(blueprint).as_posix()}" for path in paths]
 
 
 def _chapter_issues(roadmap_root: Path) -> list[str]:
@@ -331,10 +369,10 @@ def _chapter_issues(roadmap_root: Path) -> list[str]:
         return []
     issues = []
     for chapter in chapters:
-        articles = [path for path in chapter.rglob("*.md") if path.is_file()]
+        articles = [path for path in chapter.rglob("*.md") if os.path.isfile(path)]
         if not articles:
             continue
-        if (chapter / "README.md").is_file():
+        if os.path.isfile(chapter / "README.md"):
             continue
         names = articles
         issues.append(
@@ -342,6 +380,86 @@ def _chapter_issues(roadmap_root: Path) -> list[str]:
             f"README.md, so they attach to the roadmap root instead of a chapter; "
             f"add {chapter.name}/README.md with the chapter's H1 title"
         )
+    return issues
+
+
+def _implementation_note_issues(
+    blueprint: Path, article_ids: dict[str, str]
+) -> list[str]:
+    """Validate hidden, per-article implementation notes.
+
+    Notes are keyed by durable ``article_id`` rather than roadmap paths, so an
+    article move does not orphan its handoff and independent articles never
+    share a file. The hidden directory is already omitted by old and current
+    renderers, keeping the format backward-compatible with pinned projects.
+    """
+    issues: list[str] = []
+    try:
+        aliases = [
+            path.name
+            for path in blueprint.iterdir()
+            if path.name.casefold() == IMPLEMENTATION_NOTES_DIR.casefold()
+            and path.name != IMPLEMENTATION_NOTES_DIR
+        ]
+    except OSError as error:
+        return [f"cannot inspect implementation notes: {error}"]
+    for alias in sorted(aliases):
+        issues.append(
+            f"{alias}: noncanonical implementation notes directory; "
+            f"use exactly {IMPLEMENTATION_NOTES_DIR}"
+        )
+
+    root = blueprint / IMPLEMENTATION_NOTES_DIR
+    if root.is_symlink():
+        issues.append(
+            f"{IMPLEMENTATION_NOTES_DIR}: implementation notes directory must not be a symlink"
+        )
+        return issues
+    if not root.exists():
+        return issues
+    if not root.is_dir():
+        issues.append(
+            f"{IMPLEMENTATION_NOTES_DIR}: implementation notes path must be a directory"
+        )
+        return issues
+
+    try:
+        entries = sorted(root.iterdir())
+    except OSError as error:
+        issues.append(f"{IMPLEMENTATION_NOTES_DIR}: cannot read directory: {error}")
+        return issues
+    for path in entries:
+        relative = f"{IMPLEMENTATION_NOTES_DIR}/{path.name}"
+        # Hidden entries, such as an editor's lock symlink, are never notes.
+        if path.name.startswith("."):
+            continue
+        if path.is_symlink():
+            issues.append(f"{relative}: implementation note must be a regular file")
+            continue
+        if not path.is_file():
+            issues.append(f"{relative}: implementation note must be a regular file")
+            continue
+        if path.suffix != ".md" or not ARTICLE_ID_PATTERN.fullmatch(path.stem):
+            issues.append(
+                f"{relative}: implementation note must be named <article_id>.md"
+            )
+            continue
+        if path.stem not in article_ids:
+            issues.append(
+                f"{relative}: implementation note names no roadmap article; restore the "
+                "article_id of an article that still exists, or delete the note after "
+                "moving anything still useful to a surviving article's note"
+            )
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            issues.append(f"{relative}: cannot read implementation note: {error}")
+            continue
+        if not text.replace("\ufeff", "").replace("\u200b", "").strip():
+            issues.append(
+                f"{relative}: empty implementation note; delete it instead"
+            )
     return issues
 
 
@@ -353,7 +471,7 @@ def _article_id(path: Path, roadmap_root: Path) -> str:
     return relative.with_suffix("").as_posix()
 
 
-def _article_parents(parsed: list[_ParsedNode]) -> dict[str, str | None]:
+def _article_parents(parsed: list[_ParsedNode], roadmap_root: Path) -> dict[str, str | None]:
     """Infer strict single-parent containment from nested README articles."""
     by_path = {node.path.resolve(): node.id for node in parsed}
     parents: dict[str, str | None] = {}
@@ -362,7 +480,7 @@ def _article_parents(parsed: list[_ParsedNode]) -> dict[str, str | None]:
         if node.path.name == "README.md":
             candidate = candidate.parent
         parent: str | None = None
-        while candidate != candidate.parent:
+        while _is_within(candidate, roadmap_root):
             readme = (candidate / "README.md").resolve()
             if readme in by_path:
                 parent = by_path[readme]
@@ -370,6 +488,22 @@ def _article_parents(parsed: list[_ParsedNode]) -> dict[str, str | None]:
             candidate = candidate.parent
         parents[node.id] = parent
     return parents
+
+
+def _containment_cycles(parents: dict[str, str | None]) -> list[str]:
+    """Report each cycle of containing READMEs once, before depths are computed."""
+    issues: list[str] = []
+    for node_id in sorted(parents):
+        chain = [node_id]
+        seen = {node_id}
+        parent = parents[node_id]
+        while parent is not None and parent not in seen:
+            chain.append(parent)
+            seen.add(parent)
+            parent = parents[parent]
+        if parent == node_id and node_id == min(chain):
+            issues.append(f"{node_id}: containment cycle: {' -> '.join([*chain, node_id])}")
+    return issues
 
 
 def _article_depth(node_id: str, parents: dict[str, str | None]) -> int:
@@ -392,22 +526,11 @@ def _parse_node(node_id: str, path: Path, text: str) -> tuple[_ParsedNode | None
         _SOURCES_SECTION: [],
     }
     section: str | None = None
-    fence: tuple[str, int] | None = None
-    body = _HTML_COMMENT.sub("", "\n".join(lines[body_start:]))
 
-    for line in body.splitlines():
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            marker_kind = marker[0]
-            if fence is None:
-                fence = (marker_kind, len(marker))
-            elif marker_kind == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-
+    # Fences, comments and indented code are read as the page and the audit
+    # read them, so a section a reader sees never loses its links here, and a
+    # link the page shows as code is not read as one.
+    for line in mask_code_and_comments(lines[body_start:]):
         heading = _HEADING.match(line)
         if heading:
             level = len(heading.group(1))
@@ -546,20 +669,32 @@ def _resolve_target(
     blueprint: Path,
     canonical_ids: dict[Path, str],
 ) -> tuple[str | None, str | None]:
-    split = urlsplit(target)
+    try:
+        split = urlsplit(target)
+    except ValueError:
+        return None, f"{node.id}: dependency target must be a relative Markdown path: {target!r}"
     if split.scheme or split.netloc or split.query:
         return None, f"{node.id}: dependency target must be a relative Markdown path: {target!r}"
     raw_path = unquote(split.path)
     if not raw_path:
         return None, f"{node.id}: dependency target must name a Markdown file: {target!r}"
+    if "\x00" in raw_path:
+        return None, f"{node.id}: dependency target contains an invalid path: {target!r}"
     relative = Path(raw_path)
     if relative.is_absolute() or relative.suffix != ".md":
         return None, f"{node.id}: dependency target must be a relative .md file: {target!r}"
 
-    resolved = (node.path.parent / relative).resolve()
+    try:
+        resolved = (node.path.parent / relative).resolve()
+    except (OSError, RuntimeError, ValueError):
+        # Before Python 3.13 a symlink loop raises RuntimeError here. From 3.13 resolve
+        # returns the looping path, so the lexical one stands in, and the checks below
+        # report it as on 3.13.
+        resolved = Path(os.path.abspath(node.path.parent / relative))
     if not _is_within(resolved, blueprint):
         return None, f"{node.id}: dependency target escapes the blueprint directory: {target!r}"
-    if not resolved.is_file():
+    # Before Python 3.14, `Path.is_file` raises under an unreadable directory.
+    if not os.path.isfile(resolved):
         return None, f"{node.id}: dependency target does not exist: {target!r}"
     dependency = canonical_ids.get(resolved)
     if dependency is None:

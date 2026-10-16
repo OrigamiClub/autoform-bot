@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote, urlsplit
 
-from .graph import Graph, load_graph
-from .lean import declaration_names, index_failure_message, index_project
+from .graph import Graph, load_graph, roadmap_symlink_issues
+from .lean import LeanSourceError, declaration_names, index_failure_message, index_project, resolve_lean_root
 from .status import derive, is_definition
 
 RUNTIME_SCHEMA = "autoform-runtime/v3"
@@ -246,7 +246,13 @@ def build_runtime_graph(
     project_root: str | Path,
     lean_root: str | Path | None = None,
 ) -> RuntimeGraph:
-    """Copy an already validated canonical graph into the runtime contract."""
+    """Copy an already validated canonical graph into the runtime contract.
+
+    Raises ``RuntimeProjectionError``, with a retry hint, when an article's
+    bytes no longer match the digest ``load_graph`` recorded. A hand-built
+    node without a digest is not checked; the source revision covers whatever
+    bytes its article holds when projected.
+    """
 
     project = Path(project_root).expanduser().resolve()
     blueprint = graph.blueprint_dir.resolve()
@@ -294,6 +300,14 @@ def build_runtime_graph(
         except OSError:
             issues.append(f"{node.id}: article cannot be read")
             continue
+        # The source revision hashes these bytes, so they must be the bytes the
+        # node was parsed from. A hand-built node without a digest makes no
+        # snapshot claim, and the revision covers whatever bytes are read here.
+        if node.source_sha256 is not None and hashlib.sha256(content).hexdigest() != node.source_sha256:
+            issues.append(
+                f"{node.id}: the article changed after the graph was loaded; "
+                "load the graph again, or retry after the project is idle"
+            )
         article_path = relative_project.as_posix()
         if article_path in seen_article_paths:
             issues.append(f"{node.id}: article path is duplicated")
@@ -302,12 +316,6 @@ def build_runtime_graph(
         revision_paths[node.id] = relative_blueprint.as_posix()
         article_bytes[node.id] = content
 
-        for target in node.sources:
-            if not _source_target_is_confined(node.path, target, blueprint):
-                issues.append(f"{node.id}: source target escapes the blueprint or uses an unsupported location")
-        if node.mathlib_file is not None and not _is_portable_relative_path(node.mathlib_file):
-            issues.append(f"{node.id}: mathlib file must be a portable relative path")
-
     _validate_depths(graph, issues)
     if issues:
         raise RuntimeProjectionError(issues)
@@ -315,9 +323,10 @@ def build_runtime_graph(
     statuses = derive(graph)
     lean_index = None
     if lean_root is not None:
-        root = Path(lean_root).expanduser().resolve()
-        if not root.is_dir():
-            raise RuntimeProjectionError(["Lean root does not exist or is not a directory"])
+        try:
+            root = resolve_lean_root(lean_root)
+        except LeanSourceError as error:
+            raise RuntimeProjectionError([str(error)]) from error
         try:
             lean_index = index_project(root)
         except OSError as error:
@@ -332,8 +341,6 @@ def build_runtime_graph(
         for name in declaration_names(node.lean or ""):
             declaration = lean_index.find(name) if lean_index is not None else None
             source_file = declaration.path.as_posix() if declaration is not None else None
-            if source_file is not None and not _is_portable_relative_path(source_file):
-                raise RuntimeProjectionError([f"{node.id}: Lean source file escapes the Lean root"])
             lean_targets.append(RuntimeLeanTarget(name, source_file))
         runtime_nodes.append(
             RuntimeNode(
@@ -368,11 +375,15 @@ def build_runtime_graph(
                     waiting_on=node_status.waiting_on,
                 ),
                 origin=node.origin,
-                source_targets=node.sources,
+                # Leave out a value the projection cannot represent instead of
+                # refusing the whole project.
+                source_targets=tuple(
+                    target for target in node.sources if _source_target_is_confined(node.path, target, blueprint)
+                ),
                 lean_targets=tuple(lean_targets),
                 mathlib=node.mathlib,
                 mathlib_declarations=tuple(declaration_names(node.mathlib_declaration or "")),
-                mathlib_file=node.mathlib_file.replace("\\", "/") if node.mathlib_file else None,
+                mathlib_file=_portable_mathlib_file(node.mathlib_file),
             )
         )
 
@@ -398,13 +409,9 @@ def _reject_roadmap_symlinks(blueprint: Path) -> None:
     roadmap = blueprint / "roadmap"
     if not roadmap.is_dir():
         raise RuntimeProjectionError(["roadmap directory does not exist"])
-    for path in (roadmap, *sorted(roadmap.rglob("*"))):
-        if path.is_symlink():
-            try:
-                label = path.relative_to(blueprint).as_posix()
-            except ValueError:
-                label = "roadmap"
-            raise RuntimeProjectionError([f"roadmap contains a symbolic link: {label}"])
+    symlink_issues = roadmap_symlink_issues(blueprint)
+    if symlink_issues:
+        raise RuntimeProjectionError(symlink_issues)
 
 
 def _ordered_union(first: tuple[str, ...], second: tuple[str, ...]) -> tuple[str, ...]:
@@ -445,15 +452,33 @@ def _source_target_is_confined(article: Path, target: str, blueprint: Path) -> b
     return True
 
 
-def _is_portable_relative_path(value: str) -> bool:
-    path = Path(value)
-    windows = PureWindowsPath(value)
-    return (
-        not path.is_absolute()
-        and not windows.is_absolute()
-        and ".." not in path.parts
-        and ".." not in windows.parts
-    )
+def _portable_mathlib_file(value: str | None) -> str | None:
+    # A Windows anchor covers POSIX absolute paths too, and also the
+    # drive-relative C:x and rooted \x, which are not absolute but do not name
+    # a path inside the project either.
+    windows = PureWindowsPath(value or "")
+    if not value or windows.anchor or ".." in windows.parts:
+        return None
+    return value.replace("\\", "/")
+
+
+def projection_omissions(graph: Graph) -> list[str]:
+    """Name each value work and search leave out of the projection, for check to warn about."""
+    blueprint = graph.blueprint_dir.resolve()
+    omissions = []
+    for node in graph.nodes.values():
+        for target in node.sources:
+            if not _source_target_is_confined(node.path, target, blueprint):
+                omissions.append(
+                    f"{node.id}: work and search omit this source target, which is neither an http(s) link "
+                    f"nor a path inside the blueprint: {target!r}"
+                )
+        if node.mathlib_file and _portable_mathlib_file(node.mathlib_file) is None:
+            omissions.append(
+                f"{node.id}: search reports mathlib_file as null, since it is not a portable relative path: "
+                f"{node.mathlib_file!r}"
+            )
+    return omissions
 
 
 def _validate_depths(graph: Graph, issues: list[str]) -> None:
@@ -558,5 +583,6 @@ __all__ = [
     "RuntimeStatus",
     "build_runtime_graph",
     "load_runtime_graph",
+    "projection_omissions",
     "resolve_runtime_paths",
 ]

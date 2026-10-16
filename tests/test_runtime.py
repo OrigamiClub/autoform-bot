@@ -194,6 +194,22 @@ def test_revision_tracks_exact_articles_and_is_location_independent(tmp_path: Pa
     assert changed.source_revision != first.source_revision
 
 
+def test_runtime_refuses_an_article_edited_after_graph_load(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    graph = load_graph(project / "blueprint")
+    article = project / "blueprint" / "roadmap" / "chapter" / "section" / "result.md"
+    article.write_text(article.read_text(encoding="utf-8").replace("# Result", "# Edited"), encoding="utf-8")
+
+    with pytest.raises(RuntimeProjectionError) as error:
+        build_runtime_graph(graph, project_root=project)
+
+    assert error.value.issues == (
+        "chapter/section/result: the article changed after the graph was loaded; "
+        "load the graph again, or retry after the project is idle",
+    )
+    assert load_runtime_graph(project).get("chapter/section/result").title == "Edited"  # type: ignore[union-attr]
+
+
 def test_loading_is_read_only_and_never_creates_graph_json(tmp_path: Path) -> None:
     project = _project(tmp_path)
     before = {path.relative_to(project): path.read_bytes() for path in project.rglob("*") if path.is_file()}
@@ -227,7 +243,7 @@ def test_rejects_symlinked_roadmap_content_and_ambiguous_input(tmp_path: Path) -
         resolve_runtime_paths(ambiguous)
 
 
-def test_allows_confined_parent_relative_sources_and_rejects_escapes(tmp_path: Path) -> None:
+def test_keeps_confined_parent_relative_sources_and_omits_the_rest(tmp_path: Path) -> None:
     project = _project(tmp_path)
     source = project / "blueprint" / "sources" / "paper.md"
     source.parent.mkdir(parents=True)
@@ -242,25 +258,40 @@ def test_allows_confined_parent_relative_sources_and_rejects_escapes(tmp_path: P
     runtime = load_runtime_graph(project)
     assert runtime.get("chapter/section/result").source_targets == ("../../../sources/paper.md",)  # type: ignore[union-attr]
 
-    result.write_text(text.replace("../../../sources/paper.md", "../../../../outside.md"), encoding="utf-8")
-    with pytest.raises(RuntimeProjectionError, match="source target escapes") as error:
-        load_runtime_graph(project)
-    assert str(tmp_path) not in str(error.value)
+    # The projection leaves out each target it cannot represent and keeps the
+    # rest, instead of refusing the project.
+    mixed = "\n".join(
+        f"- [source]({target})"
+        for target in ("../../../../outside.md", "../../../sources/paper.md", "mailto:author@example.org")
+    )
+    result.write_text(text.replace("- [source](../../../sources/paper.md)", mixed), encoding="utf-8")
+    node = load_runtime_graph(project).get("chapter/section/result")
+    assert node is not None and node.source_targets == ("../../../sources/paper.md",)
 
 
-def test_rejects_nonportable_authored_file_paths(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (r"Mathlib\Result.lean", "Mathlib/Result.lean"),
+        (r"..\outside.lean", None),
+        ("../outside.lean", None),
+        ("/Mathlib/Result.lean", None),
+        ("C:/Mathlib/Result.lean", None),
+        # Neither is absolute on Windows, but neither names a path inside the project.
+        (r"\Mathlib\Result.lean", None),
+        ("C:Mathlib/Result.lean", None),
+    ],
+)
+def test_projects_mathlib_file_only_as_a_portable_relative_path(
+    value: str, expected: str | None, tmp_path: Path
+) -> None:
     project = _project(tmp_path)
     result = project / "blueprint" / "roadmap" / "chapter" / "section" / "result.md"
-    text = result.read_text(encoding="utf-8").replace(
-        "mathlib_file: Mathlib/Result.lean",
-        r"mathlib_file: ..\outside.lean",
-    )
+    text = result.read_text(encoding="utf-8").replace("mathlib_file: Mathlib/Result.lean", f"mathlib_file: {value}")
     result.write_text(text, encoding="utf-8")
 
-    with pytest.raises(RuntimeProjectionError, match="mathlib file must be a portable relative path") as error:
-        load_runtime_graph(project)
-
-    assert str(tmp_path) not in str(error.value)
+    node = load_runtime_graph(project).get("chapter/section/result")
+    assert node is not None and node.mathlib_file == expected
 
 
 @pytest.mark.parametrize(

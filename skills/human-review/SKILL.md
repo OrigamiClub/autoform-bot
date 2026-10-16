@@ -15,6 +15,14 @@ existing Autoform vault and site configuration; hand missing infrastructure to
 Setup. Keep the Markdown vault as the source of truth and regenerate only
 derived review views.
 
+There is no `autoform` on `PATH` in a Lean project. Run every `autoform` and
+`autoform-visualize` command, from `<PROJECT>`, as
+`uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform` followed by its arguments
+(with `autoform-visualize` in place of `autoform` for the graph), where
+`<AUTOFORM_PLUGIN_ROOT>` is the absolute plugin root: the directory that holds
+this skill's `skills/` folder, along with `pyproject.toml` and `autoform_cli/`.
+Give a subagent that root and this prefix with its task.
+
 Regenerate the review views from `<PROJECT>`: validate the blueprint, refresh
 the Mermaid graph with `autoform-visualize` so Obsidian shows current
 dependencies, render the site source, then strict-build the site. Follow the

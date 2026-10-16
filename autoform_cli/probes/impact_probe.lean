@@ -13,10 +13,40 @@ namespace AutoformImpact
 
 def probeOutputLimit : Nat := {output_limit}
 
+/-- A name as the CLI spells it: a JSON array of components, each a string or
+a number. -/
+def nameOf (components : Json) : Except String Name := do
+  (← components.getArr?).foldlM (init := Name.anonymous) fun name component =>
+    match component with
+    | .str part => pure (name.str part)
+    | _ => name.num <$> component.getNat?
+
+/-- Names as the CLI passes them: JSON `[request, components]` pairs. A list
+literal of names would be compiled, and the code generator gives up on one
+longer than about 1,500 entries. -/
+def requestedNames (text : String) : CommandElabM (Array Name) := do
+  let decode (entry : Json) : Except String Name := entry.getArrVal? 1 >>= nameOf
+  match _root_.Lean.Json.parse text >>= (·.getArr?) >>= (·.mapM decode) with
+  | .ok names => pure names
+  | .error e => throwError ("the project module list is malformed: " ++ e)
+
+/-- The directory each `M.*` or `M.+` glob walks, with `M` and the glob, as
+JSON `[directory, components, glob]` triples, for the same reason. -/
+def globDirectories (text : String) : CommandElabM (Array (System.FilePath × Name × String)) := do
+  let decode (entry : Json) : Except String (System.FilePath × Name × String) := do
+    let directory ← entry.getArrVal? 0 >>= (·.getStr?)
+    let base ← entry.getArrVal? 1 >>= nameOf
+    let glob ← entry.getArrVal? 2 >>= (·.getStr?)
+    pure (System.FilePath.mk directory, base, glob)
+  match _root_.Lean.Json.parse text >>= (·.getArr?) >>= (·.mapM decode) with
+  | .ok directories => pure directories
+  | .error e => throwError ("the glob directory list is malformed: " ++ e)
+
 /-- Write one complete record without letting the scratch file grow past the
 CLI's output limit. The Python reader checks the limit again after exit. -/
-def emitRecord (out : IO.FS.Handle) (written : IO.Ref Nat) (record : Json) : IO Unit := do
-  let line := s!"{marker}{{record.compress}}\n"
+def emitRecord (out : IO.FS.Handle) (written : IO.Ref Nat) (marker : String)
+    (record : Json) : IO Unit := do
+  let line := s!"{{marker}}{{record.compress}}\n"
   let total := (← written.get) + line.utf8ByteSize
   if total > probeOutputLimit then
     throw <| IO.userError s!"lake env lean exceeded the {{probeOutputLimit}}-byte output limit"
@@ -109,7 +139,8 @@ end AutoformImpact
 
 set_option maxHeartbeats 0 in
 run_cmd do
-  let projectModules : Std.HashSet Name := Std.HashSet.ofList [{project_modules}]
+  let projectModules : Std.HashSet Name :=
+    Std.HashSet.ofList (← AutoformImpact.requestedNames {project_modules}).toList
   let env ← getEnv
   -- `env.header` is slow to reach from the interpreted probe, so module names
   -- are read once.
@@ -124,9 +155,60 @@ run_cmd do
   let out ← IO.FS.Handle.mk path .write
   let written ← IO.mkRef 0
   try
+    -- A root-package module the inventory missed gets no records, so what it
+    -- uses and imports would silently drop out of the scope. Lake builds every
+    -- module an `M.*` or `M.+` glob finds by this same walk of the live tree,
+    -- imported or not. This probe imports every glob module the inventory
+    -- holds, so one it did not load is one the inventory missed (even if
+    -- another srcDir holds a file of that name).
+    if {check_inventory} then
+      let artifactDir := (← IO.FS.realPath {artifact_dir}).components
+      for (dir, base, glob) in (← AutoformImpact.globDirectories {glob_directories}) do
+        if (← dir.isDir) then
+          Lean.forEachModuleInDir dir fun sub => do
+            unless (env.getModuleIdx? (base ++ sub)).isSome do
+              throwError m!"the impact probe found root-package module {{base ++ sub}} under glob {{glob}}, \
+                but loaded no captured source for it: the source inventory skips nested Git checkouts, \
+                ignored directories such as `build`, and symlinked directories"
+      for module in moduleNames do
+        unless isLocalModule module do
+          let oleanPath ← IO.FS.realPath (← findOLean module)
+          if oleanPath.components.take artifactDir.length == artifactDir then
+            throwError m!"the impact probe loaded root-package module {{module}} from {{oleanPath}}, \
+              but the captured source inventory has no such module: it skips nested Git checkouts, \
+              ignored directories such as `build`, and symlinked directories, and names a module \
+              exactly as its file is spelled, including case"
+    -- Module ownership and direct imports come from the loaded environment,
+    -- not source syntax. Emit even modules with no declarations so the
+    -- evidence is a closed graph over every loaded project module.
+    if {emit_module_evidence} then
+      let sourceSearchPath ← getSrcSearchPath
+      for module in moduleNames do
+        if isLocalModule module then
+          let some moduleIdx := env.getModuleIdx? module | continue
+          -- Not `findWithExt`, which takes the first entry with a directory
+          -- named like the module's root: srcDir "." then answers for module
+          -- `Tests` of a later srcDir whenever a `Tests` directory sits beside
+          -- the lakefile, or, on a case-insensitive file system, a `tests` one.
+          let some sourceDir ← sourceSearchPath.findM? fun dir => (modToFilePath dir module "lean").pathExists |
+            throwError m!"project module {{module}} has no source path"
+          let sourcePath ← IO.FS.realPath (modToFilePath sourceDir module "lean")
+          let oleanPath ← IO.FS.realPath (← findOLean module)
+          let directImports := env.header.moduleData[moduleIdx.toNat]!.imports.foldl
+            (fun imports imported =>
+              if isLocalModule imported.module && !imports.contains imported.module then
+                imports.push imported.module
+              else imports)
+            #[]
+          AutoformImpact.emitRecord out written "{module_marker}" <| Json.mkObj [
+            ("module", AutoformImpact.nameJson module),
+            ("source_path", Json.str sourcePath.toString),
+            ("olean_path", Json.str oleanPath.toString),
+            ("direct_local_imports", AutoformImpact.namesJson directImports)]
     for (c, info) in env.constants do
       let some module := moduleOf c | continue
       if isLocalModule module then
-        AutoformImpact.emitRecord out written (AutoformImpact.record env isLocal c info module)
+        AutoformImpact.emitRecord out written "{marker}"
+          (AutoformImpact.record env isLocal c info module)
   finally
     out.flush

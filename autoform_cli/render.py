@@ -9,24 +9,60 @@ from Markdown instead.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import html
 import json
+import os
 import re
+import secrets
 import shutil
-from collections.abc import Iterable
+import stat
+import sys
+import tempfile
+import time
+import unicodedata
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
 
 from . import graph_pages, graph_views, mermaid, status
+from ._tree_snapshot import (
+    TreeChangedError,
+    TreeSelection,
+    TreeSnapshot,
+    TreeSnapshotError,
+    _update_digest,
+    bind_directory_tree,
+    descriptor_capture_supported,
+)
 from .coverage import COVERAGE_DISPOSITIONS, CoverageSummary, load_coverage
-from .graph import Graph, Node, load_graph
-from .lean import SourceLinker, build_linker, declaration_names, index_failure_message
+from .graph import Graph, GraphValidationError, Node, _implementation_note_issues, load_graph
+from .lean import (
+    PUBLICATION_MANIFEST,
+    PUBLICATION_MANIFEST_MAX_BYTES,
+    PUBLICATION_SCHEMA,
+    IndexedSourceSnapshot,
+    LeanSourceError,
+    SourceIndex,
+    SourceLinker,
+    declaration_names,
+    detect_ref,
+    detect_repository_url,
+    index_failure_message,
+    resolve_lean_root,
+    snapshot_project_sources,
+    verify_repository_snapshot,
+)
+from .markdown import article_parts
+from .markdown import mask_fences_and_comments
 from .status import is_definition
 
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_FENCE = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})")
 _MARKDOWN_LINK = re.compile(r"(?<!!)\[(?P<label>[^\]]*)\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)")
 #: A reference-style link definition, `[label]: target "title"`. Markdown
 #: resolves `[Paper][paper]` through one of these, so a rewrite that only sees
@@ -43,7 +79,18 @@ _SKIPPED_DIRECTORIES = frozenset({".obsidian", ".trash", ".git"})
 
 #: Transcriptions of the paper being formalised. Vault material, not chapters.
 SOURCES_DIR = "sources"
-PUBLICATION_MANIFEST = "publication.json"
+#: Hidden siblings of the output: a site being built, a replaced one, or a backup.
+_STAGE_PREFIX = ".autoform-publication-"
+#: How a filesystem says it lacks an operation (an atomic exchange, a directory sync).
+_UNSUPPORTED = frozenset({errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP})
+#: Rename refusals that strerror alone would leave puzzling.
+_REFUSED_COMMITS = {
+    errno.EBUSY: "the output directory is a mount point or in use",
+    errno.EXDEV: "the output directory is on another filesystem than its parent "
+    "(a mount point or an overlay lower layer)",
+}
+#: How long a render waits for another render committing into the same parent.
+_PUBLICATION_LOCK_WAIT_SECONDS = 30.0
 #: Derived views this command rewrites; stale copies must not leak into the site.
 _GENERATED_FILES = frozenset(
     {
@@ -68,6 +115,20 @@ _LOCAL_ONLY_NAMES = frozenset(
         "task_queue.json",
     }
 )
+#: Root entries every site holds; an authored root entry differing only in case would collide.
+_GENERATED_ROOT_ENTRIES = frozenset(
+    {"SUMMARY.md", "dependencies.md", "structure.md", PUBLICATION_MANIFEST}
+    | {"assets", "dependencies", "javascripts", "stylesheets"}
+)
+#: Render reads no hidden, local-only, or root generated file. Omitted entries are
+#: still recorded, and .autoform is entered, so sensitive files are refused by name.
+_PUBLICATION_SELECTION = TreeSelection(
+    include=lambda path, _mode: not (
+        _is_hidden(path) or _is_sensitive(path) or (len(path.parts) == 1 and path.name in _GENERATED_FILES)
+    ),
+    descend=lambda path: path.parts[0].casefold() == ".autoform"
+    or not (_is_hidden(path) or _is_sensitive(path)),
+)
 
 #: How a ``declaration:`` value is announced in the statement box.
 DECLARATION_LABELS = {
@@ -90,6 +151,8 @@ STYLESHEET = "stylesheets/blueprint.css"
 MERMAID_SCRIPT = "javascripts/blueprint-mermaid.js"
 LIVE_SCRIPT = "javascripts/blueprint-live.js"
 LOGO = "assets/autoform.svg"
+#: Paths render writes at fixed places; an authored path differing only in case would collide.
+_GENERATED_PATHS = _GENERATED_ROOT_ENTRIES | {STYLESHEET, MERMAID_SCRIPT, LIVE_SCRIPT, LOGO}
 _ASSET_DIR = Path(__file__).resolve().parent / "assets"
 
 
@@ -224,6 +287,9 @@ class RenderReport:
     nodes: int = 0
     linked: int = 0
     unresolved: list[str] = field(default_factory=list)
+    unchecked: bool = False
+    """A published declaration was not looked up because the sources were not read."""
+    warnings: list[str] = field(default_factory=list)
 
 
 class PublicationError(ValueError):
@@ -241,61 +307,167 @@ def render_site(
     lean_root: str | Path | None = None,
     repository_url: str | None = None,
     ref: str | None = None,
-    clean: bool = True,
 ) -> RenderReport:
     """Write deterministic, read-only projections of the Markdown blueprint.
 
     Authored Markdown remains the only graph authority. The output joins three
     reader surfaces over it: a book, derived progress, and multiscale dependency
     maps. Publication excludes hidden and operational files, rejects symlinks,
-    and never embeds timestamps or machine-specific paths.
+    and never embeds timestamps or machine-specific paths. The blueprint and the
+    Lean sources are each read once, and every page, link and hash comes from
+    those bytes. The site is built beside the output and swapped in whole.
     """
     blueprint = Path(blueprint_dir).expanduser().resolve()
     requested_destination = Path(output_dir).expanduser()
+    if requested_destination.name in {"", ".."}:  # the swap below would rename a working directory
+        raise PublicationError(["output directory must name one ordinary directory"])
     if requested_destination.is_symlink():
         raise PublicationError(["refusing symlink output directory"])
     destination = requested_destination.resolve()
-    if _is_within(destination, blueprint) or _is_within(blueprint, destination):
+    if (
+        _is_within(destination, blueprint)
+        or _is_within(blueprint, destination)
+        or _reaches(destination, blueprint)
+    ):
         raise PublicationError(
             ["blueprint and output directories must be disjoint; refusing destructive render"]
         )
-    _validate_publication_tree(blueprint)
-
-    graph = load_graph(blueprint)
-    coverage, coverage_issues = load_coverage(blueprint)
-    if coverage_issues:
-        raise PublicationError(
-            [
-                f"coverage contract line {issue.line}: {issue.reason}"
-                if issue.line
-                else f"coverage contract: {issue.reason}"
-                for issue in coverage_issues
-            ]
-        )
-    if coverage is None:
-        raise PublicationError(["coverage contract could not be loaded"])
-    statuses = status.derive(graph)
+    recovered = _recover_backup(destination)
+    snapshot = _capture_blueprint(blueprint)
     # The repository root, not the vault's parent. A blueprint nested at
     # <repo>/docs/blueprint would otherwise be described as <repo>/blueprint,
     # and every generated permalink would 404.
-    repo_root = Path(lean_root).expanduser().resolve() if lean_root is not None else blueprint.parent
     try:
-        linker = build_linker(repo_root, repository_url=repository_url, ref=ref)
-    except OSError as error:
+        repo_root = resolve_lean_root(lean_root) if lean_root is not None else blueprint.parent
+    except LeanSourceError as error:
         raise PublicationError([index_failure_message(error)]) from error
+    # Everything below reads a private copy of the captured bytes. The copy keeps
+    # the blueprint's place in the repository, so a path below the copy's root is
+    # the repository path it had when render read the vault.
+    relative = blueprint.relative_to(repo_root) if _is_within(blueprint, repo_root) else Path("blueprint")
+    with _private_copy(snapshot, relative) as (copy_root, copy):
+        graph = _load_graph(copy, blueprint)
+        coverage, coverage_issues = load_coverage(copy)
+        if coverage_issues:
+            raise PublicationError(
+                [
+                    f"coverage contract line {issue.line}: {issue.reason}"
+                    if issue.line
+                    else f"coverage contract: {issue.reason}"
+                    for issue in coverage_issues
+                ]
+            )
+        if coverage is None:
+            raise PublicationError(["coverage contract could not be loaded"])
+        expected = _destination_state(destination)
+        # Without descriptor capture every Lean capture fails closed. The implicit
+        # root is then not read and the site has no code links; an explicit Lean
+        # root asks for links, so it still fails. Like every Lean capture, this one
+        # skips each folder holding a complete publication.json: a finished site,
+        # mkdocs' copy of one, or a replaced site kept as a backup.
+        indexed = lean_root is not None or descriptor_capture_supported()
+        try:
+            lean = (
+                snapshot_project_sources(repo_root, exclude_roots=(copy_root,))
+                if indexed
+                else IndexedSourceSnapshot(SourceIndex(repo_root, {}, ""), revision="")
+            )
+        except OSError as error:
+            hint = "" if descriptor_capture_supported() else "; run without --lean-root to publish without code links"
+            raise PublicationError([index_failure_message(error) + hint]) from error
+        repository_url = repository_url if repository_url is not None else detect_repository_url(repo_root)
+        ref = ref if ref is not None else detect_ref(repo_root)
+        sources = SOURCES_DIR in snapshot.directories
+        reasons: list[str] = []
+        blueprint_reasons: list[str] = []
+        spellings: dict[str, str] = {}
+        commit = None
+        links_blueprint = False
+        if repository_url and ref:
+            commit = verify_repository_snapshot(
+                repo_root,
+                ref,
+                [(repo_root / path, data) for path, data in lean.source_files],
+                reasons=reasons,
+                spellings=spellings,
+            )
+        # A code link depends only on the Lean bytes. A link into the blueprint also needs the blueprint's
+        # bytes in that commit, which a blueprint outside the repository's working tree never has.
+        if commit is not None and _in_working_tree(blueprint, repo_root):
+            links_blueprint = (
+                verify_repository_snapshot(
+                    repo_root,
+                    commit,
+                    [(blueprint / name, data) for name, data in snapshot.files],
+                    required_directories=[blueprint / SOURCES_DIR] if sources else [],
+                    reasons=blueprint_reasons,
+                    spellings=spellings,
+                )
+                is not None
+            )
+        # Links name the verified commit, never the requested ref. With no Lean file captured, only the
+        # blueprint check compared bytes with the commit.
+        linked = commit if lean.source_files or links_blueprint else None
+        linker = SourceLinker(
+            lean.index,
+            repository_url,
+            linked,
+            indexed=indexed,
+            links_blueprint=links_blueprint,
+            spellings=spellings,
+        )
+        source_revision = _source_revision(snapshot)
+        report = _publish(
+            destination,
+            expected,
+            lambda stage: _render_pages(
+                copy,
+                stage,
+                graph,
+                coverage,
+                linker,
+                repo_root=copy_root,
+                sources=sources,
+                source_revision=source_revision,
+                lean_source_revision=lean.revision,
+            ),
+        )
+    report.warnings[:0] = recovered
+    if repository_url and ref and commit is None:
+        report.warnings.append(
+            "repository links were omitted because the captured Lean inputs "
+            "do not match one verified local Git commit" + (f": {reasons[0]}" if reasons else "")
+        )
+    elif blueprint_reasons:
+        report.warnings.append(
+            "Markdown source links were omitted because the captured blueprint does not match "
+            f"the verified local Git commit: {blueprint_reasons[0]}"
+        )
+    return report
+
+
+def _render_pages(
+    blueprint: Path,
+    destination: Path,
+    graph: Graph,
+    coverage: CoverageSummary,
+    linker: SourceLinker,
+    *,
+    repo_root: Path,
+    sources: bool,
+    source_revision: str,
+    lean_source_revision: str,
+) -> RenderReport:
+    """Write the site into *destination* from the private copy at *blueprint*."""
+    statuses = status.derive(graph)
     numbers = _number_nodes(graph)
     used_by = _reverse_edges(graph)
-    sources_base = _sources_base(blueprint, repo_root, linker)
-
-    _prepare_destination(destination, clean=clean)
-    _write_publication_manifest(
-        destination,
-        blueprint,
-        graph,
-        linker,
-        coverage=coverage,
-        complete=False,
-    )
+    # Sources leave the site only for a directory the verified commit holds.
+    sources_base = _sources_base(blueprint, repo_root, linker) if sources else None
+    revisions = {"source_revision": source_revision, "lean_source_revision": lean_source_revision}
+    # Written first, so a Lean walk by a concurrent render skips this stage;
+    # rewritten with the file inventory once every page exists.
+    _write_publication_manifest(destination, graph, linker, coverage=coverage, **revisions)
 
     report = RenderReport(output_dir=destination)
     node_paths = {node.path.resolve(): node for node in graph.nodes.values()}
@@ -303,6 +475,20 @@ def render_site(
     # blueprint chapter carries many statements in sequence. Each keeps an
     # anchor so every cross-reference still lands on the statement itself.
     groups = _group_nodes(graph)
+    if not linker.indexed:
+        # Only the declarations a page would link are lost. A blueprint that
+        # names none publishes the same pages as a host that read the sources.
+        report.unchecked = any(
+            declaration_names(graph.nodes[node_id].lean or "")
+            for node_ids in groups.values()
+            for node_id in node_ids
+        )
+        if report.unchecked:
+            report.warnings.append(
+                "code links were skipped because this platform cannot capture Lean "
+                "sources safely (directory-descriptor traversal is unavailable); "
+                "render on Linux or macOS to link declarations"
+            )
     containers = _containers(graph)
     anchors = {
         node_id: _anchor(node_id, group)
@@ -329,8 +515,6 @@ def render_site(
     for source in sorted(blueprint.rglob("*")):
         relative = source.relative_to(blueprint)
         if _SKIPPED_DIRECTORIES.intersection(relative.parts) or _is_hidden(relative):
-            continue
-        if relative.name in _GENERATED_FILES:
             continue
         # Source notes leave the site entirely once readers can reach them in
         # the repository, so the book has one reference surface rather than two.
@@ -451,77 +635,461 @@ def render_site(
         asset = destination / relative
         asset.parent.mkdir(parents=True, exist_ok=True)
         asset.write_text(contents, encoding="utf-8")
-    _write_publication_manifest(
-        destination,
-        blueprint,
-        graph,
-        linker,
-        coverage=coverage,
-        complete=True,
-    )
+    _write_publication_manifest(destination, graph, linker, coverage=coverage, **revisions)
     return report
 
 
-def _prepare_destination(destination: Path, *, clean: bool) -> None:
-    """Create an output directory without overwriting unrelated user data."""
-    if not destination.exists():
-        destination.mkdir(parents=True)
-        return
-    if not destination.is_dir():
-        raise PublicationError(["output path exists and is not a directory"])
-    if not any(destination.iterdir()):
-        return
+def _capture_blueprint(blueprint: Path) -> TreeSnapshot:
+    """Read the blueprint once, refusing what must not be published.
 
-    manifest = destination / PUBLICATION_MANIFEST
-    publication = None
-    if not manifest.is_symlink() and manifest.is_file():
-        try:
-            publication = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            pass
-    if (
-        manifest.is_symlink()
-        or not isinstance(publication, dict)
-        or publication.get("schema") != "autoform-publication/v1"
-    ):
-        raise PublicationError(
-            [
-                "refusing to overwrite a non-Autoform output directory; "
-                "choose an empty directory or remove it explicitly"
-            ]
-        )
-    if clean:
-        shutil.rmtree(destination)
-        destination.mkdir(parents=True)
-
-
-def _validate_publication_tree(blueprint: Path) -> None:
-    """Reject inputs that could leak local state through a public artifact."""
+    Through descriptors where the host has them; elsewhere (Windows) as two
+    pathname captures that must agree.
+    """
+    try:
+        selection = _PUBLICATION_SELECTION
+        with bind_directory_tree(blueprint, selection=selection) as tree:
+            snapshot = tree.capture()
+    except TreeSnapshotError as error:
+        if not blueprint.is_dir():
+            raise PublicationError([f"blueprint directory does not exist: {blueprint}"]) from error
+        if isinstance(error, TreeChangedError):
+            raise PublicationError(["blueprint changed while it was read; retry"]) from error
+        raise PublicationError([f"blueprint could not be captured: {error}"]) from error
+    omitted, symlinks = dict(snapshot.omitted), dict(snapshot.symlinks)
+    unsupported = dict(snapshot.unsupported_entries())
+    # Published names that differ only in case or Unicode form would merge on a
+    # case-insensitive filesystem. The generated paths claim theirs first.
+    spellings = {name.casefold(): name for name in _GENERATED_PATHS}
     issues: list[str] = []
-    if not blueprint.is_dir():
-        return
-    for source in sorted(blueprint.rglob("*")):
-        relative = source.relative_to(blueprint)
-        folded_parts = {part.casefold() for part in relative.parts}
-        name = relative.name.casefold()
-        if (
-            folded_parts.intersection(_LOCAL_ONLY_NAMES)
-            or name == ".env"
-            or name.startswith(".env.")
-            or name.endswith((".key", ".log", ".pem"))
-        ):
-            issues.append(f"refusing local or sensitive publication input: {relative.as_posix()}")
+    for raw in sorted({*snapshot.directories, *dict(snapshot.files), *unsupported, *omitted} - {""}):
+        relative = PurePosixPath(raw)
+        folded = "/".join(unicodedata.normalize("NFC", part).casefold() for part in relative.parts)
+        if _is_sensitive(relative):
+            issues.append(f"refusing local or sensitive publication input: {raw}")
+        elif raw in omitted:
             continue
-        if _is_hidden(relative):
+        elif raw in symlinks:
+            issues.append(f"refusing symlink in blueprint publication: {raw}")
+        elif raw in unsupported:
+            issues.append(f"refusing non-regular blueprint publication input: {raw}: {unsupported[raw]}")
+        elif (prior := spellings.setdefault(folded, raw)) == raw:
             continue
-        if source.is_symlink():
-            issues.append(f"refusing symlink in blueprint publication: {relative.as_posix()}")
+        elif prior in _GENERATED_PATHS:
+            issues.append(
+                f"refusing blueprint path {raw}: it differs only in case from the generated "
+                f"{prior}, and the two would collide; rename it"
+            )
+        else:
+            issues.append(
+                f"refusing blueprint paths {prior} and {raw}: they differ only in case or Unicode "
+                "form, and the two would collide; rename one"
+            )
     if issues:
         raise PublicationError(issues)
+    return snapshot
 
 
-def _is_hidden(relative: Path) -> bool:
+def _is_sensitive(relative: PurePosixPath) -> bool:
+    name = relative.name.casefold()
+    return bool(
+        {part.casefold() for part in relative.parts} & _LOCAL_ONLY_NAMES
+        or name == ".env"
+        or name.startswith(".env.")
+        or name.endswith((".key", ".log", ".pem"))
+    )
+
+
+def _is_hidden(relative: Path | PurePosixPath) -> bool:
     return any(part.startswith(".") for part in relative.parts)
+
+
+@contextmanager
+def _private_copy(
+    snapshot: TreeSnapshot, relative: Path = Path("blueprint"), prefix: str = ""
+) -> Iterator[tuple[Path, Path]]:
+    """Write one captured generation into a private directory for main's path-based readers.
+
+    Nothing else writes there, so every later read, by the loaders and by the
+    renderer, sees exactly the captured bytes. Yields the directory and the copy
+    at *relative* below it. Files are written under the umask, so published
+    copies of them get the modes plain writes would.
+    """
+    with tempfile.TemporaryDirectory(prefix="autoform-blueprint-") as scratch:
+        root = Path(scratch).resolve()
+        copy = root / relative
+        try:
+            for name in snapshot.directories:
+                (copy / name).mkdir(parents=True, exist_ok=True)
+            for name, data in snapshot.files:
+                if name.startswith(prefix):
+                    (copy / name).write_bytes(data)
+        except OSError as error:
+            message = f"could not copy the blueprint into {root}: {error.strerror or error}"
+            raise PublicationError([message]) from error
+        yield root, copy
+
+
+def _load_graph(copy: Path, blueprint: Path) -> Graph:
+    """Load the copy's graph, then check the vault's implementation notes as ``load_graph`` would.
+
+    The notes are hidden, so the copy lacks them. Nothing is published or hashed
+    from them, so reading them in place changes no output.
+    """
+    try:
+        graph = load_graph(copy)
+    except GraphValidationError as error:
+        issues = [issue.replace(str(copy), str(blueprint)) for issue in error.issues]
+        raise GraphValidationError(issues) from None
+    article_ids = {node.article_id: node.id for node in graph.nodes.values() if node.article_id is not None}
+    if issues := _implementation_note_issues(blueprint, article_ids):
+        raise GraphValidationError(issues)
+    return graph
+
+
+def load_publication_source(blueprint_dir: str | Path) -> tuple[str, Graph]:
+    """Read the blueprint once; return its publication revision and the graph of those bytes."""
+    blueprint = Path(blueprint_dir).expanduser().resolve()
+    snapshot = _capture_blueprint(blueprint)
+    with _private_copy(snapshot, prefix="roadmap/") as (_root, copy):  # the graph reads nothing else
+        return _source_revision(snapshot), _load_graph(copy, blueprint)
+
+
+#: An output render may replace: its identity and its files' digests (none for an empty one).
+_State = tuple[tuple[int, int], dict[str, str]]
+
+
+def _is_os_metadata(name: str) -> bool:
+    base = PurePosixPath(name).name
+    return base == ".DS_Store" or base.startswith("._")
+
+
+def _destination_state(path: Path) -> _State | None:
+    """The state of an empty directory or an exact Autoform site at *path*.
+
+    ``None`` means nothing is there. Anything render does not own is refused: a
+    symlink, a file, a legacy or foreign directory, or a site whose files no
+    longer match its manifest. macOS metadata files (Finder's ``.DS_Store`` and
+    the ``._*`` files it writes on non-APFS volumes) are disposable and leave
+    with the directory that holds them.
+    """
+    try:
+        metadata = os.lstat(path)
+        empty = stat.S_ISDIR(metadata.st_mode) and all(
+            _is_os_metadata(name) and stat.S_ISREG(os.lstat(path / name).st_mode) for name in os.listdir(path)
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise PublicationError([f"could not inspect {path}: {error.strerror or error}"]) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise PublicationError(["refusing symlink output directory"])
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise PublicationError(["output path exists and is not a directory"])
+    identity = (metadata.st_dev, metadata.st_ino)
+    if empty:
+        return identity, {}
+    manifest = None
+    try:  # bounded, and read before anything below it
+        if stat.S_ISREG(os.lstat(path / PUBLICATION_MANIFEST).st_mode):
+            with open(path / PUBLICATION_MANIFEST, "rb") as handle:
+                data = handle.read(PUBLICATION_MANIFEST_MAX_BYTES + 1)
+            manifest = json.loads(data) if len(data) <= PUBLICATION_MANIFEST_MAX_BYTES else None
+    except (OSError, ValueError, RecursionError):
+        pass
+    if isinstance(manifest, dict) and manifest.get("schema") == "autoform-publication/v1":
+        raise PublicationError(
+            [
+                f"refusing to replace the legacy autoform-publication/v1 site at {path}: it has no file "
+                "inventory to check before deleting it; delete it once by hand and render again"
+            ]
+        )
+    if not isinstance(manifest, dict) or manifest.get("schema") != PUBLICATION_SCHEMA:
+        raise PublicationError(
+            [
+                "refusing to overwrite a non-Autoform output directory or legacy "
+                "publication; choose an empty directory or remove it explicitly"
+            ]
+        )
+    if manifest.get("complete") is not True:
+        raise PublicationError(["refusing to overwrite an incomplete Autoform publication"])
+    expected = manifest.get("files")
+    if not isinstance(expected, dict):
+        raise PublicationError(["publication manifest has no valid file inventory"])
+    expected = {name: digest for name, digest in expected.items() if not _is_os_metadata(name)}
+    try:
+        with bind_directory_tree(path, expected_identity=identity) as tree:
+            snapshot = tree.capture()
+    except TreeSnapshotError as error:
+        raise PublicationError([f"could not inspect the output directory: {error}"]) from error
+    files = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in snapshot.files
+        if name != PUBLICATION_MANIFEST and not _is_os_metadata(name)
+    }
+    names = {*files, *dict(snapshot.symlinks), *dict(snapshot.special)}
+    if names != expected.keys():
+        untracked = ", ".join(sorted(names ^ expected.keys()))
+        raise PublicationError(
+            [f"refusing to overwrite an output directory with untracked or missing files: {untracked}"]
+        )
+    if sorted(name for name in snapshot.directories if name) != manifest.get("directories"):
+        raise PublicationError(
+            ["refusing to overwrite an output directory with untracked or missing directories"]
+        )
+    if files != expected:
+        raise PublicationError(["refusing to overwrite a modified Autoform publication"])
+    return identity, files
+
+
+def _publish(
+    destination: Path, expected: _State | None, render: Callable[[Path], RenderReport]
+) -> RenderReport:
+    """Render into a hidden sibling of *destination*, then swap it into place.
+
+    The previous site is deleted only once it is proved to be the exact site
+    inspected before rendering; any other outcome keeps it.
+    """
+    stage = destination.with_name(f"{_STAGE_PREFIX}{secrets.token_hex(8)}")
+    backup = _backup(destination)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(stage)  # the umask decides published modes
+    except OSError as error:
+        raise PublicationError(
+            [
+                f"could not create a publication stage in {destination.parent}: {error.strerror or error}; "
+                "render needs write access to the output directory's parent"
+            ]
+        ) from error
+    staged = _identity(stage)
+    try:
+        try:
+            report = render(stage)
+            for path in (*stage.rglob("*"), stage):
+                _fsync(path)
+        except OSError as error:
+            raise PublicationError([f"could not write the site: {error}; output was not changed"]) from error
+        with _locked_parent(destination.parent):
+            if _destination_state(destination) != expected:
+                unchanged = "output was not changed" if expected is None else "previous site was preserved"
+                raise PublicationError([f"output directory changed during publication; {unchanged}"])
+            try:
+                _commit(stage, destination, backup, replace=expected is not None)
+                with suppress(PermissionError):  # nor can such a parent be opened to sync
+                    _fsync(destination.parent)
+            except OSError as error:
+                if _identity(stage) == staged and not os.path.lexists(backup):  # nothing moved
+                    reason = _REFUSED_COMMITS.get(error.errno, error.strerror or str(error))
+                    message = f"could not publish {destination}: {reason}; output was not changed"
+                    raise PublicationError([message]) from error
+                kept = next((path for path in (backup, stage) if os.path.lexists(path)), None)
+                message = f"publishing {destination} may be incomplete: {error.strerror or error}"
+                kept_note = f", and {kept} may hold the previous site" if kept else ""
+                raise PublicationError([f"{message}; nothing was deleted{kept_note}"]) from error
+        if expected is not None:  # the replaced site now sits at the stage's name
+            report.warnings.extend(_retire(stage, expected))
+        report.output_dir = destination
+        return report
+    finally:
+        if _identity(stage) == staged:  # still the unpublished stage
+            with suppress(OSError):
+                _remove_tree(stage)
+
+
+@contextmanager
+def _locked_parent(parent: Path) -> Iterator[None]:
+    """Hold the output parent's lock, waiting while another render commits beside this one.
+
+    A filesystem without advisory locks (NFS without lockd) or a host without
+    them (Windows) proceeds unlocked; the commit still re-checks the output it
+    replaces.
+    """
+    if os.name == "nt":
+        yield
+        return
+    import fcntl
+
+    try:
+        descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    except PermissionError:  # a parent the user may write but not read cannot hold the lock
+        descriptor = None
+    except OSError as error:
+        message = f"could not open the output parent {parent}: {error.strerror or error}"
+        raise PublicationError([message]) from error
+    if descriptor is None:
+        yield
+        return
+    try:
+        deadline = time.monotonic() + _PUBLICATION_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as error:
+                if time.monotonic() >= deadline:
+                    raise PublicationError(
+                        [
+                            f"another process kept the output parent {parent} locked for "
+                            f"{_PUBLICATION_LOCK_WAIT_SECONDS:g} seconds; output was not changed; retry"
+                        ]
+                    ) from error
+                time.sleep(0.05)
+            except OSError:
+                break
+        yield
+    finally:
+        os.close(descriptor)  # releases the lock
+
+
+def _commit(stage: Path, destination: Path, backup: Path, *, replace: bool) -> None:
+    """Move *stage* to *destination*; a replaced site ends up at *stage*'s name.
+
+    One atomic exchange where the filesystem has it. Elsewhere (NFS, SMB, 9p,
+    exFAT, ...) the old site moves to *backup* first, and the next render moves
+    it back if this one dies before the second rename.
+    """
+    if not replace:
+        os.rename(stage, destination)  # atomic; refuses a non-empty directory and a file
+        return
+    try:
+        _exchange(stage, destination)
+        return
+    except OSError as error:
+        if error.errno not in _UNSUPPORTED:
+            raise
+    os.rename(destination, backup)
+    try:
+        os.rename(stage, destination)
+    except BaseException:
+        with suppress(OSError):  # after a Ctrl-C that landed past the install, the new site stays
+            os.rename(backup, destination)
+        raise
+    os.rename(backup, stage)  # no backup outlives the lock
+
+
+def _exchange(first: Path, second: Path) -> None:
+    """Swap two names in one step: RENAME_SWAP on macOS, RENAME_EXCHANGE on Linux."""
+    if os.name == "nt":
+        raise OSError(errno.ENOSYS, "atomic exchange is unavailable", str(second))
+    library = ctypes.CDLL(None, use_errno=True)
+    first_bytes, second_bytes = os.fsencode(first), os.fsencode(second)
+    try:
+        if sys.platform == "darwin":
+            result = library.renamex_np(first_bytes, second_bytes, 0x00000002)
+        else:
+            result = library.renameat2(-100, first_bytes, -100, second_bytes, 2)
+    except AttributeError:  # a C library without renameat2 (musl, glibc before 2.28)
+        raise OSError(errno.ENOSYS, "atomic exchange is unavailable", str(second)) from None
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(second))
+
+
+def _backup(destination: Path) -> Path:
+    return destination.with_name(f"{_STAGE_PREFIX}backup-{destination.name}")
+
+
+def _recover_backup(destination: Path) -> list[str]:
+    """Finish a two-rename replacement that a killed render left half done.
+
+    Beside a missing or empty output the backup is the site, so it goes back;
+    beside an exact site it is the replaced one, so it goes. Anything else is
+    left for the user. Returns warnings for the report.
+    """
+    backup = _backup(destination)
+    if not os.path.lexists(backup):
+        return []
+    with _locked_parent(destination.parent):
+        try:
+            state = _destination_state(destination)
+            if state is None or not state[1]:
+                os.rename(backup, destination)  # also replaces an empty directory
+                return []
+            replaced = _destination_state(backup)
+            if replaced is None:
+                return []
+            retired = destination.with_name(f"{_STAGE_PREFIX}{secrets.token_hex(8)}")
+            os.rename(backup, retired)
+        except (OSError, PublicationError) as error:
+            raise PublicationError(
+                [f"could not recover the previous site at {backup}: {error}; restore or remove it by hand"]
+            ) from error
+    return _retire(retired, replaced)
+
+
+def _retire(site: Path, expected: _State) -> list[str]:
+    """Delete a replaced site that still equals *expected*; otherwise say where it is."""
+    try:
+        unchanged = _destination_state(site) == expected
+    except (OSError, PublicationError):
+        unchanged = False
+    if not unchanged:
+        return [f"the previous site was kept at {site}: it changed during the commit"]
+    try:
+        _remove_tree(site)
+    except OSError as error:
+        reason = error.strerror or error
+        return [f"the previous site at {site} was only partly deleted: {reason}; remove the rest by hand"]
+    return []
+
+
+def _identity(path: Path) -> tuple[int, int] | None:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return None
+    return metadata.st_dev, metadata.st_ino
+
+
+def _fsync(path: Path) -> None:
+    """Flush one file or directory; some network filesystems cannot sync a directory.
+
+    Windows cannot open a directory to sync it, and flushes only a writable handle.
+    """
+    if os.name == "nt":
+        if path.is_file():
+            with open(path, "r+b") as handle:
+                os.fsync(handle.fileno())
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        if error.errno not in _UNSUPPORTED or not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def _remove_tree(path: Path) -> None:
+    """Delete a site or stage, its ``publication.json`` last.
+
+    Until then a leftover of an interrupted deletion still carries the marker
+    that keeps Lean walks out of it. The root itself goes with rmdir, so a file
+    saved into it meanwhile stops the deletion instead of being lost. An entry
+    already gone is skipped: on a volume without native extended attributes,
+    macOS deletes ``._X`` along with ``X``.
+    """
+    with os.scandir(path) as entries:
+        children = [entry for entry in entries if entry.name != PUBLICATION_MANIFEST]
+    for child in children:
+        if not child.is_dir(follow_symlinks=False):
+            with suppress(FileNotFoundError):
+                os.unlink(child.path)
+        elif sys.version_info >= (3, 12):
+            shutil.rmtree(child.path, onexc=_skip_missing)
+        else:
+            shutil.rmtree(child.path, onerror=_skip_missing)
+    with suppress(FileNotFoundError):  # a stage that failed early has none
+        os.unlink(path / PUBLICATION_MANIFEST)
+    os.rmdir(path)
+
+
+def _skip_missing(_function: object, _path: str, error: BaseException | tuple) -> None:
+    """An rmtree error handler (``onexc``, or ``onerror``'s exc_info) that skips vanished entries."""
+    exception = error[1] if isinstance(error, tuple) else error
+    if not isinstance(exception, FileNotFoundError):
+        raise exception
 
 
 def _sources_base(blueprint: Path, repo_root: Path, linker: SourceLinker) -> "_SourceBase | None":
@@ -534,10 +1102,11 @@ def _sources_base(blueprint: Path, repo_root: Path, linker: SourceLinker) -> "_S
     They stay in the vault and the site links out to them instead.
 
     Returns ``None`` when there are no repository coordinates to build a link
-    from. The pages are then published as before, because a site with no
-    sources and no way to reach them is worse than a redundant page.
+    from, or the blueprint's files are not in the linked commit. The pages are
+    then published as before, because a site with no sources and no way to
+    reach them is worse than a redundant page.
     """
-    if not linker.repository_url or not linker.ref:
+    if not linker.repository_url or not linker.ref or not linker.links_blueprint:
         return None
     try:
         relative = (blueprint / SOURCES_DIR).resolve().relative_to(repo_root).as_posix()
@@ -545,7 +1114,8 @@ def _sources_base(blueprint: Path, repo_root: Path, linker: SourceLinker) -> "_S
         # The vault is outside the repository being linked, so no blob URL
         # describes it. Better no link than one that 404s.
         return None
-    return _SourceBase(linker.repository_url, linker.ref, relative)
+    spellings = {unicodedata.normalize("NFC", path): committed for path, committed in linker.spellings.items()}
+    return _SourceBase(linker.repository_url, linker.ref, relative, spellings)
 
 
 @dataclass(frozen=True, slots=True)
@@ -562,10 +1132,13 @@ class _SourceBase:
     repository_url: str
     ref: str
     relative: str
+    spellings: Mapping[str, str] = field(default_factory=dict)
+    """Committed paths keyed by NFC form, since a link spells a note however its author typed it."""
 
     def href(self, tail: tuple[str, ...]) -> str:
         verb = "blob" if tail else "tree"
         path = "/".join((self.relative, *tail))
+        path = self.spellings.get(unicodedata.normalize("NFC", path), path)
         return f"{self.repository_url}/{verb}/{self.ref}/{quote(path, safe='/')}"
 
 
@@ -574,42 +1147,34 @@ def _source_href(sources_base: _SourceBase, tail: tuple[str, ...]) -> str:
     return sources_base.href(tail)
 
 
-def _published_source_files(blueprint: Path):
-    """Yield the regular authored inputs that contribute to the static site."""
-    for source in sorted(blueprint.rglob("*")):
-        relative = source.relative_to(blueprint)
-        if _SKIPPED_DIRECTORIES.intersection(relative.parts) or _is_hidden(relative):
-            continue
-        if relative.name in _GENERATED_FILES or not source.is_file():
-            continue
-        yield source, relative
-
-
-def _source_revision(blueprint: Path) -> str:
-    digest = hashlib.sha256(b"autoform-markdown-publication/v1\0")
-    for source, relative in _published_source_files(blueprint):
-        digest.update(relative.as_posix().encode("utf-8") + b"\0")
-        digest.update(source.read_bytes() + b"\0")
+def _source_revision(snapshot: TreeSnapshot) -> str:
+    """Hash every captured directory and file, each field length-framed."""
+    digest = hashlib.sha256(b"autoform-markdown-publication/v2\0")
+    for relative in sorted(relative or "." for relative in snapshot.directories):
+        _update_digest(digest, b"directory", relative, b"")
+    for relative, data in sorted(snapshot.files):
+        _update_digest(digest, b"file", relative, data)
     return digest.hexdigest()
 
 
 def publication_source_revision(blueprint_dir: str | Path) -> str:
     """Return the deterministic source hash stored in ``publication.json``."""
 
-    return _source_revision(Path(blueprint_dir).expanduser().resolve())
+    return _source_revision(_capture_blueprint(Path(blueprint_dir).expanduser().resolve()))
 
 
 def _write_publication_manifest(
     destination: Path,
-    blueprint: Path,
     graph: Graph,
     linker: SourceLinker,
     *,
     coverage: CoverageSummary,
-    complete: bool,
+    source_revision: str,
+    lean_source_revision: str,
 ) -> None:
+    paths = sorted(path.relative_to(destination).as_posix() for path in destination.rglob("*"))
     manifest = {
-        "complete": complete,
+        "complete": True,
         "coverage": {
             "complete": coverage.complete,
             "counts": coverage.counts,
@@ -617,18 +1182,37 @@ def _write_publication_manifest(
             "source_path": coverage.source_path,
             "source_sha256": coverage.source_sha256,
         },
-        "schema": "autoform-publication/v1",
+        "directories": [path for path in paths if (destination / path).is_dir()],
+        "files": {
+            path: hashlib.sha256((destination / path).read_bytes()).hexdigest()
+            for path in paths
+            if path != PUBLICATION_MANIFEST and (destination / path).is_file()
+        },
+        "schema": PUBLICATION_SCHEMA,
         "source": "blueprint/roadmap Markdown",
-        "source_revision": publication_source_revision(blueprint),
+        "source_revision": source_revision,
         "git_ref": linker.ref,
+        "lean_source_revision": lean_source_revision,
         "nodes": len(graph.nodes),
         "dependencies": graph.edge_count,
         "views": ["book", "progress", "project", "chapter", "focus", "full"],
     }
-    (destination / PUBLICATION_MANIFEST).write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if len(encoded) > PUBLICATION_MANIFEST_MAX_BYTES:  # the next render could not read it
+        raise PublicationError(
+            [f"generated publication manifest exceeds max_file_bytes={PUBLICATION_MANIFEST_MAX_BYTES}"]
+        )
+    # Replaced, never truncated in place: a Lean capture that read an empty
+    # manifest would index the stage's copies.
+    temporary = destination / f".{PUBLICATION_MANIFEST}.{secrets.token_hex(8)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(temporary, flags, 0o666)  # the mode write_bytes gives
+    try:
+        with open(descriptor, "wb") as output:
+            output.write(encoded)
+        os.replace(temporary, destination / PUBLICATION_MANIFEST)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _group_nodes(graph: Graph) -> dict[str, list[str]]:
@@ -904,8 +1488,6 @@ def _render_structure_page(
 
     def keep(relative: Path) -> bool:
         if _SKIPPED_DIRECTORIES.intersection(relative.parts) or _is_hidden(relative):
-            return False
-        if relative.name in _GENERATED_FILES:
             return False
         return not (sources_base is not None and relative.parts[:1] == (SOURCES_DIR,))
 
@@ -1312,7 +1894,7 @@ def _render_overview_summary(
 
 
 def _first_h1(text: str) -> str | None:
-    for line in text.splitlines():
+    for line in mask_fences_and_comments(text.splitlines()):
         heading = _HEADING.match(line)
         if heading is not None and len(heading.group(1)) == 1:
             return heading.group(2).strip()
@@ -1331,8 +1913,9 @@ def _document_body(text: str) -> str:
 
     kept: list[str] = []
     dropped_title = False
-    for line in lines[start:]:
-        heading = _HEADING.match(line)
+    source_lines = lines[start:]
+    for line, visible in zip(source_lines, mask_fences_and_comments(source_lines)):
+        heading = _HEADING.match(visible)
         if heading is not None and len(heading.group(1)) == 1 and not dropped_title:
             dropped_title = True
             continue
@@ -1353,7 +1936,7 @@ def _anchored_links(
     *,
     extension: str = ".html",
     hrefs: dict[Path, str] | None = None,
-) -> dict[str, str]:
+) -> Mapping[str, str]:
     """Link every node to its statement on the published chapter page.
 
     Use ``.md`` for links MkDocs will parse -- it validates and rewrites those
@@ -1362,28 +1945,54 @@ def _anchored_links(
     and extension can share *hrefs*, so each target page is linked once across
     all of them.
     """
-    resolved_page = page.resolve()
-    # Many nodes share a chapter page, and resolving a path walks the disk, so
-    # each target page is linked once. The current page is cached as "" and
-    # links as a bare fragment.
-    if hrefs is None:
-        hrefs = {}
-    links: dict[str, str] = {}
-    for node_id, (target, anchor) in targets.items():
-        href = hrefs.get(target)
+    return _PageLinks(targets, page, extension, {} if hrefs is None else hrefs)
+
+
+class _PageLinks(Mapping[str, str]):
+    """The links from one page to every node, each built when first read.
+
+    A page names a few nodes but *targets* holds the whole graph, and a site
+    has a page per node, so building every link up front made rendering
+    quadratic in the size of the graph.
+    """
+
+    def __init__(self, targets: dict[str, tuple[Path, str]], page: Path, extension: str, hrefs: dict[Path, str]):
+        self._targets = targets
+        self._page = page
+        self._resolved_page = page.resolve()
+        self._extension = extension
+        self._hrefs = hrefs
+        self._links: dict[str, str] = {}
+
+    def __getitem__(self, node_id: str) -> str:
+        link = self._links.get(node_id)
+        if link is not None:
+            return link
+        target, anchor = self._targets[node_id]
+        # Many nodes share a chapter page, and resolving a path walks the disk,
+        # so each target page is linked once. The current page is cached as ""
+        # and links as a bare fragment.
+        href = self._hrefs.get(target)
         if href is None:
-            if target.resolve() == resolved_page:
+            if target.resolve() == self._resolved_page:
                 href = ""
             else:
-                href = mermaid.relative_link(target, page, extension)
-                if extension == ".html":
+                href = mermaid.relative_link(target, self._page, self._extension)
+                if self._extension == ".html":
                     href = _as_published(href)
-            hrefs[target] = href
+            self._hrefs[target] = href
         if href:
-            links[node_id] = f"{href}#{anchor}" if anchor else href
+            link = f"{href}#{anchor}" if anchor else href
         else:
-            links[node_id] = f"#{anchor}" if anchor else "#"
-    return links
+            link = f"#{anchor}" if anchor else "#"
+        self._links[node_id] = link
+        return link
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._targets)
+
+    def __len__(self) -> int:
+        return len(self._targets)
 
 
 def _as_published(href: str) -> str:
@@ -1416,6 +2025,10 @@ def _rewrite_links(
     of its own directory onto the chapter page, so its remaining relative links
     have to be recomputed from there. And source notes are not published at
     all when *sources_base* says where to reach them in the repository.
+
+    The site holds only the blueprint, so an inline link to a file outside it,
+    such as a source note's evidence link to a Lean file, keeps its text and
+    loses its target instead of dangling.
     """
     # Most pages name a few nodes, so each node link is built where it is used.
     # A coverage page can name most of the graph, so one cache serves the whole
@@ -1436,7 +2049,8 @@ def _rewrite_links(
                 href = f"{'' if href == '#' else href}#{fragment}"
             return href
         if not _is_within(candidate, blueprint):
-            return None
+            # Nothing outside the blueprint is published: "" keeps only the text.
+            return ""
         relative = candidate.relative_to(blueprint)
         if sources_base is not None and relative.parts[:1] == (SOURCES_DIR,):
             return f"{_source_href(sources_base, relative.parts[1:])}{separator}{fragment}"
@@ -1445,7 +2059,9 @@ def _rewrite_links(
 
     def replace(match: re.Match[str]) -> str:
         href = moved_target(match.group("target"))
-        return match.group(0) if href is None else f"[{match.group('label')}]({href})"
+        if href is None:
+            return match.group(0)
+        return f"[{match.group('label')}]({href})" if href else match.group("label")
 
     def rewrite(line: str) -> str:
         # A reference definition carries the destination for every `[x][label]`
@@ -1454,7 +2070,7 @@ def _rewrite_links(
         definition = _LINK_DEFINITION.match(line)
         if definition is not None:
             href = moved_target(definition.group("target"))
-            if href is not None:
+            if href:
                 indent, label = definition.group("indent"), definition.group("label")
                 return f"{indent}[{label}]: {href}{definition.group('rest') or ''}"
             return line
@@ -1469,6 +2085,37 @@ def _is_within(path: Path, directory: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _in_working_tree(path: Path, root: Path) -> bool:
+    """Whether the repository at *root* can track *path*: below it, and not in a checkout nested there."""
+    if not _is_within(path, root):
+        return False
+    while path != root:
+        if (path / ".git").exists():  # a submodule or a separate clone
+            return False
+        path = path.parent
+    return True
+
+
+def _reaches(path: Path, directory: Path) -> bool:
+    """Whether *path* lies inside *directory* under another spelling.
+
+    A case- or normalization-insensitive filesystem opens ``BLUEPRINT/site``
+    inside ``blueprint`` although the two paths differ, so compare identities.
+    """
+    try:
+        target = os.stat(directory)
+    except OSError:
+        return False
+    for candidate in (path, *path.parents):
+        try:
+            metadata = os.stat(candidate)
+        except OSError:
+            continue
+        if (metadata.st_dev, metadata.st_ino) == (target.st_dev, target.st_ino):
+            return True
+    return False
 
 
 def _outside_fences(text: str, transform) -> str:
@@ -1635,7 +2282,7 @@ def _render_environment(
     numbers: dict[str, str],
     used_by: dict[str, list[str]],
     linker: SourceLinker,
-    links: dict[str, str],
+    links: Mapping[str, str],
     page: Path,
     blueprint: Path,
     repo_root: Path,
@@ -1738,7 +2385,10 @@ def _lean_presentation(
         url = linker.url(name)
         location = linker.location(name)
         code = f"<code>{html.escape(name)}</code>"
-        if url:
+        if not linker.indexed:
+            # The sources were not read, so "not found" would be false.
+            fallback.append(code)
+        elif url:
             label = html.escape(f"View {name} in Lean source", quote=True)
             icons.append(
                 f'<a class="bp-code-link" href="{html.escape(url, quote=True)}" '
@@ -1772,13 +2422,14 @@ def _vault_source_link(node: Node, *, repo_root: Path, linker) -> str:
     The graph view and the published statement are both derived. This is the
     file a reader edits, so it is worth one click from the statement itself.
     """
-    if not linker.repository_url or not linker.ref:
+    if not linker.repository_url or not linker.ref or not linker.links_blueprint:
         return ""
     try:
         relative = node.path.resolve().relative_to(repo_root).as_posix()
     except ValueError:
         return ""
-    href = f"{linker.repository_url}/blob/{linker.ref}/{relative}"
+    relative = linker.spellings.get(relative, relative)
+    href = f"{linker.repository_url}/blob/{linker.ref}/{quote(relative, safe='/')}"
     label = html.escape(f"Edit the Markdown source for {node.title}", quote=True)
     icon = (
         '<svg class="bp-source-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
@@ -1815,7 +2466,7 @@ def _dependency_disclosure(
     statuses: dict[str, status.NodeStatus],
     numbers: dict[str, str],
     used_by: dict[str, list[str]],
-    links: dict[str, str],
+    links: Mapping[str, str],
 ) -> str:
     """Hide DAG relations behind a native, keyboard-accessible disclosure."""
     rows: list[tuple[str, str]] = []
@@ -1843,7 +2494,7 @@ def _node_references(
     graph: Graph,
     statuses: dict[str, status.NodeStatus],
     numbers: dict[str, str],
-    links: dict[str, str],
+    links: Mapping[str, str],
 ) -> str:
     """Link each node by number and title, coloured by its derived state."""
     rendered = []
@@ -1885,26 +2536,19 @@ def _split_body(text: str) -> tuple[str, str]:
 
     Only the statement belongs inside the theorem environment; ``## Sources``
     and friends are page material that sits after it, the way a blueprint sets
-    a statement apart from the prose around it.
+    a statement apart from the prose around it. The dependency sections are
+    dropped: the DAG is re-presented in the metadata line, so repeating the raw
+    link lists on the page would only duplicate it.
     """
-    body = _body_without_dependencies(text)
-    lines = body.splitlines()
-    fence: tuple[str, int] | None = None
-    for index, line in enumerate(lines):
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is None and _HEADING.match(line):
-            statement = "\n".join(lines[:index]).strip()
-            # Many statements now share one chapter page, so a node's own
-            # subheadings must not compete with the chapter's structure.
-            return statement, _demote_headings("\n".join(lines[index:]).strip())
-    return body.strip(), ""
+    parts = article_parts(text)
+    remainder = "\n\n".join(
+        f"{section.heading}\n\n{section.body}".rstrip()
+        for section in parts.sections
+        if section.title.casefold() not in _DEPENDENCY_SECTIONS
+    )
+    # Many statements now share one chapter page, so a node's own
+    # subheadings must not compete with the chapter's structure.
+    return _demote_headings(parts.statement), _demote_headings(remainder)
 
 
 def _demote_headings(text: str) -> str:
@@ -1916,58 +2560,6 @@ def _demote_headings(text: str) -> str:
         return f"{'#' * level} {heading.group(2)}"
 
     return _outside_fences(text, demote)
-
-
-def _body_without_dependencies(text: str) -> str:
-    """Drop the frontmatter, the H1, and the dependency sections.
-
-    The DAG is re-presented in the metadata line, so repeating the raw link
-    lists on the page would only duplicate it.
-    """
-    lines = text.splitlines()
-    start = 0
-    if lines and lines[0].strip() == "---":
-        for index in range(1, len(lines)):
-            if lines[index].strip() == "---":
-                start = index + 1
-                break
-
-    kept: list[str] = []
-    skipping = False
-    dropped_title = False
-    fence: tuple[str, int] | None = None
-
-    for line in lines[start:]:
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            if not skipping:
-                kept.append(line)
-            continue
-        if fence is not None:
-            if not skipping:
-                kept.append(line)
-            continue
-
-        heading = _HEADING.match(line)
-        if heading:
-            level = len(heading.group(1))
-            name = heading.group(2).strip().casefold()
-            if level == 1 and not dropped_title:
-                dropped_title = True
-                skipping = False
-                continue
-            if level <= 2:
-                skipping = level == 2 and name in _DEPENDENCY_SECTIONS
-                if skipping:
-                    continue
-        if not skipping:
-            kept.append(line)
-    return "\n".join(kept).strip()
 
 
 def _stylesheet() -> str:
@@ -2605,9 +3197,12 @@ __all__ = [
     "LOGO",
     "MERMAID_SCRIPT",
     "PUBLICATION_MANIFEST",
+    "PUBLICATION_MANIFEST_MAX_BYTES",
+    "PUBLICATION_SCHEMA",
     "PublicationError",
     "STYLESHEET",
     "RenderReport",
+    "load_publication_source",
     "render_site",
     "publication_source_revision",
 ]

@@ -13,7 +13,8 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .status import STATES, is_definition
+from .graph_views import container_nodes
+from .status import STATES, State, is_definition
 
 if TYPE_CHECKING:
     from .graph import Graph, Node
@@ -28,8 +29,11 @@ def node_link(node: Node, output: Path, link_extension: str) -> str:
 
 def relative_link(target: Path, output: Path, link_extension: str) -> str:
     """Relative link from the page at *output* to *target*, with its suffix swapped."""
-    relative = os.path.relpath(target.resolve(), output.resolve().parent)
-    return Path(relative).with_suffix(link_extension).as_posix()
+    relative = Path(os.path.relpath(target.resolve(), output.resolve().parent))
+    if not relative.name:
+        # The page's own directory is ``.``, which has no name to take a suffix.
+        return relative.as_posix()
+    return relative.with_suffix(link_extension).as_posix()
 
 
 def source_links(graph: Graph, output: Path, link_extension: str) -> dict[str, str]:
@@ -71,12 +75,18 @@ def render_diagram(
     if links is None:
         links = source_links(graph, output, link_extension)
 
+    boxes = container_nodes(graph, statuses)
     handles = {node.id: f"n{index}" for index, node in enumerate(ordered)}
     lines = ["```mermaid", "graph LR"]
 
     for node in ordered:
         handle = handles[node.id]
         label = _escape(node.title)
+        if node.id in boxes:
+            # A chapter or section page is a scope, not an unstated result.
+            box = boxes[node.id]
+            lines.append(f'  {handle}["{_view_label(box)}"]:::{_scope_class(box.complete)}')
+            continue
         # Rectangles introduce data, rounded boxes assert something.
         shape = f'["{label}"]' if is_definition(node) else f'("{label}")'
         lines.append(f"  {handle}{shape}:::{statuses[node.id].key}")
@@ -90,7 +100,8 @@ def render_diagram(
                 lines.append(f"  {handles[dependency]} -.-> {handles[node.id]}")
 
     for node in ordered:
-        tooltip = _escape(f"{node.title} — {statuses[node.id].label}")
+        state = _view_summary(boxes[node.id]) if node.id in boxes else statuses[node.id].label
+        tooltip = _escape(f"{node.title} — {state}")
         lines.append(f'  click {handles[node.id]} "{links[node.id]}" "{tooltip}"')
 
     if include_classdefs:
@@ -120,7 +131,7 @@ def render_view_diagram(
             class_name = node.status_key or "planned"
         else:
             shape = f'["{label}"]'
-            class_name = "scope" if node.kind == "scope" else "boundary"
+            class_name = _scope_class(node.complete) if node.kind == "scope" else "boundary"
         lines.append(f"  {handle}{shape}:::{class_name}")
 
     for edge in view.edges:
@@ -173,27 +184,36 @@ def _view_edge_lines(edge: ViewEdge, handles: dict[str, str]) -> list[str]:
     return lines
 
 
+def _scope_class(complete: bool) -> str:
+    return "scope_complete" if complete else "scope"
+
+
 def classdef_lines(*, dark: bool = False) -> list[str]:
     """Mermaid ``classDef`` declarations for every state, in one palette."""
-    states = [
-        f"classDef {state.key} "
-        f"fill:{state.dark_fill if dark else state.fill},"
-        f"stroke:{state.dark_stroke if dark else state.stroke},"
-        f"color:{state.dark_text if dark else state.text},stroke-width:2px"
-        for state in STATES
-    ]
+    def classdef(name: str, state: State) -> str:
+        return (
+            f"classDef {name} fill:{state.dark_fill if dark else state.fill},"
+            f"stroke:{state.dark_stroke if dark else state.stroke},"
+            f"color:{state.dark_text if dark else state.text},stroke-width:2px"
+        )
+
+    states = [classdef(state.key, state) for state in STATES]
     # Chapter and boundary boxes are the project map, which is the first thing
     # on the landing page, so they take the same greys and blues as the rest of
-    # the site rather than the GitHub palette the states used to sit in.
+    # the site rather than the GitHub palette the states used to sit in. A
+    # finished scope takes the fully proved green, so completion reads at a glance.
+    complete = classdef("scope_complete", next(state for state in STATES if state.key == "fully_proved"))
     if dark:
         views = [
             "classDef scope fill:#1C1D1F,stroke:#2D88FF,color:#E4E6EB,stroke-width:2px",
+            complete,
             "classDef boundary fill:#18191A,stroke:#8A8D91,color:#B0B3B8,stroke-width:2px,stroke-dasharray:5 3",
             "classDef focus stroke:#F7B928,stroke-width:4px",
         ]
     else:
         views = [
             "classDef scope fill:#EBF2FE,stroke:#0064E0,color:#050505,stroke-width:2px",
+            complete,
             "classDef boundary fill:#FFFFFF,stroke:#8A8D91,color:#65676B,stroke-width:2px,stroke-dasharray:5 3",
             "classDef focus stroke:#F7B928,stroke-width:4px",
         ]
@@ -296,7 +316,9 @@ def render_page(
         links=links,
         include_classdefs=include_classdefs,
     )
-    legend = render_legend(statuses)
+    # Containers are drawn as scope boxes, so they have no row in the legend.
+    boxes = container_nodes(graph, statuses)
+    legend = render_legend({node_id: state for node_id, state in statuses.items() if node_id not in boxes})
     sections = [
         "---",
         "kind: graph",

@@ -49,7 +49,7 @@ _SNAPSHOT_ATTEMPTS = 3
 # Rust's ``char::is_whitespace`` set, which ``str::trim`` uses in elan.
 # Python additionally treats U+001C..U+001F as whitespace; accepting those
 # would disagree with elan because they remain control characters there.
-_ELAN_WHITESPACE = frozenset(
+_ELAN_WHITESPACE = (
     "\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680"
     "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
     "\u2028\u2029\u202f\u205f\u3000"
@@ -125,14 +125,7 @@ def inspect_project(target: str | Path, *, catalog: ReleaseCatalog | None = None
         project_root = "/".join([".."] * (len(start.parts) - len(root.parts))) or "."
         autoform_paths = _inspect_autoform_paths(root)
         snapshot = _snapshot._capture_decision_snapshot(root)
-        attempt_diagnostics: list[ProjectDiagnostic] = []
-        result = _inspect_snapshot(
-            catalog,
-            snapshot,
-            attempt_diagnostics,
-            project_root=project_root,
-            autoform_paths=autoform_paths,
-        )
+        result = _inspect_snapshot(catalog, snapshot, project_root=project_root, autoform_paths=autoform_paths)
         verified = _snapshot._capture_decision_snapshot(root)
         if (
             snapshot.stable
@@ -176,11 +169,11 @@ def _inspect_autoform_paths(root: Path) -> tuple[str, ...]:
 def _inspect_snapshot(
     catalog: ReleaseCatalog,
     snapshot: _DecisionSnapshot,
-    diagnostics: list[ProjectDiagnostic],
     *,
     project_root: str,
     autoform_paths: tuple[str, ...],
 ) -> ProjectInspection:
+    diagnostics: list[ProjectDiagnostic] = []
     lake, requirements = _inspect_lake(snapshot, diagnostics)
     requirement = requirements.mathlib if requirements is not None else None
     toolchain = _inspect_toolchain(snapshot, diagnostics)
@@ -209,7 +202,7 @@ def _inspect_snapshot(
     mathlib = locked if manifest_valid and overrides_valid else None
     # Lake validates direct requirements against the root manifest before it
     # loads workspace overrides, so an override does not suppress this warning.
-    if locked is not None and requirement is not None and _is_stale(requirement, locked):
+    if locked is not None and requirement is not None and _is_stale(requirement, locked, manifest_packages.raw_url):
         diagnostics.append(
             ProjectDiagnostic(
                 "warning",
@@ -414,6 +407,7 @@ def _unused_mathlib(requirements: _Requirements) -> str | None:
     )
 
 
+# Unused here; the library locator (#204) imports it.
 def _trim_elan_whitespace(value: str) -> str:
     """Mirror Rust's Unicode whitespace trim without Python's extra C0 separators."""
 
@@ -435,7 +429,7 @@ def _inspect_toolchain(snapshot: _DecisionSnapshot, diagnostics: list[ProjectDia
         return None
     # elan reads only the trimmed first line and rejects an existing file when
     # that line is empty or malformed.
-    toolchain = _trim_elan_whitespace(text.split("\n", 1)[0])
+    toolchain = text.split("\n", 1)[0].strip(_ELAN_WHITESPACE)
     if not toolchain or not toolchain.isprintable() or any(character.isspace() for character in toolchain):
         diagnostics.append(
             ProjectDiagnostic(
@@ -467,23 +461,18 @@ def _locked_mathlib(
         layout = _manifest_layout(version)
         if layout is None:
             raise ValueError(relative)
-    except (AttributeError, RecursionError, ValueError):
-        kind = "Lake manifest" if relative == _MANIFEST else "Lake package-overrides file"
-        diagnostics.append(
-            ProjectDiagnostic("error", "invalid-lake-manifest", f"{relative} is not a {kind} Autoform reads.", relative)
-        )
-        return False, None
-    if layout == "legacy":
-        if relative == _MANIFEST:
-            message = (
-                f"Lake still reads the legacy layout of {relative}, but Autoform does not; "
-                "`lake update` rewrites it."
-            )
-        else:
-            message = f"Lake still reads the legacy layout of {relative}, but Autoform does not decode it."
-        diagnostics.append(ProjectDiagnostic("warning", "unsupported-lake-manifest", message, relative))
-        return False, None
-    try:
+        if layout == "legacy":
+            if relative == _MANIFEST:
+                code = "unsupported-lake-manifest"
+                message = (
+                    f"Lake still reads the legacy layout of {relative}, but Autoform does not; "
+                    "`lake update` rewrites it."
+                )
+            else:
+                code = "unsupported-package-overrides"
+                message = f"Lake still reads the legacy layout of {relative}, but Autoform does not decode it."
+            diagnostics.append(ProjectDiagnostic("warning", code, message, relative))
+            return False, None
         if relative == _MANIFEST:
             _validate_manifest_root(payload)
         packages = payload.get("packages")
@@ -493,13 +482,18 @@ def _locked_mathlib(
         decoded = [_decode_package_entry(item, relative) for item in packages]
     except (AttributeError, RecursionError, ValueError):
         kind = "Lake manifest" if relative == _MANIFEST else "Lake package-overrides file"
+        code = "invalid-lake-manifest" if relative == _MANIFEST else "invalid-package-overrides"
         diagnostics.append(
-            ProjectDiagnostic("error", "invalid-lake-manifest", f"{relative} is not a {kind} Autoform reads.", relative)
+            ProjectDiagnostic("error", code, f"{relative} is not a {kind} Autoform reads.", relative)
         )
         return False, None
     # Lake inserts entries into a NameMap in order, so the last duplicate wins.
-    match = next((lock for name, lock in reversed(decoded) if name == _MATHLIB_NAME), None)
-    return True, _LockedPackages(frozenset(name for name, _lock in decoded), match)
+    match, entry = next(
+        ((lock, item) for (name, lock), item in zip(reversed(decoded), reversed(packages)) if name == _MATHLIB_NAME),
+        (None, None),
+    )
+    raw_url = entry["url"] if match is not None and match.type == "git" else None
+    return True, _LockedPackages(frozenset(name for name, _lock in decoded), match, raw_url)
 
 
 def _read_text(

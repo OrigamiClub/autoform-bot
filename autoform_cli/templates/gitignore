@@ -1,5 +1,6 @@
 .lake/
 site/
 site-src/
+.autoform-publication-*/
 *.log
 .claude/worktrees/

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+from autoform_cli import _tree_snapshot as tree_snapshot_module
 from autoform_cli.doctor import diagnose_project
-from autoform_cli.lean import LeanSourceError
 
 
 def _article(
@@ -191,26 +192,27 @@ def test_a_deprecated_lean_target_fails_the_lean_targets_check(tmp_path: Path) -
     assert _checks(result)["audit"][0]
 
 
-def test_unreadable_lean_sources_are_a_lean_target_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    project = _clean_project(
-        tmp_path,
-        metadata=(
-            "declaration: theorem",
-            "statement: formalized",
-            "proof: formalized",
-            "lean: Project.result",
-        ),
-    )
+_LEAN_METADATA = (
+    "declaration: theorem",
+    "statement: formalized",
+    "proof: formalized",
+    "lean: Project.result",
+)
+
+
+def _lean_root(tmp_path: Path) -> Path:
     lean_root = tmp_path / "lean"
     lean_root.mkdir()
     (lean_root / "Project.lean").write_text("theorem Project.result : True := trivial\n", encoding="utf-8")
+    return lean_root
 
-    def changed_after_projection(_root):
-        raise LeanSourceError("Lean sources kept changing while they were indexed")
 
-    monkeypatch.setattr("autoform_cli.audit.snapshot_project_sources", changed_after_projection)
+def test_an_unindexable_lean_source_fails_only_the_lean_targets_check(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("named pipes are unavailable")
+    project = _clean_project(tmp_path, metadata=_LEAN_METADATA)
+    lean_root = _lean_root(tmp_path)
+    os.mkfifo(lean_root / "F.lean")
 
     result = diagnose_project(project, lean_root=lean_root)
 
@@ -221,18 +223,66 @@ def test_unreadable_lean_sources_are_a_lean_target_failure(
     assert str(tmp_path) not in result.to_json()
 
 
-def test_runtime_projection_failure_is_reported_without_traceback(tmp_path: Path) -> None:
-    project = _clean_project(
-        tmp_path,
-        metadata=("declaration: theorem", "mathlib_file: ../Outside.lean"),
-    )
+def test_an_oversized_node_fails_the_lean_targets_check_not_the_audit(tmp_path: Path) -> None:
+    project = _clean_project(tmp_path)
+    lean_root = tmp_path / "lean"
+    lean_root.mkdir()
+    spans = {f"small{index}": 6 for index in range(5)} | {"big": 420}
+    for name, lines in spans.items():
+        _article(project, f"{name}.md", metadata=(*_LEAN_METADATA[:3], f"lean: Project.{name}"))
+        steps = "".join(f"  -- step {step}\n" for step in range(lines - 2))
+        (lean_root / f"{name}.lean").write_text(f"theorem Project.{name} : True := by\n{steps}  trivial\n", encoding="utf-8")
+
+    result = diagnose_project(project, lean_root=lean_root)
+
+    assert _checks(result)["audit"] == (True, "roadmap audit passed")
+    assert _checks(result)["lean targets"] == (False, "1 finding(s): node-too-large")
+
+
+def test_doctor_captures_the_lean_sources_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = _clean_project(tmp_path, metadata=_LEAN_METADATA)
+    lean_root = _lean_root(tmp_path)
+    original = tree_snapshot_module._tree_snapshot_checkpoint
+    captures = 0
+
+    def count_captures(event: str, relative: str) -> None:
+        nonlocal captures
+        original(event, relative)
+        if event == "before-final-verification":
+            captures += 1
+
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", count_captures)
+
+    result = diagnose_project(project, lean_root=lean_root)
+
+    assert result.clean
+    assert captures == 1
+
+
+def test_runtime_projection_failure_is_reported_without_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _clean_project(tmp_path)
+    article = project / "blueprint" / "roadmap" / "result.md"
+    from autoform_cli import doctor
+
+    original = doctor.load_graph
+
+    def load_then_edit(blueprint: str | Path):
+        graph = original(blueprint)
+        article.write_text(article.read_text(encoding="utf-8") + "\nEdited.\n", encoding="utf-8")
+        return graph
+
+    # The graph loads, then the article changes before the projection rereads it.
+    monkeypatch.setattr(doctor, "load_graph", load_then_edit)
 
     result = diagnose_project(project)
 
     assert not result.clean
     assert _checks(result)["runtime"] == (
         False,
-        "result: mathlib file must be a portable relative path",
+        "result: the article changed after the graph was loaded; "
+        "load the graph again, or retry after the project is idle",
     )
     assert _checks(result)["graph"] == (False, "not summarized because runtime projection failed")
     assert len(result.checks) == 6
@@ -247,7 +297,7 @@ def test_invalid_lean_root_is_a_sanitized_lean_failure(tmp_path: Path) -> None:
 
     assert not result.clean
     assert _checks(result)["runtime"][0]
-    assert _checks(result)["lean targets"] == (False, "1 finding(s): invalid-lean-root")
+    assert _checks(result)["lean targets"] == (False, "Lean root does not exist or is not a directory")
     assert str(tmp_path) not in result.to_json()
 
     loop = tmp_path / "lean-loop"
@@ -257,7 +307,11 @@ def test_invalid_lean_root_is_a_sanitized_lean_failure(tmp_path: Path) -> None:
         pytest.skip("symbolic links are unavailable")
     loop_result = diagnose_project(project, lean_root=loop)
     assert len(loop_result.checks) == 6
-    assert _checks(loop_result)["lean targets"] == (False, "1 finding(s): invalid-lean-root")
+    if os.name == "nt":
+        # Windows reports a symbolic link loop by its own error code.
+        assert not _checks(loop_result)["lean targets"][0]
+    else:
+        assert _checks(loop_result)["lean targets"] == (False, "Lean root cannot be resolved")
     assert str(tmp_path) not in loop_result.to_json()
 
 

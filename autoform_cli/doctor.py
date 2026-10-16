@@ -13,8 +13,9 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path, PureWindowsPath
 
-from .audit import AuditFinding, audit_graph
+from .audit import AuditFinding, _lean_findings, audit_graph
 from .graph import GraphValidationError, load_graph
+from .lean import LeanSourceError, resolve_lean_root
 from .runtime import (
     RUNTIME_AUTHORITY,
     RUNTIME_SCHEMA,
@@ -25,15 +26,6 @@ from .runtime import (
     resolve_runtime_paths,
 )
 
-_LEAN_FINDING_CODES = frozenset(
-    {
-        "invalid-lean-root",
-        "lean-target-deprecated",
-        "lean-target-kind-mismatch",
-        "lean-target-not-found",
-        "unreadable-lean-sources",
-    }
-)
 _CHECK_NAMES = ("blueprint", "runtime", "graph", "references", "audit", "lean targets")
 _QUOTED_STRING = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"")
 
@@ -103,18 +95,12 @@ def diagnose_project(
         reason = _sanitize_issues(error.issues, paths)
         checks.append(DoctorCheck("runtime", False, "canonical graph is invalid"))
         checks.append(DoctorCheck("graph", False, reason))
-        checks.append(DoctorCheck("references", False, "not checked because graph validation failed"))
-        checks.append(DoctorCheck("audit", False, "not checked because graph validation failed"))
-        checks.append(_blocked_lean_check("graph validation failed", lean_root))
-        return _result(checks)
+        return _blocked_result(checks, "graph validation failed", lean_root=lean_root)
 
-    resolved_lean_root, lean_root_valid = _resolve_lean_root(lean_root)
+    # No runtime field the doctor reports depends on Lean, so the projection
+    # runs without it and the lean targets check is the only Lean capture.
     try:
-        runtime = build_runtime_graph(
-            graph,
-            project_root=paths.project_root,
-            lean_root=resolved_lean_root,
-        )
+        runtime = build_runtime_graph(graph, project_root=paths.project_root)
     except RuntimeProjectionError as error:
         checks.append(DoctorCheck("runtime", False, _issues(error.issues)))
     else:
@@ -128,10 +114,7 @@ def diagnose_project(
 
     if runtime is None:
         checks.append(DoctorCheck("graph", False, "not summarized because runtime projection failed"))
-        checks.append(DoctorCheck("references", False, "not checked because runtime projection failed"))
-        checks.append(DoctorCheck("audit", False, "not checked because runtime projection failed"))
-        checks.append(_blocked_lean_check("runtime projection failed", lean_root))
-        return _result(checks)
+        return _blocked_result(checks, "runtime projection failed", lean_root=lean_root)
 
     checks.append(
         DoctorCheck(
@@ -152,19 +135,17 @@ def diagnose_project(
         )
     )
 
-    audit = audit_graph(graph, lean_root=resolved_lean_root)
-    lean_findings = tuple(finding for finding in audit.findings if finding.code in _LEAN_FINDING_CODES)
-    if lean_root is not None and not lean_root_valid:
-        lean_findings = (
-            AuditFinding(".", "invalid-lean-root", "Lean root does not exist or is not a directory"),
-            *lean_findings,
-        )
-    roadmap_findings = tuple(finding for finding in audit.findings if finding.code not in _LEAN_FINDING_CODES)
-    checks.append(_finding_check("audit", roadmap_findings, "roadmap audit passed"))
+    checks.append(_finding_check("audit", audit_graph(graph).findings, "roadmap audit passed"))
     if lean_root is None:
         checks.append(DoctorCheck("lean targets", True, "not checked; no Lean root supplied"))
     else:
-        checks.append(_finding_check("lean targets", lean_findings, "all asserted local Lean targets resolve"))
+        try:
+            root = resolve_lean_root(lean_root)
+        except LeanSourceError as error:
+            checks.append(DoctorCheck("lean targets", False, str(error)))
+        else:
+            lean_findings = tuple(_lean_findings(graph, root))
+            checks.append(_finding_check("lean targets", lean_findings, "all asserted local Lean targets resolve"))
     return _result(checks)
 
 
@@ -191,17 +172,6 @@ def _finding_check(name: str, findings: tuple[AuditFinding, ...], clean_detail: 
         return DoctorCheck(name, True, clean_detail)
     codes = ", ".join(sorted({finding.code for finding in findings}))
     return DoctorCheck(name, False, f"{len(findings)} finding(s): {codes}")
-
-
-def _resolve_lean_root(lean_root: str | Path | None) -> tuple[Path | None, bool]:
-    if lean_root is None:
-        return None, True
-    try:
-        root = Path(lean_root).expanduser().resolve()
-        valid = root.is_dir()
-    except (OSError, RuntimeError, ValueError):
-        return None, False
-    return (root if valid else None), valid
 
 
 def _sanitize_issues(issues: tuple[str, ...], paths: RuntimePaths) -> str:

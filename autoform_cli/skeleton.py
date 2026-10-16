@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -36,15 +37,18 @@ from urllib.parse import quote, urlsplit
 import psutil
 import tomli
 
+from ._tree_snapshot import _normalized_name
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import (
     MANAGED_OUTPUT_SCHEMAS,
     PACKET_SCHEMA,
     PASSAGE_SCHEMA,
+    LeanSourceError,
     SourceIndex,
     declaration_names,
     index_failure_message,
     index_project,
+    resolve_lean_root,
 )
 
 SKELETON_SCHEMA = "autoform-skeleton/v4"
@@ -68,6 +72,9 @@ _CORE_MODULE_ROOTS = ("Init", "Lean", "Std", "Lake")
 _SHADOWED_CORE_MODULE = re.compile(
     r"object file '[^']*' of module ((?:" + "|".join(_CORE_MODULE_ROOTS) + r")(?:\.\S+)?) does not exist"
 )
+#: The impact probe's refusal of a loaded or glob-built module the source
+#: inventory lacks; the project is built, so the refusal gets no `lake build` hint.
+_UNCAPTURED_ROOT_MODULE = re.compile(r"the impact probe (?:loaded|found) root-package module .*")
 
 DEFAULT_PROBE_TIMEOUT = 600.0
 #: The Lake freshness check hashes every imported input, which on a Mathlib
@@ -466,7 +473,9 @@ def load_skeleton_report(path: str | Path) -> SkeletonReport:
 
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        # A "\ud800" escape decodes to half of a surrogate pair, which the report's hashes cannot encode.
+        json.dumps(data, ensure_ascii=False).encode("utf-8")
+    except (OSError, RecursionError, ValueError) as exc:
         raise SkeletonError([f"cannot read skeleton report {path}: {exc}"]) from exc
     if (
         not isinstance(data, dict)
@@ -674,13 +683,17 @@ def _trusted_from_dict(item: object, *, root: str) -> TrustedDeclaration:
 def _report_entry(item: dict[str, object], name: str) -> TrustedDeclaration:
     """Read the fields every reported declaration has, with their source invariants."""
 
-    kind = _report_kind(item.get("kind"), name)
+    kind = item.get("kind")
+    if not isinstance(kind, str) or kind not in _DECLARATION_KINDS:
+        raise SkeletonError([f"invalid declaration kind for {name} in skeleton report"])
     semantic = _report_value(item.get("semantic"), f"semantic material for {name}")
     _validate_semantic_material(semantic, context=name, kind=kind)
     source = _report_value(item.get("source"), f"source for {name}", optional=True)
     if kind in {"theorem", "axiom"} and source is not None:
         raise SkeletonError([f"proof-bearing source is forbidden for {kind} {name}"])
-    withheld = _report_withheld(item.get("source_withheld"), source, name)
+    withheld = item.get("source_withheld")
+    if type(withheld) is not bool or (withheld and source is not None):
+        raise SkeletonError([f"invalid withheld source flag for {name} in skeleton report"])
     start = _report_value(item.get("start_line"), f"start line for {name}", int, optional=True)
     end = _report_value(item.get("end_line"), f"end line for {name}", int, optional=True)
     if (start is None) != (end is None) or (start is not None and end is not None and (start < 1 or end < start)):
@@ -712,24 +725,12 @@ def _report_value(value: object, context: str, kind: type = str, *, optional: bo
     return value
 
 
-def _report_withheld(value: object, source: str | None, name: str) -> bool:
-    if type(value) is not bool or (value and source is not None):
-        raise SkeletonError([f"invalid withheld source flag for {name} in skeleton report"])
-    return value
-
-
 def _report_string_tuple(value: object, context: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
         raise SkeletonError([f"invalid {context} in skeleton report"])
     if len(value) != len(set(value)):
         raise SkeletonError([f"duplicate {context} in skeleton report"])
     return tuple(value)
-
-
-def _report_kind(value: object, context: str) -> str:
-    if not isinstance(value, str) or value not in _DECLARATION_KINDS:
-        raise SkeletonError([f"invalid declaration kind for {context} in skeleton report"])
-    return value
 
 
 def _sha256_id(content: bytes) -> str:
@@ -880,6 +881,8 @@ def _remember_descendants(
 ) -> None:
     """Retain handles for children that may outlive their immediate parent."""
 
+    if process.returncode is not None:
+        return  # a reaped leader's PID may belong to another process
     try:
         children = psutil.Process(process.pid).children(recursive=True)
     except (psutil.Error, OSError, SystemError):
@@ -954,6 +957,49 @@ def _process_group_is_alive(pid: int) -> bool:
     return True
 
 
+def _process_group_has_live_members(pid: int) -> bool:
+    """Whether the group ``pid`` leads holds a process that is not a zombie.
+
+    Its leader stays unreaped, and so a member, until the group is retired.
+    """
+
+    if not _process_group_is_alive(pid):
+        return False
+    try:
+        for candidate in psutil.process_iter(["pid", "status"]):
+            try:
+                if os.getpgid(candidate.info["pid"]) == pid and candidate.info["status"] != psutil.STATUS_ZOMBIE:
+                    return True
+            except (OSError, psutil.Error):
+                continue
+    except (OSError, psutil.Error, SystemError):
+        return True  # a table that cannot be read proves nothing gone
+    return False
+
+
+def _leader_has_exited(process: subprocess.Popen[bytes]) -> bool:
+    """Whether the command has exited, leaving it unreaped on POSIX.
+
+    ``Popen.poll`` would reap it, and a reaped leader's process group id can
+    pass to an unrelated group before the next ``killpg``.
+    """
+
+    if os.name != "posix" or process.returncode is not None:
+        return process.poll() is not None
+    try:
+        if hasattr(os, "waitid"):
+            # Unlike a zombie status, this waits for every thread of the leader.
+            return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        return psutil.Process(process.pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.ZombieProcess:
+        return True
+    except (ChildProcessError, psutil.NoSuchProcess):
+        # Reaped elsewhere: poll records it, so nothing signals the group again.
+        return process.poll() is not None
+    except (OSError, psutil.Error, SystemError):
+        return False
+
+
 def _remaining(deadline: float) -> float:
     return max(0.0, deadline - time.perf_counter())
 
@@ -971,7 +1017,11 @@ def _terminate_process_tree(
     deadline: float,
     token: str,
 ) -> None:
-    """Best-effort termination of a command and every descendant observed."""
+    """Best-effort termination of a command and every descendant observed.
+
+    The leader is reaped last, so the group is only signalled while its id
+    cannot belong to another group.
+    """
 
     started, available = time.perf_counter(), _remaining(deadline)
     for share, group_signal, method in ((0.4, "SIGTERM", "terminate"), (0.8, "SIGKILL", "kill")):
@@ -983,17 +1033,21 @@ def _terminate_process_tree(
             strict=False,
         )
         live = [child for child in descendants.values() if child.pid != process.pid and _process_is_alive(child)]
-        if os.name == "posix":
+        if os.name == "posix" and process.returncode is None:
             with contextlib.suppress(OSError):
                 os.killpg(process.pid, getattr(signal, group_signal))
-        for target in ([process] if process.poll() is None else []) + live:
+        # On POSIX killpg already reached the leader; Popen.terminate would poll, and so reap, it.
+        leader = [process] if os.name != "posix" and process.poll() is None else []
+        for target in leader + live:
             with contextlib.suppress(OSError, psutil.Error, SystemError):
                 getattr(target, method)()
         phase_deadline = started + available * share
-        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-            process.wait(timeout=_remaining(phase_deadline))
+        while not _leader_has_exited(process) and _remaining(phase_deadline):
+            time.sleep(min(0.01, _remaining(phase_deadline)))
         with contextlib.suppress(OSError, psutil.Error, SystemError):
             psutil.wait_procs(live, timeout=_remaining(phase_deadline))
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        process.wait(timeout=_remaining(deadline))
 
 
 class _CommandSignalled(BaseException):
@@ -1160,7 +1214,7 @@ def _run_registered_command(
             reader = threading.Thread(target=drain, args=(name, stream), daemon=True)
             reader.start()
             readers.append(reader)
-        while process.poll() is None:
+        while not _leader_has_exited(process):
             _remember_descendants(process, descendants)
             check_output()
             remaining = deadline - time.monotonic()
@@ -1168,9 +1222,15 @@ def _run_registered_command(
                 raise _CommandTimedOut([f"{context} timed out after {timeout:g} seconds"])
             overflow.wait(min(0.05, remaining))
         _remember_descendants(process, descendants)
+        # A reap recorded elsewhere frees the group id, so it is not checked again.
+        group_alive = process.returncode is None and _process_group_has_live_members(process.pid)
         _remember_tagged_processes(token, descendants, root_pid=process.pid)
-        if _process_group_is_alive(process.pid) or any(map(_process_is_alive, descendants.values())):
+        if group_alive or any(map(_process_is_alive, descendants.values())):
             raise SkeletonError([f"{context} left descendant processes running"])
+        # The group is retired. No signal may land between the reap and the recorded status.
+        guard.disarm()
+        process.wait()
+        guard.arm()
         cleanup_deadline = time.perf_counter() + _PROCESS_TERMINATION_GRACE
         if not _join_readers(readers, deadline=time.perf_counter() + _PROCESS_TERMINATION_GRACE * 0.2):
             raise SkeletonError([f"{context} left descendant processes holding its output pipes open"])
@@ -1214,6 +1274,7 @@ class LeanLibrary:
     src_dir: Path
     roots: tuple[str, ...]
     globs: tuple[str, ...] = ()
+    artifact_dir: Path | None = None
 
 
 def lean_libraries(lean_root: str | Path) -> tuple[LeanLibrary, ...]:
@@ -1222,16 +1283,18 @@ def lean_libraries(lean_root: str | Path) -> tuple[LeanLibrary, ...]:
     A TOML manifest is read directly. A Lean manifest is evaluated by Lake
     itself through ``lake translate-config``, the same way the generated verify
     workflow reads the root package name, so both manifest languages are
-    handled without a second parser for Lean syntax.
+    handled without a second parser for Lean syntax. When both exist, Lake
+    builds from ``lakefile.lean``, so that is the one read here too.
+
+    As in Lake, a library's ``srcDir`` is relative to the package's ``srcDir``,
+    which is also the source directory of a package without library targets.
     """
 
     root = Path(lean_root).expanduser().resolve()
-    toml_snapshot = _read_snapshot_file(root / "lakefile.toml")
-    lakefile_snapshot = _read_snapshot_file(root / "lakefile.lean")
-    if toml_snapshot is not None:
-        text = toml_snapshot[0]
-    elif lakefile_snapshot is not None:
+    if _read_snapshot_file(root / "lakefile.lean") is not None:
         text = _translate_lakefile(root)
+    elif (toml_snapshot := _read_snapshot_file(root / "lakefile.toml")) is not None:
+        text = toml_snapshot[0]
     else:
         raise SkeletonError([f"no lakefile.toml or lakefile.lean in {root}"])
     try:
@@ -1243,12 +1306,19 @@ def lean_libraries(lean_root: str | Path) -> tuple[LeanLibrary, ...]:
             [f"cannot safely parse the Lake configuration of {root}: it exceeds the parser's limits"]
         ) from exc
 
+    build_dir = config.get("buildDir", ".lake/build")
+    lean_lib_dir = config.get("leanLibDir", "lib/lean")
+    if not isinstance(build_dir, str) or not isinstance(lean_lib_dir, str):
+        raise SkeletonError([f"cannot read the buildDir/leanLibDir of {root}"])
+    artifact_dir = (root / build_dir / lean_lib_dir).resolve()
+    package_src = root / str(config.get("srcDir", "."))
+
     libraries: list[LeanLibrary] = []
     for entry in config.get("lean_lib", []) or []:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
             continue
         name = entry["name"]
-        src_dir = root / str(entry.get("srcDir", "."))
+        src_dir = package_src / str(entry.get("srcDir", "."))
         roots = entry.get("roots")
         if not isinstance(roots, list) or not all(isinstance(item, str) for item in roots):
             roots = [name]
@@ -1259,11 +1329,21 @@ def lean_libraries(lean_root: str | Path) -> tuple[LeanLibrary, ...]:
             globs = [globs]
         if not isinstance(globs, list) or not all(isinstance(item, str) for item in globs):
             globs = []
-        libraries.append(LeanLibrary(name=name, src_dir=src_dir.resolve(), roots=tuple(roots), globs=tuple(globs)))
+        libraries.append(
+            LeanLibrary(
+                name=name,
+                src_dir=src_dir.resolve(),
+                roots=tuple(roots),
+                globs=tuple(globs),
+                artifact_dir=artifact_dir,
+            )
+        )
     if not libraries:
         package = config.get("name")
         if isinstance(package, str) and package:
-            libraries.append(LeanLibrary(name=package, src_dir=root, roots=(package,)))
+            libraries.append(
+                LeanLibrary(name=package, src_dir=package_src.resolve(), roots=(package,), artifact_dir=artifact_dir)
+            )
     if not libraries:
         raise SkeletonError([f"the Lake configuration of {root} declares no library"])
     return tuple(libraries)
@@ -1282,8 +1362,11 @@ def _translate_lakefile(root: Path) -> bytes:
             context="lake translate-config",
         )
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()[:300]
-            raise SkeletonError([f"lake translate-config failed: {detail}"])
+            output = (result.stderr or result.stdout).strip()
+            # With both lakefiles, Lake opens with an info line saying which one it
+            # uses; leave it out so the error itself fits in the limit.
+            errors = "\n".join(line for line in output.splitlines() if not line.startswith("info:")).strip()
+            raise SkeletonError([f"lake translate-config failed: {(errors or output)[:300]}"])
         translated = _read_snapshot_file(target)
         if translated is None:
             raise SkeletonError(["lake translate-config failed: translated configuration is missing"])
@@ -1342,8 +1425,8 @@ def render_probe(
         marker=PROBE_MARKER,
         output_env=PROBE_OUTPUT_ENV,
         output_limit=DEFAULT_PROBE_OUTPUT_LIMIT,
-        project_roots=", ".join(_lean_name(name) for name in sorted(set(project_roots))),
-        roots=", ".join(f"({json.dumps(name, ensure_ascii=False)}, {_lean_name(name)})" for name in roots),
+        project_roots=_lean_requests(tuple(sorted(set(project_roots)))),
+        roots=_lean_requests(roots),
     )
 
 
@@ -1351,12 +1434,32 @@ def _lean_name(name: str) -> str:
     """Spell a Lean name as a term without trusting Lean to parse it."""
 
     result = "Name.anonymous"
-    for part, quoted in _lean_name_parts(name):
-        if not quoted and part.isascii() and part.isdigit():
-            result = f"Name.num ({result}) {int(part)}"
+    for component in _lean_name_components(name):
+        if isinstance(component, int):
+            result = f"Name.num ({result}) {component}"
         else:
-            result = f"Name.str ({result}) {json.dumps(part, ensure_ascii=False)}"
+            result = f"Name.str ({result}) {json.dumps(component, ensure_ascii=False)}"
     return result
+
+
+def _lean_requests(roots: tuple[str, ...]) -> str:
+    """Spell the requested roots as a Lean string of JSON the probe decodes.
+
+    The probe would compile a list literal of names, and Lean's code generator
+    gives up on one longer than about 1,500 entries.
+    """
+
+    payload = [[name, list(_lean_name_components(name))] for name in roots]
+    return json.dumps(json.dumps(payload, ensure_ascii=False), ensure_ascii=False)
+
+
+def _lean_name_components(name: str) -> tuple[str | int, ...]:
+    """The components of a Lean name: unquoted ASCII digits are numeric."""
+
+    return tuple(
+        int(part) if not quoted and part.isascii() and part.isdigit() else part
+        for part, quoted in _lean_name_parts(name)
+    )
 
 
 _LEAN_NAME_PART = r"«([^»]+)»|([^.\s«»]+)"
@@ -1453,7 +1556,7 @@ def run_probe(
 
     lake = shutil.which("lake")
     if lake is None:
-        raise SkeletonError(["lake is not on PATH; a built Lean project is required to extract skeletons"])
+        raise SkeletonError([f"lake is not on PATH; {_probe_purpose(label)} requires a built Lean project"])
     if not (lean_root / "lake-manifest.json").is_file():
         raise SkeletonError(
             [f"lake-manifest.json is missing; run `lake build` before {_probe_purpose(label)}"]
@@ -1484,7 +1587,7 @@ def run_probe(
                     "rerun with --timeout <seconds> for large projects"
                 ]
             ) from exc
-        output = _read_probe_records(records) if result.returncode == 0 else ""
+        output = _read_probe_records(records, label) if result.returncode == 0 else ""
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         shadowed = _SHADOWED_CORE_MODULE.search(detail)
@@ -1497,11 +1600,14 @@ def run_probe(
                     f"rename that library's modules\n{detail}"
                 ]
             )
+        uncaptured = _UNCAPTURED_ROOT_MODULE.search(detail)
+        if uncaptured:
+            raise SkeletonError([uncaptured.group()])
         raise SkeletonError([f"the {label} failed; is the project built with `lake build`?\n{detail}"])
     return output or result.stdout
 
 
-def _read_probe_records(records: Path) -> str:
+def _read_probe_records(records: Path, label: str) -> str:
     """Read the probe's records file under the same byte limit as its captured output."""
 
     try:
@@ -1509,9 +1615,14 @@ def _read_probe_records(records: Path) -> str:
             data = handle.read(DEFAULT_PROBE_OUTPUT_LIMIT + 1)
     except FileNotFoundError:
         return ""
+    except OSError as exc:
+        raise SkeletonError([f"the {label}'s records could not be read: {exc.strerror or exc}"]) from exc
     if len(data) > DEFAULT_PROBE_OUTPUT_LIMIT:
         raise SkeletonError([f"lake env lean exceeded the {DEFAULT_PROBE_OUTPUT_LIMIT}-byte output limit"])
-    return data.decode("utf-8")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SkeletonError([f"the {label}'s records are not valid UTF-8"]) from exc
 
 
 _FOUND_RECORD_FIELDS = frozenset(
@@ -1568,7 +1679,8 @@ def parse_probe_output(
     records: dict[str, dict[str, object]] = {}
     tables: dict[str, dict[str, object]] = {table: {} for table in _PROBE_TABLES}
     expected = None if expected_roots is None else set(expected_roots)
-    for line in text.splitlines():
+    # Not `splitlines`: Lean's JSON printer leaves U+0085, U+2028 and U+2029 unescaped.
+    for line in text.split("\n"):
         if not line.startswith(PROBE_MARKER):
             continue
         try:
@@ -1910,7 +2022,7 @@ def _validate_semantic_material(semantic: str, *, context: str, kind: str | None
     shapes = _SEMANTIC_SHAPES if kind is None else (_KIND_SEMANTIC_SHAPE.get(kind, _SEMANTIC_SHAPES[0]),)
     try:
         payload = json.loads(semantic)
-    except (json.JSONDecodeError, RecursionError):
+    except (RecursionError, ValueError):
         payload = None
     generated = payload.get("generated") if isinstance(payload, dict) else None
     entries = generated if isinstance(generated, list) else []
@@ -2047,14 +2159,14 @@ def extract_skeletons(
         graph = load_graph(blueprint_dir)
     except GraphValidationError as exc:
         raise SkeletonError(exc.issues) from exc
-    root = Path(lean_root).expanduser().resolve()
-    graph_snapshot = _graph_snapshot(graph)
-    control_snapshot = _project_control_snapshot(root)
+    try:
+        root = resolve_lean_root(lean_root)
+    except LeanSourceError as error:
+        raise SkeletonError([str(error)]) from error
+    activity = "skeletons were being extracted"
+    inputs = snapshot_inputs(graph, root)
     libraries = lean_libraries(root)
-    if _project_control_snapshot(root) != control_snapshot:
-        raise SkeletonError(
-            ["Lean project configuration changed while skeletons were being extracted; retry after the project is idle"]
-        )
+    check_configuration_unchanged(root, inputs, activity=activity)
     try:
         index = index_project(root)
     except OSError as error:
@@ -2067,24 +2179,7 @@ def extract_skeletons(
         runner=runner or run_probe,
         node_ids=node_ids,
     )
-    try:
-        current_index = index_project(root)
-    except OSError as error:
-        raise SkeletonError([index_failure_message(error)]) from error
-    if current_index.source_digest != index.source_digest:
-        raise SkeletonError(["Lean sources changed while skeletons were being extracted; retry after the build is idle"])
-    if _project_control_snapshot(root) != control_snapshot:
-        raise SkeletonError(
-            ["Lean project configuration changed while skeletons were being extracted; retry after the project is idle"]
-        )
-    try:
-        current_graph: Graph | None = load_graph(graph.blueprint_dir)
-    except GraphValidationError:
-        current_graph = None
-    if current_graph is None or _graph_snapshot(current_graph) != graph_snapshot:
-        raise SkeletonError(
-            ["the blueprint changed while skeletons were being extracted; retry after the project is idle"]
-        )
+    current_graph = check_inputs_unchanged(graph, root, index, inputs, activity=activity)
     for node in report.nodes:
         current = current_graph.nodes.get(node.node_id)
         if current is None or source_passage(current, current_graph.blueprint_dir) != (
@@ -2097,16 +2192,59 @@ def extract_skeletons(
     return report
 
 
-def extract_graph_skeletons(
-    graph: Graph,
-    *,
-    lean_root: Path,
-    libraries: tuple[LeanLibrary, ...],
-    index: SourceIndex,
-    runner: ProbeRunner,
-    node_ids: tuple[str, ...] | None = None,
-) -> SkeletonReport:
-    """Extract skeletons for an already loaded graph."""
+@dataclass(frozen=True, slots=True)
+class InputsSnapshot:
+    """The blueprint and the project configuration, as they were before Lean ran."""
+
+    graph: object
+    configuration: object
+
+
+def snapshot_inputs(graph: Graph, lean_root: Path) -> InputsSnapshot:
+    """Record the inputs a Lean run is about, to refuse its answer if they change."""
+
+    return InputsSnapshot(graph=_graph_snapshot(graph), configuration=_project_control_snapshot(lean_root))
+
+
+def check_configuration_unchanged(lean_root: Path, snapshot: InputsSnapshot, *, activity: str) -> None:
+    """Refuse when the Lake configuration changed since ``snapshot``."""
+
+    if _project_control_snapshot(lean_root) != snapshot.configuration:
+        raise SkeletonError(
+            [f"Lean project configuration changed while {activity}; retry after the project is idle"]
+        )
+
+
+def check_inputs_unchanged(
+    graph: Graph, lean_root: Path, index: SourceIndex, snapshot: InputsSnapshot, *, activity: str
+) -> Graph:
+    """Refuse an answer whose Lean sources, Lake configuration or blueprint changed
+    while Lean ran, and return the blueprint as it is now.
+
+    ``activity`` names what was running, as in "skeletons were being extracted".
+    """
+
+    try:
+        current_index = index_project(lean_root)
+    except OSError as error:
+        raise SkeletonError([index_failure_message(error)]) from error
+    if current_index.source_digest != index.source_digest:
+        raise SkeletonError([f"Lean sources changed while {activity}; retry after the build is idle"])
+    check_configuration_unchanged(lean_root, snapshot, activity=activity)
+    try:
+        current_graph: Graph | None = load_graph(graph.blueprint_dir)
+    except GraphValidationError:
+        current_graph = None
+    if current_graph is None or _graph_snapshot(current_graph) != snapshot.graph:
+        raise SkeletonError([f"the blueprint changed while {activity}; retry after the project is idle"])
+    return current_graph
+
+
+def select_lean_targets(
+    graph: Graph, node_ids: tuple[str, ...] | None = None
+) -> tuple[list[tuple[Node, tuple[str, ...]]], list[tuple[Node, tuple[str, ...]]], str]:
+    """Every article's ``lean:`` targets in id order, the ones ``node_ids`` selects,
+    and ``all`` or ``filtered`` for whether it narrowed them."""
 
     targets: list[tuple[Node, tuple[str, ...]]] = []
     target_issues: list[str] = []
@@ -2126,25 +2264,56 @@ def extract_graph_skeletons(
             targets.append((node, names))
     if target_issues:
         raise SkeletonError(target_issues)
-    target_ids = {node.id for node, _ in targets}
-    selected = targets
-    selection = "all"
-    if node_ids is not None:
-        if not node_ids:
-            raise SkeletonError(["no articles selected"])
-        if len(node_ids) != len(set(node_ids)):
-            raise SkeletonError(["duplicate article selection"])
-        wanted = set(node_ids)
-        unknown = sorted(wanted - set(graph.nodes))
-        if unknown:
-            raise SkeletonError([f"unknown article: {node_id}" for node_id in unknown])
-        untargeted = sorted(wanted - target_ids)
-        if untargeted:
-            raise SkeletonError(
-                [f"{node_id}: article has no Lean declaration targets" for node_id in untargeted]
-            )
-        selected = [(node, names) for node, names in selected if node.id in wanted]
-        selection = "filtered"
+    if node_ids is None:
+        return targets, targets, "all"
+    if not node_ids:
+        raise SkeletonError(["no articles selected"])
+    if len(node_ids) != len(set(node_ids)):
+        raise SkeletonError(["duplicate article selection"])
+    wanted = set(node_ids)
+    unknown = sorted(wanted - set(graph.nodes))
+    if unknown:
+        raise SkeletonError([f"unknown article: {node_id}" for node_id in unknown])
+    untargeted = sorted(wanted - {node.id for node, _ in targets})
+    if untargeted:
+        raise SkeletonError(
+            [f"{node_id}: article has no Lean declaration targets" for node_id in untargeted]
+        )
+    return targets, [(node, names) for node, names in targets if node.id in wanted], "filtered"
+
+
+def locate_declaration(
+    name: str, *, index: SourceIndex, libraries: tuple[LeanLibrary, ...], lean_root: Path
+) -> tuple[str | None, str | None]:
+    """The module that builds ``name``, or ``None`` and the reason no module does."""
+
+    location = index.find(name)
+    if location is None:
+        return None, "declaration not found in the Lean sources"
+    if name in index.elsewhere:
+        # The lexical index cannot tell which of several declarations Lean binds
+        # a name to (one may be private, or in a file no target builds), so the
+        # name fails closed.
+        files = sorted(path.as_posix() for path in (location.path, *index.elsewhere[name]))
+        return None, f"several source files declare it: {', '.join(files)}"
+    module = module_of(lean_root / location.path, libraries)
+    if module is None:
+        return None, f"source {location.path.as_posix()} is not built by any library target"
+    return module, None
+
+
+def extract_graph_skeletons(
+    graph: Graph,
+    *,
+    lean_root: Path,
+    libraries: tuple[LeanLibrary, ...],
+    index: SourceIndex,
+    runner: ProbeRunner,
+    node_ids: tuple[str, ...] | None = None,
+) -> SkeletonReport:
+    """Extract skeletons for an already loaded graph."""
+
+    targets, selected, selection = select_lean_targets(graph, node_ids)
     passages: dict[str, tuple[str | None, str | None]] = {}
     # An article whose cited passage cannot be found cannot be judged for
     # faithfulness, so its declarations are unresolved rather than shown alone.
@@ -2161,24 +2330,14 @@ def extract_graph_skeletons(
     root_modules: dict[str, str] = {}
     for node, names in selected:
         for name in names:
+            module, reason = locate_declaration(name, index=index, libraries=libraries, lean_root=lean_root)
             if node.id in broken_passages:
-                unresolved.append(UnresolvedTarget(node.id, name, broken_passages[node.id]))
-                continue
-            location = index.find(name)
-            module = None if location is None else module_of(lean_root / location.path, libraries)
-            if location is None:
-                unresolved.append(
-                    UnresolvedTarget(node.id, name, "declaration not found in the Lean sources")
-                )
+                # Every refusal is named at once, so mending the passage brings no second one.
+                reason = "; ".join(filter(None, (broken_passages[node.id], reason)))
+                unresolved.append(UnresolvedTarget(node.id, name, reason))
                 continue
             if module is None:
-                unresolved.append(
-                    UnresolvedTarget(
-                        node.id,
-                        name,
-                        f"source {location.path.as_posix()} is not built by any library target",
-                    )
-                )
+                unresolved.append(UnresolvedTarget(node.id, name, reason or ""))
                 continue
             imports.add(module)
             if name not in roots:
@@ -2285,13 +2444,29 @@ def source_passage(node: Node, blueprint: Path, *, issues: list[str] | None = No
         return None, None
 
     for target in node.sources:
-        parsed = urlsplit(target)
+        try:
+            parsed = urlsplit(target)
+        except ValueError:
+            continue
         if parsed.scheme or parsed.netloc:
             continue
         match = _LINE_LOCATOR.fullmatch(parsed.fragment)
         if match is None or not parsed.path or parsed.path.endswith(".md"):
             continue
-        candidate = (node.path.parent / parsed.path).resolve()
+        if "\x00" in parsed.path:
+            return broken(target, "contains an invalid path")
+        try:
+            candidate = (node.path.parent / parsed.path).resolve()
+        except (OSError, RuntimeError, ValueError):
+            # Before Python 3.13 a symlink loop raises RuntimeError here.
+            return broken(target, "names a path that cannot be resolved")
+        try:
+            os.stat(candidate)
+        except OSError as error:
+            # From Python 3.13 resolve returns a looping path, which stat refuses, as it
+            # does a name too long for the filesystem.
+            if error.errno in (errno.ELOOP, errno.ENAMETOOLONG):
+                return broken(target, "names a path that cannot be resolved")
         if not candidate.is_relative_to(blueprint.resolve()):
             return broken(target, "points outside the blueprint")
         try:
@@ -2307,8 +2482,12 @@ def source_passage(node: Node, blueprint: Path, *, issues: list[str] | None = No
                 lines.pop()
         except (ValueError, UnicodeError):
             return broken(target, "names a file that is not readable UTF-8 text")
-        start = int(match.group(1))
-        end = int(match.group(2) or start)
+        try:
+            start = int(match.group(1))
+            end = int(match.group(2) or start)
+        except ValueError:
+            # By default `int` refuses more than 4,300 digits, far past any file's last line.
+            return broken(target, "names no lines of its file")
         if start < 1 or end < start or end > len(lines):
             return broken(target, "names no lines of its file")
         relative = candidate.relative_to(blueprint.resolve()).as_posix()
@@ -2565,7 +2744,7 @@ def _validate_managed_output(path: Path, *, kind: str) -> tuple[int, int, str] |
     manifest = path / PACKET_MANIFEST
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else None
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, RecursionError, ValueError):
         payload = None
     if not (
         isinstance(payload, dict)
@@ -2629,9 +2808,20 @@ def _stage_report_output(report: SkeletonReport, destination: Path) -> tuple[Pat
 
 
 def _remove_output(path: Path) -> None:
-    """Remove one transaction-owned file or directory without following links."""
+    """Remove one transaction-owned file or directory without following links.
+
+    A directory loses its manifest last: Lean source capture skips a folder by
+    that marker, matched by folded name, so no packet may outlive it.
+    """
 
     if path.is_dir() and not path.is_symlink():
+        with os.scandir(path) as entries:
+            children = [entry for entry in entries if _normalized_name(entry.name) != PACKET_MANIFEST]
+        for child in children:
+            if child.is_dir(follow_symlinks=False):
+                shutil.rmtree(child.path)
+            else:
+                os.unlink(child.path)
         shutil.rmtree(path)
     else:
         path.unlink(missing_ok=True)
@@ -2893,6 +3083,9 @@ def write_packets(
     written: list[Path] = []
     manifest: list[dict[str, str]] = []
     passage_manifest: list[dict[str, str]] = []
+    # Written after the manifests: a capture that lists a stage before its
+    # marker is complete then finds no folder to descend into.
+    files: list[tuple[Path, str | bytes]] = []
     try:
         packet_stage = _stage_output(root)
         passages_stage = _stage_output(passages_root) if passages_root is not None else None
@@ -2903,9 +3096,8 @@ def write_packets(
             passage_path: str | None = None
             if passages_stage is not None and node.passage is not None:
                 passage_path = (node_path / "passage.txt").as_posix()
-                (passages_stage / node_path).mkdir(parents=True, exist_ok=True)
                 passage_bytes = (node.passage + "\n").encode("utf-8")
-                (passages_stage / passage_path).write_bytes(passage_bytes)
+                files.append((passages_stage / passage_path, passage_bytes))
                 passage_manifest.append(
                     {
                         "hash": _sha256_id(passage_bytes),
@@ -2916,12 +3108,11 @@ def write_packets(
                 )
             article_relative = node_path / ARTICLE_PACKET
             if node.declarations:
-                (packet_stage / node_path).mkdir(parents=True, exist_ok=True)
-                (packet_stage / article_relative).write_text(node.blind_text(), encoding="utf-8")
+                files.append((packet_stage / article_relative, node.blind_text()))
                 written.append(root / article_relative)
             for declaration in node.declarations:
                 relative = node_path / _packet_filename(declaration.name)
-                (packet_stage / relative).write_text(declaration.blind_text(), encoding="utf-8")
+                files.append((packet_stage / relative, declaration.blind_text()))
                 written.append(root / relative)
                 entry = {
                     "article_packet": article_relative.as_posix(),
@@ -2943,7 +3134,15 @@ def write_packets(
         ):
             if stage is not None:
                 payload = json.dumps({"kind": kind, kind: entries, "schema": schema}, indent=2, sort_keys=True)
-                (stage / PACKET_MANIFEST).write_text(payload + "\n", encoding="utf-8")
+                # Staged under a name that is neither the marker nor Lean source, then
+                # renamed: a capture sees no marker or the whole one, never a partial file.
+                os.replace(_stage_output(stage / PACKET_MANIFEST, payload + "\n"), stage / PACKET_MANIFEST)
+        for path, content in files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(content, bytes):
+                path.write_bytes(content)
+            else:
+                path.write_text(content, encoding="utf-8")
         outputs = [(root, packet_stage, root_identity)]
         if passages_root is not None and passages_stage is not None:
             outputs.append((passages_root, passages_stage, passages_identity))
@@ -2989,6 +3188,7 @@ __all__ = [
     "SEMANTIC_SCHEMA",
     "SKELETON_SCHEMA",
     "DeclarationSkeleton",
+    "InputsSnapshot",
     "LeanLibrary",
     "NodeSkeleton",
     "PACKET_MANIFEST",
@@ -2996,16 +3196,21 @@ __all__ = [
     "SkeletonError",
     "SkeletonReport",
     "TrustedDeclaration",
+    "check_configuration_unchanged",
+    "check_inputs_unchanged",
     "extract_graph_skeletons",
     "extract_skeletons",
     "format_report",
     "lean_libraries",
     "load_skeleton_report",
+    "locate_declaration",
     "module_of",
     "parse_probe_output",
     "path_of",
     "render_probe",
     "run_probe",
+    "select_lean_targets",
+    "snapshot_inputs",
     "source_excerpt",
     "source_passage",
     "write_packets",

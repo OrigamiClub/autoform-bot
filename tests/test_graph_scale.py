@@ -615,6 +615,34 @@ def test_site_rendering_indexes_containers_a_fixed_number_of_times(
     assert _container_index_builds(tmp_path, monkeypatch, 6) == _container_index_builds(tmp_path, monkeypatch, 2)
 
 
+def _path_resolves(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sections: int) -> int:
+    blueprint = _written_blueprint(tmp_path / str(sections), sections)
+    calls = 0
+    original = Path.resolve
+
+    def counted(self: Path, strict: bool = False) -> Path:
+        nonlocal calls
+        calls += 1
+        return original(self, strict)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "resolve", counted)
+        render_site(blueprint, tmp_path / str(sections) / "site")
+    return calls
+
+
+def test_site_rendering_resolves_paths_linearly_in_the_number_of_sections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    small = _path_resolves(tmp_path, monkeypatch, 4)
+    large = _path_resolves(tmp_path, monkeypatch, 8)
+
+    # Every statement has its own map page. Linking every node from every page
+    # made doubling the sections multiply the resolves by 2.4.
+    assert large <= 2 * small
+
+
 def test_audit_does_not_scan_for_children_per_node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     graph = load_graph(_written_blueprint(tmp_path))
     expected = audit_graph(graph)
@@ -660,3 +688,7 @@ def test_runtime_accepts_hand_built_nodes_without_a_source_digest(tmp_path: Path
     item = runtime.get("item")
     assert item is not None
     assert item.source_sha256 is None
+    (roadmap / "item.md").write_text("# Item\n\nEdited.\n", encoding="utf-8")
+    edited = build_runtime_graph(hand_built, project_root=project)
+    assert edited.source_revision != runtime.source_revision
+    assert edited.source_revision == load_runtime_graph(project).source_revision

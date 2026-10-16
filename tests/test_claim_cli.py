@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
+from autoform_cli import claims
 from autoform_cli.__main__ import main
 from autoform_cli.claims import CLAIM_REF_PREFIX, ClaimBoard, author_claim_key
 
@@ -210,3 +212,30 @@ def test_claim_cli_multi_node_transport_failure_is_nonzero(tmp_path: Path, capsy
     missing = tmp_path / "missing" / "claims.git"
     assert main(_args(missing, tmp_path / "scratch", "acquire", "a", "b")) == 1
     assert capsys.readouterr().out.startswith("error: ")
+
+
+def test_claim_cli_names_a_stale_ref_lock_and_list_and_cleanup_warn_about_it(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    monkeypatch.setattr(claims, "_LOCK_GRACE_S", 0.1)
+    repo = _bare_repo(tmp_path)
+    scratch = tmp_path / "scratch"
+    ref = CLAIM_REF_PREFIX + author_claim_key("a")
+    lock = repo / f"{ref}.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text("")
+    os.utime(lock, (1_700_000_000, 1_700_000_000))
+    described = f"Git lock file {lock.resolve()} (modified 2023-11-14T22:13:20Z) blocks updates of {ref}"
+
+    assert main(_args(repo, scratch, "acquire", "a")) == 1
+    assert capsys.readouterr().out == (
+        f"error: {described}. Git leaves a lock file behind when a process stops while updating a ref; "
+        "if no Git process is using the claim board, delete it and retry\n"
+    )
+
+    for command, stdout in (("list", "[]\n"), ("cleanup", "removed 0 expired claim(s)\n")):
+        assert main(_args(repo, scratch, command)) == 0
+        captured = capsys.readouterr()
+        assert captured.out == stdout
+        assert captured.err == f"warning: {described}; if no Git process is using the claim board, delete it\n"
+    assert lock.exists()

@@ -81,11 +81,18 @@ prints `{"error": {"code": "project-catalog-invalid", "message": ...},
 The `mathlib` object has `source` (`"lake-manifest.json"` or
 `".lake/package-overrides.json"`, whichever Lake takes the entry from),
 `type` (`"git"` or `"path"`), `inherited`, and the entry's `url` (with any
-embedded credentials replaced by `***`), `input_rev`, `rev`, `dir` and
+embedded credentials, and everything after the first `?` or `#`, replaced by
+`***`; when a `?` or `#` comes before the `@` that ends the credentials,
+everything after `scheme://` is replaced), `input_rev`, `rev`, `dir` and
 `sub_dir`, each `null` when the entry does not have it, and `config_file`
 and `manifest_file`, which default to `"lakefile"` and
 `"lake-manifest.json"` when the entry has no value or `null`, as Lake reads
 them.
+
+`input_rev` is the requested revision, such as a tag or branch (the
+manifest's `inputRev`), and `rev` is the commit Lake locked. The release
+catalog that `project versions --json` prints calls the same two values
+`mathlib_rev` and `mathlib_commit`; each v1 schema keeps its own names.
 
 Errors mean Lake would fail on the project, a file Autoform needs cannot be
 read, or Autoform's bounded parser cannot safely decode the input; the last
@@ -98,15 +105,17 @@ wants to point something out.
 | `target-unreadable` | error | The target path cannot be resolved. |
 | `project-not-found` | error | No directory at or above the target has a `lakefile.lean`, `lakefile.toml` or `lean-toolchain`. |
 | `project-changed-during-inspection` | error | The decision files kept changing across every retry, so no single snapshot was read. |
-| `unreadable-file` | error | A decision file is not a regular, readable UTF-8 file of at most 1 MiB. |
+| `unreadable-file` | error | A decision file is not a regular, readable UTF-8 file of at most 1 MiB. Symlinked decision files and a symlinked `.lake` are followed, as Lake follows them; a decision-file link that dangles, loops, exceeds the kernel's expanded-path buffer, or ends on anything other than a regular file is unreadable. A present non-directory `.lake` makes its override path unreadable, not absent. |
 | `missing-lake-config` | error | There is neither `lakefile.toml` nor `lakefile.lean`. |
 | `invalid-lakefile-toml` | error | `lakefile.toml` is not TOML that Autoform can decode safely, including a Lake-valid file beyond the bounded parser's resource limits, or Lake would refuse a field that the report reads (a bad name or version, a malformed require, or a target entry or name Lake rejects). |
 | `missing-lean-toolchain` | error | There is no `lean-toolchain`. |
 | `invalid-lean-toolchain` | error | The trimmed first line of `lean-toolchain` is empty or contains whitespace or a non-printable character. |
-| `invalid-lake-manifest` | error | `lake-manifest.json` or `.lake/package-overrides.json` is not JSON Lake decodes, or has an unknown version. |
+| `invalid-lake-manifest` | error | `lake-manifest.json` is not JSON Lake decodes, or has an unknown version. |
+| `invalid-package-overrides` | error | `.lake/package-overrides.json` is not JSON Lake decodes, or has an unknown version. |
 | `lake-manifest-incomplete` | error | A requirement of `lakefile.toml` is recorded by neither the manifest nor the overrides, or there are requirements and they record no packages; Lake asks for `lake update`. |
 | `missing-lake-manifest` | warning | There is no `lake-manifest.json`, so the locked Mathlib is unknown; Lake would run an update. |
-| `unsupported-lake-manifest` | warning | A manifest or overrides file uses a legacy layout (before version 0.7) that Lake still reads but Autoform does not decode. |
+| `unsupported-lake-manifest` | warning | `lake-manifest.json` uses a legacy layout (before version 0.7) that Lake still reads but Autoform does not decode. |
+| `unsupported-package-overrides` | warning | `.lake/package-overrides.json` uses a legacy layout (before version 0.7) that Lake still reads but Autoform does not decode. |
 | `lakefile-lean-not-evaluated` | warning | `lakefile.lean` takes precedence and is never evaluated, so its package and Mathlib are unknown. |
 | `mathlib-overridden` | warning | `.lake/package-overrides.json` selects the reported Mathlib entry whenever Mathlib is active. |
 | `lake-manifest-stale` | warning | `lakefile.toml` asks for a different Mathlib than the manifest locks; Lake builds the locked one. |

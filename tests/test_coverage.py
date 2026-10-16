@@ -749,6 +749,16 @@ def test_a_placeholder_used_as_a_marker_is_rejected(tmp_path: Path) -> None:
         assert [issue.reason for issue in issues] == ["coverage evidence is a placeholder"], evidence
 
 
+def test_a_status_word_joined_to_the_next_by_a_hyphen_is_not_a_marker(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _contract(blueprint, "| Appendix | DEFERRED | Unknown-variance case, excluded by agreement |\n")
+
+    summary, issues = load_coverage(blueprint)
+
+    assert issues == ()
+    assert summary is not None
+
+
 def test_a_status_word_opening_a_sentence_is_not_a_placeholder(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     # These name something a reader can check. Rejecting them on the first word
@@ -791,14 +801,16 @@ def test_malformed_evidence_paths_are_reported_without_raising(tmp_path: Path) -
     blueprint = tmp_path / "blueprint"
     _contract(
         blueprint,
-        "| Malformed | DECOMPOSED | [Bad](../roadmap/bad%00path.md) |\n",
+        "| Malformed | DECOMPOSED | [Bad](../roadmap/bad%00path.md) |\n"
+        "| Unparsable | DECOMPOSED | [Host](http://[oops/a.md) |\n",
     )
 
     summary, issues = load_coverage(blueprint)
 
     assert summary is None
     assert [issue.reason for issue in issues] == [
-        "coverage link contains an invalid path: '../roadmap/bad%00path.md'"
+        "coverage link contains an invalid path: '../roadmap/bad%00path.md'",
+        "coverage link is not a valid URL: 'http://[oops/a.md'",
     ]
 
 

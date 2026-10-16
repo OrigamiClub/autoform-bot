@@ -4,8 +4,12 @@ import errno
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
+import sys
+import types
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -18,12 +22,11 @@ from autoform_cli._tree_snapshot import (
     TreeCaptureLimits,
     TreeChangedError,
     TreeSelection,
-    TreeSnapshot,
     TreeSnapshotError,
     bind_directory_tree,
-    capture_directory_descriptor,
 )
 from autoform_cli.lean import (
+    Alias,
     SourceLinker,
     build_linker,
     declaration_names,
@@ -31,7 +34,9 @@ from autoform_cli.lean import (
     open_project_sources,
     snapshot_project_sources,
     strip_lean_comments,
+    verify_repository_snapshot,
 )
+from autoform_cli.skeleton import _output_identity, _replace_outputs
 
 _SOURCE = """import Mathlib
 
@@ -67,11 +72,85 @@ def toplevel : Nat := 3
 """
 
 
+def _require_directory_descriptors() -> None:
+    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
+        pytest.skip("directory descriptors are unavailable")
+
+
+def _require_descriptor_capture() -> None:
+    if not (
+        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
+        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
+    ):
+        pytest.skip("directory descriptor capture is unavailable")
+
+
+def _use_portable_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
+
+
 def _index(tmp_path: Path, text: str = _SOURCE, name: str = "Project/Basic.lean"):
     path = tmp_path / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return index_project(tmp_path)
+
+
+def _on_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
+    action: Callable[[], None],
+    relative: str | None = None,
+) -> None:
+    """Run `action` at each tree snapshot checkpoint named `event`, optionally only at `relative`."""
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+
+    def checkpoint(name: str, path: str) -> None:
+        original_checkpoint(name, path)
+        if name == event and (relative is None or path == relative):
+            action()
+
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", checkpoint)
+
+
+def _count_binds(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+    """Record the arguments of every `open_project_sources` call, one per capture attempt."""
+    calls: list[tuple] = []
+    original_open = lean_module.open_project_sources
+
+    def counted_open(*args, **kwargs):
+        calls.append(args)
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(lean_module, "open_project_sources", counted_open)
+    return calls
+
+
+def _capture_through(entry: str, root: Path):
+    """Capture Lean sources through one of the two public retrying entry points."""
+    if entry == "snapshot":
+        return snapshot_project_sources(root)
+    with lean_module.bind_project_source_snapshot(root) as (_bound, snapshot):
+        return snapshot
+
+
+def _changed_path(root: Path) -> str | None:
+    """Capture once without retrying; return the path the TreeChangedError names."""
+    sources = open_project_sources(root)
+    try:
+        with pytest.raises(TreeChangedError) as error:
+            sources.capture()
+    finally:
+        sources.close()
+    return error.value.relative
+
+
+def _snapshot_in_one_attempt(monkeypatch: pytest.MonkeyPatch, root: Path):
+    """Snapshot through the retrying entry point and require a single attempt."""
+    attempts = _count_binds(monkeypatch)
+    snapshot = snapshot_project_sources(root)
+    assert len(attempts) == 1
+    return snapshot
 
 
 def test_qualifies_names_with_their_namespace(tmp_path: Path) -> None:
@@ -101,6 +180,37 @@ def test_sections_do_not_add_to_the_namespace(tmp_path: Path) -> None:
     assert index.find("Outer.Helpers.beta") is None
 
 
+def test_every_scope_closes_at_its_own_end(tmp_path: Path) -> None:
+    source = "\n".join(
+        [
+            "namespace Outer",
+            "noncomputable section",
+            "theorem a : True := trivial",
+            "end",
+            "theorem b : True := trivial",
+            "@[expose] public section",
+            "theorem c : True := trivial",
+            "end",
+            "public meta section",
+            "end",
+            "mutual",
+            "def even : Nat → Bool",
+            "  | 0 => true",
+            "  | n + 1 => odd n",
+            "def odd : Nat → Bool",
+            "  | 0 => false",
+            "  | n + 1 => even n",
+            "end",
+            "theorem d : True := trivial",
+            "end Outer",
+        ]
+    )
+    index = _index(tmp_path, source)
+
+    names = ["Outer.a", "Outer.b", "Outer.c", "Outer.even", "Outer.odd", "Outer.d"]
+    assert sorted(index.declarations) == sorted(names)
+
+
 def test_attributes_and_modifiers_do_not_hide_a_declaration(tmp_path: Path) -> None:
     assert _index(tmp_path).find("Outer.Inner.gamma") is not None
 
@@ -109,6 +219,15 @@ def test_commented_out_code_is_not_indexed(tmp_path: Path) -> None:
     index = _index(tmp_path)
 
     assert index.find("Ghost.commented_out") is None
+
+
+def test_nothing_after_exit_is_indexed(tmp_path: Path) -> None:
+    index = _index(tmp_path, "def real : Nat := 1\n#exit\ndef dead : Nat := 2\n")
+
+    assert index.find("real") is not None
+    assert index.find("dead") is None
+    # Audit sizes the last declaration up to here, not through the dead tail.
+    assert index.line_counts == {Path("Project/Basic.lean"): 1}
 
 
 def test_line_comments_are_ignored(tmp_path: Path) -> None:
@@ -159,33 +278,20 @@ def test_hidden_lean_source_directories_are_indexed(tmp_path: Path) -> None:
     assert index_project(tmp_path).find("hiddenProof") is not None
 
 
-@pytest.mark.parametrize("directory", [".direnv", ".obsidian", ".trash", ".venv"])
+@pytest.mark.parametrize("parent", ["", "Nested/"])
+@pytest.mark.parametrize(
+    "directory",
+    [".direnv", ".git", ".lake", ".obsidian", ".trash", ".venv", ".GIT", ".LAKE", ".ObSiDiAn"],
+)
 def test_known_tooling_directories_are_not_scanned(
     tmp_path: Path,
     directory: str,
+    parent: str,
 ) -> None:
     _index(tmp_path, "def canonical : Nat := 0\n")
-    ignored = tmp_path / directory
-    ignored.mkdir()
-    try:
-        (ignored / "external").symlink_to(tmp_path.parent, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlinks are unavailable")
-
-    index = index_project(tmp_path)
-
-    assert index.find("canonical") is not None
-
-
-@pytest.mark.parametrize("directory", [".GIT", ".LAKE", ".ObSiDiAn"])
-def test_case_aliases_of_tooling_directories_are_not_scanned(
-    tmp_path: Path,
-    directory: str,
-) -> None:
-    _index(tmp_path, "def canonical : Nat := 0\n")
-    ignored = tmp_path / directory
-    ignored.mkdir()
-    (ignored / "Leak.lean").write_text("def leaked : Nat := 0\n")
+    ignored = tmp_path / parent / directory
+    ignored.mkdir(parents=True)
+    (ignored / "Leak.lean").write_text("def leaked : Nat := 0\n", encoding="utf-8")
 
     index = index_project(tmp_path)
 
@@ -197,30 +303,20 @@ def test_changes_inside_an_excluded_build_directory_do_not_invalidate_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not (
-        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
-        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
-    ):
-        pytest.skip("directory descriptor capture is unavailable")
+    _require_descriptor_capture()
     _index(tmp_path, "def canonical : Nat := 0\n")
     build_state = tmp_path / ".lake" / "build-state"
     build_state.parent.mkdir()
     build_state.write_text("old\n", encoding="utf-8")
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
     changed = False
 
-    def change_excluded_file(event: str, relative: str) -> None:
+    def change_excluded_file() -> None:
         nonlocal changed
-        original_checkpoint(event, relative)
-        if event == "before-final-verification" and not changed:
+        if not changed:
             changed = True
             build_state.write_text("new\n", encoding="utf-8")
 
-    monkeypatch.setattr(
-        tree_snapshot_module,
-        "_tree_snapshot_checkpoint",
-        change_excluded_file,
-    )
+    _on_checkpoint(monkeypatch, "before-final-verification", change_excluded_file)
     sources = open_project_sources(tmp_path)
     try:
         snapshot = sources.capture()
@@ -243,15 +339,6 @@ def test_closed_source_binding_rejects_later_capture(
         sources.capture()
 
 
-def test_missing_project_keeps_the_empty_index_contract(tmp_path: Path) -> None:
-    missing = tmp_path / "missing"
-
-    index = index_project(missing)
-
-    assert index.root == missing.resolve()
-    assert index.declarations == {}
-
-
 @pytest.mark.parametrize("root_kind", ["missing", "file"])
 def test_direct_snapshot_names_a_stable_invalid_root(
     tmp_path: Path,
@@ -261,15 +348,7 @@ def test_direct_snapshot_names_a_stable_invalid_root(
     root = tmp_path / "root"
     if root_kind == "file":
         root.write_text("not a directory\n")
-    attempts = 0
-    original_bind = lean_module.bind_project_sources
-
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    attempts = _count_binds(monkeypatch)
     monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
     reason = (
         "directory root does not exist"
@@ -280,7 +359,7 @@ def test_direct_snapshot_names_a_stable_invalid_root(
     with pytest.raises(lean_module.LeanSourceError, match=reason):
         snapshot_project_sources(root)
 
-    assert attempts == lean_module._SNAPSHOT_ATTEMPTS
+    assert len(attempts) == lean_module._SNAPSHOT_ATTEMPTS
 
 
 def test_index_project_keeps_supporting_a_symlinked_root(tmp_path: Path) -> None:
@@ -319,8 +398,7 @@ def test_symlinked_root_preserves_an_absolute_descendant_exclusion(
 
 
 def test_source_binding_rejects_root_replacement(tmp_path: Path) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     project = tmp_path / "project"
     _index(project, "def original : Nat := 0\n")
     sources = open_project_sources(project)
@@ -343,37 +421,28 @@ def test_source_capture_rejects_mid_capture_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not (
-        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
-        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
-    ):
-        pytest.skip("directory descriptor capture is unavailable")
+    _require_descriptor_capture()
     source = tmp_path / "Project" / "Basic.lean"
     _index(tmp_path, "def before : Nat := 0\n")
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
     changed = False
 
-    def change_source(event: str, relative: str) -> None:
+    def change_source() -> None:
         nonlocal changed
-        original_checkpoint(event, relative)
-        if event == "before-final-verification" and not changed:
+        if not changed:
             changed = True
             source.write_text("def after : Nat := 1000\n", encoding="utf-8")
 
-    monkeypatch.setattr(
-        tree_snapshot_module,
-        "_tree_snapshot_checkpoint",
-        change_source,
-    )
+    _on_checkpoint(monkeypatch, "before-final-verification", change_source)
 
     sources = open_project_sources(tmp_path)
     try:
-        with pytest.raises(TreeSnapshotError, match="changed while it was captured"):
+        with pytest.raises(TreeChangedError, match="changed while it was captured") as error:
             sources.capture()
     finally:
         sources.close()
 
     assert changed
+    assert error.value.relative == "Project/Basic.lean"
 
 
 def test_snapshot_retries_a_capture_that_races_one_edit(
@@ -382,17 +451,15 @@ def test_snapshot_retries_a_capture_that_races_one_edit(
 ) -> None:
     source = tmp_path / "Project" / "Basic.lean"
     _index(tmp_path, "def before : Nat := 0\n")
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
     changed = False
 
-    def change_source_once(event: str, relative: str) -> None:
+    def change_source_once() -> None:
         nonlocal changed
-        original_checkpoint(event, relative)
-        if event == "before-final-verification" and not changed:
+        if not changed:
             changed = True
             source.write_text("def after : Nat := 1000\n", encoding="utf-8")
 
-    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", change_source_once)
+    _on_checkpoint(monkeypatch, "before-final-verification", change_source_once)
     monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
 
     snapshot = snapshot_project_sources(tmp_path)
@@ -402,41 +469,818 @@ def test_snapshot_retries_a_capture_that_races_one_edit(
     assert snapshot.index.find("before") is None
 
 
+@pytest.mark.parametrize(
+    ("entry", "edited", "unattributed_first_open", "named"),
+    [
+        ("snapshot", "B", False, "Project/B.lean"),
+        ("bind", "B", False, "Project/B.lean"),
+        # Each changed path is named once, in the order the attempts saw it.
+        ("snapshot", "AB", False, "Project/A.lean, Project/B.lean"),
+        # An attempt whose change names no path adds nothing to the list.
+        ("snapshot", "B", True, "Project/B.lean"),
+    ],
+    ids=["snapshot", "bind", "two-paths", "unattributed"],
+)
 def test_snapshot_reports_sources_that_keep_changing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    edited: str,
+    unattributed_first_open: bool,
+    named: str,
 ) -> None:
-    source = tmp_path / "Project" / "Basic.lean"
-    _index(tmp_path, "def churn : Nat := 0\n")
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    _require_descriptor_capture()
+    _index(tmp_path, "def a : Nat := 0\n", "Project/A.lean")
+    _index(tmp_path, "def b : Nat := 0\n", "Project/B.lean")
     edits = 0
+    opens = 0
+    original_open = lean_module.open_project_sources
 
-    def change_source(event: str, relative: str) -> None:
+    def open_sources(*args, **kwargs):
+        nonlocal opens
+        opens += 1
+        if unattributed_first_open and opens == 1:
+            raise TreeChangedError("directory tree changed before it was captured")
+        return original_open(*args, **kwargs)
+
+    def change_source() -> None:
         nonlocal edits
-        original_checkpoint(event, relative)
-        if event == "before-final-verification":
-            edits += 1
-            # Each edit also changes the size, so coarse timestamps cannot hide it.
-            source.write_text(f"def churn : Nat := {'1' * (edits + 1)}\n", encoding="utf-8")
+        name = edited[min(edits, len(edited) - 1)]
+        edits += 1
+        # Each edit also changes the size, so coarse timestamps cannot hide it.
+        (tmp_path / "Project" / f"{name}.lean").write_text(
+            f"def churn : Nat := {'1' * (edits + 1)}\n",
+            encoding="utf-8",
+        )
 
-    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", change_source)
+    monkeypatch.setattr(lean_module, "open_project_sources", open_sources)
+    _on_checkpoint(monkeypatch, "before-final-verification", change_source)
     monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
 
-    with pytest.raises(lean_module.LeanSourceError, match="Lean sources kept changing while they were indexed"):
-        snapshot_project_sources(tmp_path)
+    with pytest.raises(lean_module.LeanSourceError, match="Lean sources kept changing while they were indexed") as error:
+        _capture_through(entry, tmp_path)
 
-    assert edits == lean_module._SNAPSHOT_ATTEMPTS
+    assert opens == lean_module._SNAPSHOT_ATTEMPTS
+    assert edits == lean_module._SNAPSHOT_ATTEMPTS - unattributed_first_open
+    assert str(error.value) == f"Lean sources kept changing while they were indexed; changed: {named}"
+
+
+def _at(monkeypatch: pytest.MonkeyPatch, when: str, action: Callable[[], object]) -> list[str]:
+    """Run `action` once at the capture moment `when`; the returned list records that it ran.
+
+    `when` is "verify" (the checkpoint before the final verification), "list F"
+    (the checkpoint after the scan lists folder F; "list " is the root),
+    "relist F" (just before folder F's end-of-scan relist, not verification's), or "open N after W"
+    or "opendir N after W" (just before the first descriptor-relative open of N
+    as a file or as a folder once moment W has passed).
+    """
+    fired: list[str] = []
+
+    def once() -> None:
+        if not fired:
+            fired.append(when)
+            action()
+
+    kind, _, rest = when.partition(" ")
+    if kind == "verify":
+        _on_checkpoint(monkeypatch, "before-final-verification", once)
+    elif kind == "list":
+        _on_checkpoint(monkeypatch, "after-directory-list", once, relative=rest)
+    elif kind == "relist":
+        original_recheck = tree_snapshot_module._recheck_scanned_directory
+
+        def recheck(descriptor, *, relative: str, **kwargs):
+            # Verification relists through the same function; only the scan's
+            # call, which passes no verify_kept, is the end-of-scan relist.
+            if relative == rest and kwargs.get("verify_kept") is None:
+                once()
+            return original_recheck(descriptor, relative=relative, **kwargs)
+
+        monkeypatch.setattr(tree_snapshot_module, "_recheck_scanned_directory", recheck)
+    else:
+        name, _, after = rest.partition(" after ")
+        armed = _at(monkeypatch, after, lambda: None)
+        original_open = os.open
+
+        def open_after(path, flags, mode=0o777, *, dir_fd=None):
+            directory = bool(flags & getattr(os, "O_DIRECTORY", 0))
+            if armed and path == name and dir_fd is not None and directory == (kind == "opendir"):
+                once()
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "open", open_after)
+    return fired
+
+
+def _write_site(site: Path, generation: int) -> None:
+    (site / "assets").mkdir(parents=True, exist_ok=True)
+    (site / "assets" / "a.css").write_text(f"/* {generation} */\n", encoding="utf-8")
+    (site / "index.html").write_text(f"<p>{generation}</p>\n", encoding="utf-8")
+
+
+_PACKETS_MANIFEST = '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+
+
+def _packets_output(folder: Path, revision: int) -> None:
+    folder.mkdir()
+    (folder / "manifest.json").write_text(_PACKETS_MANIFEST, encoding="utf-8")
+    (folder / "Packet.lean").write_text(f"def generated{revision} : Nat := 0\n", encoding="utf-8")
+
+
+def _clone(worker: Path, revision: int) -> None:
+    (worker / ".git").mkdir(parents=True)
+    (worker / ".git/HEAD").write_text(f"ref: refs/heads/r{revision}\n", encoding="utf-8")
+    (worker / "Project").mkdir()
+    (worker / "Project/Worker.lean").write_text(f"def nestedWorker{revision} : Nat := 0\n", encoding="utf-8")
+
+
+def _lean(path: Path, name: str = "x") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"def {name} : Nat := 0\n", encoding="utf-8")
+
+
+def _lock_link(path: Path, number: int = 1) -> Path:
+    path.unlink(missing_ok=True)
+    try:
+        path.symlink_to(f"user@host.{number}:1700000000")
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    return path
+
+
+def _notes_folder(path: Path) -> None:
+    path.mkdir()
+    (path / "notes.txt").write_text("notes\n", encoding="utf-8")
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _replace(path: Path, make: Callable[[Path], object]) -> None:
+    _remove(path)
+    make(path)
+
+
+def _clean_site(site: Path) -> None:
+    # mkdocs keeps the output folder and replaces its children.
+    for entry in site.iterdir():
+        _remove(entry)
+    _write_site(site, 1)
+
+
+def _atomic_save(folder: Path) -> None:
+    (folder / ".notes.md.1.swp").write_text("swap\n", encoding="utf-8")
+    (folder / "notes.md.tmp").write_text("1\n", encoding="utf-8")
+    os.replace(folder / "notes.md.tmp", folder / "notes.md")
+
+
+def _republish_packets(root: Path) -> None:
+    # Publish as skeleton output does: stage beside the output, move the old
+    # output to a backup, rename the stage into place, drop the backup.
+    generated = root / "review-packets"
+    stage = root / ".review-packets.autoform-stage-1"
+    _packets_output(stage, 1)
+    _replace_outputs([(generated, stage, _output_identity(generated))])
+    assert sorted(path.name for path in root.iterdir()) == ["Proj", "review-packets"]
+
+
+def _git_folder(path: Path) -> None:
+    (path / ".git").mkdir(parents=True)
+    _lean(path / "Packet.lean", "generated0")
+
+
+def _web_app(path: Path, revision: int) -> None:
+    path.mkdir()
+    (path / "manifest.json").write_text(f'{{"name": "web app {revision}"}}\n', encoding="utf-8")
+
+
+def _expose_packets(generated: Path) -> None:
+    generated.rename(generated.parent / ".held")
+    _lean(generated / "Packet.lean", "exposed")
+
+
+def _rehide_packets(generated: Path) -> None:
+    shutil.rmtree(generated)
+    (generated.parent / ".held").rename(generated)
+
+
+# Each case: (setup, [(moment, change), ...], names the capture must not
+# index).  The root holds Proj/A.lean ("kept") besides what setup adds, and
+# setup and change receive the root.  Every change leaves Lean inputs alone, so
+# the capture succeeds in one attempt.
+_UNRELATED_CHANGES = [
+    pytest.param(
+        lambda r: _write_site(r / "Aout/site", 0),
+        [("verify", lambda r: _replace(r / "Aout/site", lambda p: _write_site(p, 1)))],
+        (),
+        id="site-rebuilt",
+    ),
+    pytest.param(
+        lambda r: _write_site(r / "zz/site", 0),
+        [("verify", lambda r: _clean_site(r / "zz/site"))],
+        (),
+        id="site-cleaned",
+    ),
+    pytest.param(
+        lambda r: _write_site(r / "Aout/site", 0),
+        [("verify", lambda r: _remove(r / "Aout/site"))],
+        (),
+        id="site-removed",
+    ),
+    pytest.param(
+        lambda r: _write_site(r / "site", 0),
+        [("list ", lambda r: _remove(r / "site"))],
+        (),
+        id="site-removed-after-root-listing",
+    ),
+    pytest.param(
+        lambda r: _write_site(r / "site", 0),
+        [("list site", lambda r: _remove(r / "site"))],
+        (),
+        id="site-removed-after-its-listing",
+    ),
+    pytest.param(
+        lambda r: _write_site(r / "site", 0),
+        [("opendir site after verify", lambda r: _remove(r / "site"))],
+        (),
+        id="site-removed-before-verification-opens-it",
+    ),
+    pytest.param(
+        lambda r: (r / "notes.md").write_text("0\n", encoding="utf-8"),
+        [("verify", _atomic_save)],
+        (),
+        id="atomic-save-in-root",
+    ),
+    pytest.param(
+        lambda r: (r / "Proj/notes.md").write_text("0\n", encoding="utf-8"),
+        [("verify", lambda r: _atomic_save(r / "Proj"))],
+        (),
+        id="atomic-save-beside-lean-file",
+    ),
+    pytest.param(
+        lambda r: _lock_link(r / "Proj/.#A.lean").unlink(),
+        [("verify", lambda r: _lock_link(r / "Proj/.#A.lean"))],
+        (),
+        id="lock-link-appearing",
+    ),
+    pytest.param(
+        lambda r: _notes_folder(r / "Proj/site"),
+        [("relist Proj", lambda r: _replace(r / "Proj/site", lambda p: p.write_text("<html></html>\n")))],
+        (),
+        id="folder-turned-file-before-relist",
+    ),
+    pytest.param(
+        lambda r: _lock_link(r / "Proj/.#A.lean"),
+        [("relist Proj", lambda r: _lock_link(r / "Proj/.#A.lean", 2))],
+        (),
+        id="lock-link-rewritten-before-relist",
+    ),
+    pytest.param(
+        lambda r: _lean(r / "Proj/B.lean", "b"),
+        [("list Proj", lambda r: _remove(r / "Proj/B.lean"))],
+        ("b",),
+        id="lean-file-removed-before-its-lookup",
+    ),
+    pytest.param(
+        lambda r: _lean(r / "Proj/B.lean", "b"),
+        [("open B.lean after list Proj", lambda r: _remove(r / "Proj/B.lean"))],
+        ("b",),
+        id="lean-file-removed-before-its-read",
+    ),
+    pytest.param(
+        lambda r: _web_app(r / "site", 0),
+        [("verify", lambda r: _replace(r / "site", lambda p: _web_app(p, 1)))],
+        (),
+        id="unrecognized-manifest-rebuilt",
+    ),
+    pytest.param(
+        lambda r: _clone(r / "vendor/worker", 0),
+        [("verify", lambda r: _replace(r / "vendor/worker", lambda p: _clone(p, 1)))],
+        ("nestedWorker0", "nestedWorker1"),
+        id="nested-checkout-recloned",
+    ),
+    pytest.param(
+        lambda r: _packets_output(r / "review-packets", 0),
+        [("verify", _republish_packets)],
+        ("generated0", "generated1"),
+        id="skeleton-output-republished",
+    ),
+    pytest.param(
+        lambda r: _packets_output(r / "hidden", 0),
+        [("verify", lambda r: _remove(r / "hidden"))],
+        ("generated0",),
+        id="skeleton-output-removed",
+    ),
+    pytest.param(
+        lambda r: _git_folder(r / "hidden"),
+        [("verify", lambda r: _remove(r / "hidden"))],
+        ("generated0",),
+        id="nested-checkout-removed",
+    ),
+]
+
+
+@pytest.mark.parametrize(("setup", "changes", "absent"), _UNRELATED_CHANGES)
+def test_change_without_lean_inputs_is_captured_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setup: Callable[[Path], object],
+    changes: list,
+    absent: tuple[str, ...],
+) -> None:
+    _require_descriptor_capture()
+    _index(tmp_path, "def kept : Nat := 0\n", "Proj/A.lean")
+    setup(tmp_path)
+    fired = [_at(monkeypatch, when, lambda change=change: change(tmp_path)) for when, change in changes]
+
+    snapshot = _snapshot_in_one_attempt(monkeypatch, tmp_path)
+
+    assert fired == [[when] for when, _change in changes]
+    assert snapshot.index.find("kept") is not None
+    for name in absent:
+        assert snapshot.index.find(name) is None
+
+
+def _away(r: Path, relative: str, *, copy: bool = False) -> None:
+    (r / relative).rename(r.parent / "away")
+    if copy:
+        shutil.copytree(r.parent / "away", r / relative)
+
+
+def _back(r: Path, relative: str) -> None:
+    if (r / relative).exists():
+        shutil.rmtree(r / relative)
+    (r.parent / "away").rename(r / relative)
+
+
+def _swap_for_copy(r: Path, relative: str) -> None:
+    _away(r, relative, copy=True)
+    shutil.rmtree(r.parent / "away")
+
+
+def _sub_and_tail(r: Path) -> None:
+    _lean(r / "Proj/Sub/S.lean", "s")
+    (r / "Proj/Tail").mkdir()
+
+
+def _lean_in_site(site: Path, rebuilt: bool = False) -> None:
+    if rebuilt:
+        _replace(site, lambda path: _write_site(path, 1))
+    _lean(site / "New.lean")
+
+
+def _moved_out(r: Path, name: str, make: Callable[[Path], object] | None = None) -> None:
+    (r.parent / "outside").mkdir(exist_ok=True)
+    (r / "Proj" / name).rename(r.parent / "outside" / name)
+    if make is not None:
+        make(r / "Proj" / name)
+
+
+def _moved_in(r: Path, name: str) -> None:
+    if (r / "Proj" / name).exists():
+        (r / "Proj" / name).rename(r.parent / "outside" / "replacement")
+    (r.parent / "outside" / name).rename(r / "Proj" / name)
+
+
+# Each case: (setup, [(moment, change), ...], the path the failed capture
+# names).  The root holds Proj/A.lean besides what setup adds; setup and change
+# receive the root, whose parent holds entries moved out of the tree.
+_LEAN_CHANGES = [
+    pytest.param(
+        lambda r: None,
+        [("verify", lambda r: _swap_for_copy(r, "Proj"))],
+        "Proj",
+        id="lean-folder-replaced-by-copy",
+    ),
+    pytest.param(
+        lambda r: _lean(r / "Proj/B.lean", "b"),
+        [("verify", lambda r: _remove(r / "Proj/A.lean"))],
+        "Proj/A.lean",
+        id="lean-file-removed",
+    ),
+    pytest.param(
+        lambda r: _write_site(r / "site", 0),
+        [("verify", lambda r: _lean_in_site(r / "site"))],
+        "site/New.lean",
+        id="lean-file-in-unrelated-folder",
+    ),
+    pytest.param(
+        lambda r: _write_site(r / "site", 0),
+        [("verify", lambda r: _lean_in_site(r / "site", rebuilt=True))],
+        "site/New.lean",
+        id="lean-file-in-rebuilt-unrelated-folder",
+    ),
+    pytest.param(
+        lambda r: _write_site(r / "site", 0),
+        [("verify", lambda r: _lean(r / "fresh/New.lean"))],
+        "fresh/New.lean",
+        id="lean-file-in-new-folder",
+    ),
+    pytest.param(
+        lambda r: _write_site(r / "site", 0),
+        [("verify", lambda r: _lean(r / "site/deep/New.lean"))],
+        "site/deep/New.lean",
+        id="lean-file-in-new-nested-folder",
+    ),
+    # Only the relist at the end of the folder's scan sees X.lean, as on the
+    # strict path: it appears after the listing and is gone by verification.
+    pytest.param(
+        lambda r: _lean(r / "Zed/B.lean", "b"),
+        [("list Zed", lambda r: _lean(r / "Zed/X.lean")), ("verify", lambda r: _remove(r / "Zed/X.lean"))],
+        "Zed/X.lean",
+        id="lean-file-only-during-its-lean-folders-scan",
+    ),
+    # site holds no Lean file, so it is relisted although it is not recorded.
+    pytest.param(
+        lambda r: _write_site(r / "site", 0),
+        [("list site", lambda r: _lean(r / "site/X.lean")), ("verify", lambda r: _remove(r / "site/X.lean"))],
+        "site/X.lean",
+        id="lean-file-only-during-its-unrelated-folders-scan",
+    ),
+    # An empty folder named X.lean becomes a regular file between the
+    # verification walk's stat and its open, which fails with ENOTDIR.
+    pytest.param(
+        lambda r: (r / "X.lean").mkdir(),
+        [("opendir X.lean after verify", lambda r: _replace(r / "X.lean", _lean))],
+        "X.lean",
+        id="lean-named-folder-turned-file-during-verification-walk",
+    ),
+    # The scan keeps nothing for the entry, which becomes a .lean file before
+    # Proj's end-of-scan relist and is gone before verification.
+    pytest.param(
+        lambda r: _notes_folder(r / "Proj/X.lean"),
+        [("relist Proj", lambda r: _replace(r / "Proj/X.lean", _lean)), ("verify", lambda r: _remove(r / "Proj/X.lean"))],
+        "Proj/X.lean",
+        id="unselected-folder-turned-lean-file-before-relist",
+    ),
+    pytest.param(
+        lambda r: _lock_link(r / "Proj/.#A.lean"),
+        [("relist Proj", lambda r: _replace(r / "Proj/.#A.lean", _lean)), ("verify", lambda r: _remove(r / "Proj/.#A.lean"))],
+        "Proj/.#A.lean",
+        id="lock-link-turned-lean-file-before-relist",
+    ),
+    # Moved out of the tree between the scan's lookup and its open, so the scan
+    # drops B.lean as vanished or walks the notes folder that took D's place;
+    # moved back before Proj's relist, it loses its Lean input before
+    # verification.  Only the relist sees it, and only because the scan keeps
+    # no identity for a dropped file and the opened identity of a walked folder.
+    pytest.param(
+        lambda r: _lean(r / "Proj/B.lean", "b"),
+        [
+            ("open B.lean after list Proj", lambda r: _moved_out(r, "B.lean")),
+            ("relist Proj", lambda r: _moved_in(r, "B.lean")),
+            ("verify", lambda r: _remove(r / "Proj/B.lean")),
+        ],
+        "Proj/B.lean",
+        id="lean-file-moved-out-at-open-and-back-before-relist",
+    ),
+    pytest.param(
+        lambda r: _lean(r / "Proj/D/New.lean", "n"),
+        [
+            ("opendir D after list Proj", lambda r: _moved_out(r, "D", _notes_folder)),
+            ("relist Proj", lambda r: _moved_in(r, "D")),
+            ("verify", lambda r: _remove(r / "Proj/D/New.lean")),
+        ],
+        "Proj/D/New.lean",
+        id="lean-folder-moved-out-at-open-and-back-before-relist",
+    ),
+    # Proj/Sub is restored before verification, so only the scan's own checks
+    # see it: gone at Proj's relist, or a different folder when Proj looks at
+    # Sub again after descending into it.
+    pytest.param(
+        _sub_and_tail,
+        [("list Proj/Tail", lambda r: _away(r, "Proj/Sub")), ("verify", lambda r: _back(r, "Proj/Sub"))],
+        "Proj/Sub",
+        id="lean-folder-moved-away-during-its-parents-scan",
+    ),
+    pytest.param(
+        lambda r: _lean(r / "Proj/Sub/S.lean", "s"),
+        [("list Proj/Sub", lambda r: _away(r, "Proj/Sub", copy=True)), ("verify", lambda r: _back(r, "Proj/Sub"))],
+        "Proj/Sub",
+        id="lean-folder-replaced-by-copy-during-its-scan",
+    ),
+    # A marker that appears in a folder of Lean files hides them; only the
+    # folder's end-of-scan relist sees one that is gone again by verification.
+    pytest.param(
+        lambda r: _lean(r / "vendor/lib/Lib.lean", "vendored"),
+        [("relist vendor/lib", lambda r: (r / "vendor/lib/.git").mkdir()), ("verify", lambda r: (r / "vendor/lib/.git").rmdir())],
+        "vendor/lib",
+        id="checkout-marker-only-at-its-folders-relist",
+    ),
+    pytest.param(
+        lambda r: _packets_output(r / "review-packets", 0),
+        [("verify", lambda r: _expose_packets(r / "review-packets"))],
+        "review-packets/Packet.lean",
+        id="skeleton-output-replaced-by-lean-folder",
+    ),
+    pytest.param(
+        lambda r: _packets_output(r / "review-packets", 0),
+        [("verify", lambda r: _remove(r / "review-packets/manifest.json"))],
+        "review-packets/Packet.lean",
+        id="skeleton-output-unmarked-in-place",
+    ),
+    pytest.param(
+        lambda r: _packets_output(r / "review-packets", 0),
+        [("relist ", lambda r: _expose_packets(r / "review-packets")), ("verify", lambda r: _rehide_packets(r / "review-packets"))],
+        "review-packets/Packet.lean",
+        id="skeleton-output-exposed-only-at-root-relist",
+    ),
+]
+
+
+@pytest.mark.parametrize(("setup", "changes", "named"), _LEAN_CHANGES)
+def test_lean_change_is_caught_and_named(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setup: Callable[[Path], object],
+    changes: list,
+    named: str,
+) -> None:
+    _require_descriptor_capture()
+    root = tmp_path / "root"
+    _index(root, "def kept : Nat := 0\n", "Proj/A.lean")
+    setup(root)
+    fired = [_at(monkeypatch, when, lambda change=change: change(root)) for when, change in changes]
+
+    assert _changed_path(root) == named
+    expected = [[when] for when, _change in changes]
+    if len(changes) > 1:
+        # The last change hides the first from the final verification, so an
+        # earlier check must catch it and verification is never reached.
+        expected[-1] = []
+    assert fired == expected
+
+
+@pytest.mark.parametrize("step", ["lookup", "examine"])
+@pytest.mark.parametrize(
+    ("name", "named"),
+    [("B.lean", "Proj/B.lean"), ("Sub", "Proj/Sub/S.lean"), ("L.lean", "Proj/L.lean")],
+    ids=["file", "folder", "link"],
+)
+def test_lean_entry_dropped_as_vanished_and_back_at_its_folders_relist_is_caught(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    named: str,
+    step: str,
+) -> None:
+    # The scan finds the entry gone at its lookup, or when it examines it (the
+    # open of a file or folder, the readlink of a link), and drops it.  The
+    # entry is back right after that call, so Proj's end-of-scan relist lists
+    # it, and it is gone again before verification.  Only that relist can see
+    # it, by examining the name it dropped.
+    _require_descriptor_capture()
+    _index(tmp_path, "def a : Nat := 0\n", "Proj/A.lean")
+    entry = tmp_path / "Proj" / name
+
+    def restore() -> None:
+        if name == "L.lean":
+            entry.symlink_to("A.lean")
+        else:
+            _lean(entry / "S.lean" if name == "Sub" else entry, "b")
+
+    restore()
+    call = "stat" if step == "lookup" else "readlink" if name == "L.lean" else "open"
+    original = getattr(os, call)
+    armed = _at(monkeypatch, "list Proj", lambda: None)
+    fired: list[str] = []
+
+    def vanish_around_call(path, *args, **kwargs):
+        if armed and not fired and path == name and kwargs.get("dir_fd") is not None:
+            fired.append(step)
+            _remove(entry)
+            try:
+                return original(path, *args, **kwargs)
+            finally:
+                restore()
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, call, vanish_around_call)
+    _at(monkeypatch, "verify", lambda: _remove(entry))
+
+    assert _changed_path(tmp_path) == named
+    assert fired == [step]
+
+
+def test_lean_file_edited_while_it_is_read_is_named(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_descriptor_capture()
+    _index(tmp_path, "def kept : Nat := 0\n", "Proj/A.lean")
+    source = tmp_path / "Proj" / "A.lean"
+    original_fdopen = os.fdopen
+    edited = False
+
+    def edit_once(descriptor, *args, **kwargs):
+        nonlocal edited
+        if not edited and os.fstat(descriptor).st_ino == source.stat().st_ino:
+            edited = True
+            with source.open("a", encoding="utf-8") as handle:
+                handle.write("def edited : Nat := 1\n")
+        return original_fdopen(descriptor, *args, **kwargs)
+
+    monkeypatch.setattr(tree_snapshot_module.os, "fdopen", edit_once)
+    monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
+
+    assert _changed_path(tmp_path) == "Proj/A.lean"
+    edited = False
+    binds = _count_binds(monkeypatch)
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert edited
+    assert len(binds) == 2
+    assert snapshot.index.find("edited") is not None
+
+
+
+
+def test_marker_candidate_removed_before_it_is_read_is_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_descriptor_capture()
+    _index(tmp_path, "def kept : Nat := 0\n", "Proj/A.lean")
+    site = tmp_path / "site"
+    site.mkdir()
+    manifest = site / "manifest.json"
+    manifest.write_text('{"name": "web app"}\n', encoding="utf-8")
+    original_names = tree_snapshot_module._capture_directory_names
+    removed = False
+
+    def list_then_remove(descriptor, **kwargs):
+        nonlocal removed
+        names = original_names(descriptor, **kwargs)
+        if not removed and "manifest.json" in names:
+            # The site generator removes its output between the listing and
+            # the marker lookup.
+            removed = True
+            manifest.unlink()
+        return names
+
+    monkeypatch.setattr(tree_snapshot_module, "_capture_directory_names", list_then_remove)
+
+    snapshot = _snapshot_in_one_attempt(monkeypatch, tmp_path)
+
+    assert removed
+    assert snapshot.index.find("kept") is not None
+
+
+
+def test_checkout_marker_appearing_beside_lean_files_is_caught(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_descriptor_capture()
+    _index(tmp_path, "def main : Nat := 0\n", "Main.lean")
+    _index(tmp_path, "def vendored : Nat := 0\n", "vendor/lib/Lib.lean")
+    marker = tmp_path / "vendor" / "lib" / ".git"
+
+    def clone() -> None:
+        if not marker.exists():
+            marker.mkdir()
+
+    _on_checkpoint(monkeypatch, "before-final-verification", clone)
+
+    assert _changed_path(tmp_path) == "vendor/lib"
+
+    marker.rmdir()
+    binds = _count_binds(monkeypatch)
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert len(binds) == 2
+    assert snapshot.index.find("main") is not None
+    assert snapshot.index.find("vendored") is None
+
+
+def test_unrelated_folders_do_not_change_tree_revisions(tmp_path: Path) -> None:
+    _require_descriptor_capture()
+    plain = tmp_path / "plain"
+    busy = tmp_path / "busy"
+    for root in (plain, busy):
+        _index(root, "def a : Nat := 0\n", "Proj/A.lean")
+    _write_site(busy / "site", 0)
+    (busy / "docs").mkdir()
+    (busy / "docs" / "x.md").write_text("notes\n", encoding="utf-8")
+
+    def capture(root: Path):
+        sources = open_project_sources(root)
+        try:
+            return sources.tree.capture(), sources.capture()
+        finally:
+            sources.close()
+
+    plain_tree, plain_sources = capture(plain)
+    busy_tree, busy_sources = capture(busy)
+    shutil.rmtree(busy / "site")
+    _write_site(busy / "site", 1)
+    rebuilt_tree, rebuilt_sources = capture(busy)
+
+    assert busy_tree.revision == plain_tree.revision
+    assert busy_sources.revision == plain_sources.revision
+    assert rebuilt_tree.generation_revision == busy_tree.generation_revision
+    assert rebuilt_sources.generation_revision == busy_sources.generation_revision
+
+
+def test_verification_walk_charges_capture_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_descriptor_capture()
+    _index(tmp_path, "def kept : Nat := 0\n", "Proj/A.lean")
+    (tmp_path / "site").mkdir()
+    # Proj, site and Proj/A.lean: three entries per pass.
+    limits = TreeCaptureLimits(max_entries=5)
+    monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
+    assert snapshot_project_sources(tmp_path, limits=limits).index.find("kept") is not None
+
+    def grow() -> None:
+        for number in range(10):
+            (tmp_path / "site" / f"page{number}.html").write_text("x\n", encoding="utf-8")
+
+    _on_checkpoint(monkeypatch, "before-final-verification", grow)
+    binds = _count_binds(monkeypatch)
+
+    with pytest.raises(lean_module.LeanSourceError, match="max_entries"):
+        snapshot_project_sources(tmp_path, limits=limits)
+
+    assert len(binds) == 2
+
+
+@pytest.mark.parametrize("excluded", [".lake", "build"])
+def test_rechecks_do_not_walk_excluded_folders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    excluded: str,
+) -> None:
+    _require_descriptor_capture()
+    _index(tmp_path, "def kept : Nat := 0\n", "Proj/A.lean")
+    (tmp_path / excluded).mkdir()
+    for number in range(10):
+        (tmp_path / excluded / f"Out{number}.lean").write_text(f"def out{number} : Nat := 0\n", encoding="utf-8")
+    binds = _count_binds(monkeypatch)
+
+    # Proj, the excluded folder and Proj/A.lean: three entries per pass, so
+    # walking the excluded folder's ten entries would exceed the limit.
+    snapshot = snapshot_project_sources(tmp_path, limits=TreeCaptureLimits(max_entries=5))
+
+    assert len(binds) == 1
+    assert snapshot.index.find("kept") is not None
+    assert snapshot.index.find("out0") is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "reason"),
+    [
+        # Opening site is refused.
+        (0, "permission denied: site"),
+        # site opens and lists, but looking up its entries is refused, which
+        # blames site because a lookup checks only the folder's search permission.
+        (0o444, "permission denied: site"),
+    ],
+    ids=["open", "lookup"],
+)
+def test_folder_refused_to_a_selected_recheck_is_not_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: int,
+    reason: str,
+) -> None:
+    _require_descriptor_capture()
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses directory permissions")
+    _index(tmp_path, "def kept : Nat := 0\n", "Proj/A.lean")
+    site = tmp_path / "site"
+    site.mkdir()
+
+    def refuse() -> None:
+        if os.access(site, os.W_OK):
+            (site / "New.lean").write_text("def appeared : Nat := 0\n", encoding="utf-8")
+            site.chmod(mode)
+
+    _on_checkpoint(monkeypatch, "before-final-verification", refuse)
+    monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
+    binds = _count_binds(monkeypatch)
+    try:
+        # The verification cannot look into site, so the attempt is a change;
+        # the retry's scan then reports the lasting refusal.
+        with pytest.raises(lean_module.LeanSourceError, match=rf"^{re.escape(reason)}$"):
+            snapshot_project_sources(tmp_path)
+    finally:
+        site.chmod(0o755)
+
+    assert len(binds) == 2
 
 
 def test_snapshot_retries_a_root_replaced_while_it_is_bound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not (
-        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
-        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
-    ):
-        pytest.skip("directory descriptor capture is unavailable")
+    _require_descriptor_capture()
     project = tmp_path / "project"
     _index(project, "def canonical : Nat := 0\n")
     replacement = tmp_path / "replacement"
@@ -451,22 +1295,14 @@ def test_snapshot_retries_a_root_replaced_while_it_is_bound(
             return original_stat(replacement, *args, **kwargs)
         return original_stat(path, *args, **kwargs)
 
-    original_bind = lean_module.bind_project_sources
-    attempts = 0
-
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    attempts = _count_binds(monkeypatch)
     monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
     with monkeypatch.context() as context:
         context.setattr(directory_binding_module.os, "stat", stat_once_replaced)
         snapshot = snapshot_project_sources(project)
 
     assert swapped
-    assert attempts == 2
+    assert len(attempts) == 2
     assert snapshot.index.find("canonical") is not None
 
 
@@ -524,11 +1360,14 @@ def test_nested_checkouts_are_not_indexed_as_project_source(
 
 
 @pytest.mark.parametrize("replacement_kind", ["file", "directory"])
-def test_nested_checkout_marker_replacement_retries_one_generation(
+def test_nested_checkout_marker_replacement_is_captured_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     replacement_kind: str,
 ) -> None:
+    # A nested checkout contributes no Lean input, so its marker is not kept:
+    # swapping a clone's .git folder for a worktree's .git file (or back)
+    # leaves it hidden and is not a change.
     _index(tmp_path)
     worker = tmp_path / "vendor/worker"
     (worker / "Project").mkdir(parents=True)
@@ -543,14 +1382,10 @@ def test_nested_checkout_marker_replacement_retries_one_generation(
     )
 
     changed = False
-    attempts = 0
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
-    original_bind = lean_module.bind_project_sources
 
-    def replace_marker(event: str, relative: str) -> None:
+    def replace_marker() -> None:
         nonlocal changed
-        original_checkpoint(event, relative)
-        if event != "before-final-verification" or changed:
+        if changed:
             return
         changed = True
         if replacement_kind == "file":
@@ -560,19 +1395,12 @@ def test_nested_checkout_marker_replacement_retries_one_generation(
             marker.unlink()
             marker.mkdir()
 
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
-    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", replace_marker)
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    _on_checkpoint(monkeypatch, "before-final-verification", replace_marker)
     monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
 
-    snapshot = snapshot_project_sources(tmp_path)
+    snapshot = _snapshot_in_one_attempt(monkeypatch, tmp_path)
 
     assert changed
-    assert attempts == 2
     assert snapshot.index.find("toplevel") is not None
     assert snapshot.index.find("nestedWorker") is None
 
@@ -619,11 +1447,7 @@ def test_lasting_capture_failure_is_reported_without_retrying(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    if not (
-        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
-        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
-    ):
-        pytest.skip("directory descriptor capture is unavailable")
+    _require_descriptor_capture()
     _index(tmp_path, "def canonical : Nat := 0\n")
 
     def fail_read(*_args, **_kwargs):
@@ -636,15 +1460,7 @@ def test_lasting_capture_failure_is_reported_without_retrying(
         "_read_file",
         fail_read,
     )
-    original_bind = lean_module.bind_project_sources
-    attempts = 0
-
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    attempts = _count_binds(monkeypatch)
     reason = (
         f"directory tree could not be read: {os.strerror(errno.EIO)}"
         if failure == "io-error"
@@ -654,7 +1470,64 @@ def test_lasting_capture_failure_is_reported_without_retrying(
     with pytest.raises(lean_module.LeanSourceError, match=rf"^{re.escape(reason)}$"):
         snapshot_project_sources(tmp_path)
 
-    assert attempts == 1
+    assert len(attempts) == 1
+
+
+def test_selected_verification_recurses_in_three_frames_per_folder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Capture has no depth limit, so the frames verification spends per
+    # folder level decide how deep a tree fits under the recursion limit.
+    _require_descriptor_capture()
+    folder = tmp_path / "d" / "d" / "d" / "d"
+    folder.mkdir(parents=True)
+    (folder / "Deep.lean").write_text("def deep : Nat := 0\n")
+    frames_at_level: dict[int, int] = {}
+    lookup = tree_snapshot_module._lookup
+
+    def counting_lookup(descriptor: int, name: str, relative: str) -> os.stat_result:
+        names = []
+        frame = sys._getframe()
+        while frame is not None:
+            names.append(frame.f_code.co_name)
+            frame = frame.f_back
+        if "_verify_snapshot" in names:
+            level = relative.count("/") + 1 if relative else 0
+            frames_at_level.setdefault(level, len(names))
+        return lookup(descriptor, name, relative)
+
+    monkeypatch.setattr(tree_snapshot_module, "_lookup", counting_lookup)
+
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert snapshot.index.find("deep") is not None
+    assert [frames_at_level[level + 1] - frames_at_level[level] for level in range(4)] == [3, 3, 3, 3]
+
+
+def test_selected_verification_calls_back_through_a_plain_function(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A C-implemented callback such as functools.partial adds no Python frame,
+    # so the frame count above misses it, but it spends CPython's separate C
+    # recursion budget at every folder level of verification.
+    _require_descriptor_capture()
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "Deep.lean").write_text("def deep : Nat := 0\n")
+    callbacks: list[type] = []
+    recheck = tree_snapshot_module._recheck_scanned_directory
+
+    def recording_recheck(*args: object, **kwargs: object) -> object:
+        if kwargs.get("verify_kept") is not None:
+            callbacks.append(type(kwargs["verify_kept"]))
+        return recheck(*args, **kwargs)
+
+    monkeypatch.setattr(tree_snapshot_module, "_recheck_scanned_directory", recording_recheck)
+
+    snapshot_project_sources(tmp_path)
+
+    assert callbacks and set(callbacks) == {types.FunctionType}
 
 
 @pytest.mark.parametrize(
@@ -688,6 +1561,114 @@ def test_unreadable_lean_source_is_named_by_its_relative_path(
     assert str(tmp_path) not in str(caught.value)
 
 
+def test_unsearchable_directory_is_blamed_instead_of_its_children(tmp_path: Path) -> None:
+    """A folder with read but no search permission lists its names, but every
+    lookup of one fails; the folder is at fault, not its entries."""
+
+    _require_descriptor_capture()
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses directory permissions")
+    _index(tmp_path, "def canonical : Nat := 0\n")
+    unsearchable = tmp_path / "Project" / "Sub"
+    unsearchable.mkdir()
+    (unsearchable / "Hidden.lean").write_text("def hidden : Nat := 0\n", encoding="utf-8")
+    unsearchable.chmod(0o644)
+    try:
+        with pytest.raises(
+            lean_module.LeanSourceError,
+            match=r"^permission denied: Project/Sub$",
+        ):
+            snapshot_project_sources(tmp_path)
+    finally:
+        unsearchable.chmod(0o755)
+
+
+def test_search_permission_revoked_at_any_lookup_or_open_blames_the_folder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revoking search permission on a folder refuses every later lookup,
+    open and readlink of a name in it. Whichever of them the revocation
+    precedes, during capture or final verification, the folder is named."""
+
+    _require_descriptor_capture()
+    _index(tmp_path, "def canonical : Nat := 0\n")
+    project = tmp_path / "Project"
+    (project / "Sub").mkdir()
+    (project / "Sub" / "Nested.lean").write_text("def nested : Nat := 0\n", encoding="utf-8")
+    (project / "Link.lean").symlink_to("Basic.lean")
+    (project / "Out").mkdir()
+    (project / "Out" / "manifest.json").write_text(
+        json.dumps({"kind": "packets", "packets": [], "schema": "autoform-skeleton-packets/v2"}),
+        encoding="utf-8",
+    )
+    folders = {}
+    for relative in (".", "Project", "Project/Sub", "Project/Out"):
+        metadata = os.stat(tmp_path / relative)
+        folders[metadata.st_dev, metadata.st_ino] = relative
+    operations = 0
+    revoke_at = 0
+    revoked = None
+
+    def by_name(original):
+        def operation(path, *args, dir_fd=None, **kwargs):
+            nonlocal operations, revoked
+            if dir_fd is not None:
+                metadata = os.fstat(dir_fd)
+                folder = (metadata.st_dev, metadata.st_ino)
+                if folder in folders:
+                    operations += 1
+                    if operations == revoke_at:
+                        revoked = folder
+                    if folder == revoked:
+                        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+            return original(path, *args, dir_fd=dir_fd, **kwargs)
+
+        return operation
+
+    for name in ("stat", "open", "readlink"):
+        monkeypatch.setattr(os, name, by_name(getattr(os, name)))
+    # Lean indexing rejects the link only after the capture has read it.
+    with pytest.raises(lean_module.LeanSourceError, match="symbolic links are not supported"):
+        snapshot_project_sources(tmp_path)
+    for revoke_at in range(1, operations + 1):
+        operations = 0
+        revoked = None
+        with pytest.raises(lean_module.LeanSourceError) as caught:
+            snapshot_project_sources(tmp_path)
+        assert str(caught.value) == f"permission denied: {folders[revoked]}", revoke_at
+
+
+def test_entry_vanishing_after_a_refused_open_is_retried_as_a_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Telling who refused an open repeats the lookup; if the entry is gone
+    by then, nothing was refused for good and the capture is retried."""
+
+    _require_descriptor_capture()
+    _index(tmp_path, "def canonical : Nat := 0\n")
+    failures = [
+        ("open", PermissionError(errno.EACCES, "refused")),
+        ("stat", FileNotFoundError(errno.ENOENT, "vanished")),
+    ]
+
+    def failing(name):
+        original = getattr(os, name)
+
+        def operation(path, *args, dir_fd=None, **kwargs):
+            if dir_fd is not None and path == "Basic.lean" and failures[:1] and failures[0][0] == name:
+                raise failures.pop(0)[1]
+            return original(path, *args, dir_fd=dir_fd, **kwargs)
+
+        return operation
+
+    for name in ("open", "stat"):
+        monkeypatch.setattr(os, name, failing(name))
+    snapshot_project_sources(tmp_path)
+    assert failures == []
+
+
 def test_unsupported_entry_name_is_reported_without_retrying(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -699,20 +1680,12 @@ def test_unsupported_entry_name_is_reported_without_retrying(
         (tmp_path / "Project" / "Odd\\Name.lean").write_text("def odd : Nat := 0\n", encoding="utf-8")
     except OSError:
         pytest.skip("backslashes in file names are unavailable")
-    original_bind = lean_module.bind_project_sources
-    attempts = 0
-
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    attempts = _count_binds(monkeypatch)
 
     with pytest.raises(lean_module.LeanSourceError, match="directory tree contains an unsupported entry name"):
         snapshot_project_sources(tmp_path)
 
-    assert attempts == 1
+    assert len(attempts) == 1
 
 
 def test_portable_binding_rejects_a_replacement_root_generation(
@@ -724,9 +1697,7 @@ def test_portable_binding_rejects_a_replacement_root_generation(
     replacement = tmp_path / "replacement"
     _index(replacement, "def replacement : Nat := 0\n")
     displaced = tmp_path / "displaced"
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
     bound = BoundDirectoryTree(project)
     original_verify = bound.verify
     original_capture = tree_snapshot_module._capture_portable
@@ -767,8 +1738,7 @@ def test_descriptor_and_portable_capture_have_identical_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     root = tmp_path / "tree"
     (root / "a" / "x").mkdir(parents=True)
     (root / "a-").mkdir()
@@ -777,9 +1747,7 @@ def test_descriptor_and_portable_capture_have_identical_order(
     with bind_directory_tree(root) as bound:
         descriptor_snapshot = bound.capture()
 
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
     with bind_directory_tree(root) as bound:
         portable_snapshot = bound.capture()
 
@@ -789,58 +1757,6 @@ def test_descriptor_and_portable_capture_have_identical_order(
         descriptor_snapshot.generation_revision
         == portable_snapshot.generation_revision
     )
-
-
-def test_expected_child_identity_is_checked_during_descriptor_capture(
-    tmp_path: Path,
-) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
-    root = tmp_path / "tree"
-    child = root / "child"
-    child.mkdir(parents=True)
-    (child / "Original.lean").write_text("def original : Nat := 0\n")
-    expected = (child.stat().st_dev, child.stat().st_ino)
-    displaced = tmp_path / "displaced"
-    replacement = tmp_path / "replacement"
-    replacement.mkdir()
-    (replacement / "Replacement.lean").write_text("def replacement : Nat := 0\n")
-    binding = directory_binding_module.open_directory(root)
-    try:
-        child.rename(displaced)
-        replacement.rename(child)
-        with pytest.raises(TreeSnapshotError, match="changed while it was captured"):
-            capture_directory_descriptor(
-                binding.descriptor,
-                expected_children={"child": expected},
-            )
-    finally:
-        binding.close()
-
-
-def test_expected_child_rejects_a_case_colliding_entry(tmp_path: Path) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
-    root = tmp_path / "tree"
-    child = root / "child"
-    child.mkdir(parents=True)
-    collision = root / "CHILD"
-    try:
-        collision.mkdir()
-    except FileExistsError:
-        pytest.skip("filesystem does not permit case-colliding directory names")
-    if collision.samefile(child):
-        pytest.skip("filesystem does not permit case-colliding directory names")
-    expected = (child.stat().st_dev, child.stat().st_ino)
-    binding = directory_binding_module.open_directory(root)
-    try:
-        with pytest.raises(TreeSnapshotError, match="changed while it was captured"):
-            capture_directory_descriptor(
-                binding.descriptor,
-                expected_children={"child": expected},
-            )
-    finally:
-        binding.close()
 
 
 def test_portable_binding_rejects_a_symlinked_ancestor(
@@ -855,9 +1771,7 @@ def test_portable_binding_rejects_a_symlinked_ancestor(
         alias.symlink_to(real, target_is_directory=True)
     except OSError:
         pytest.skip("symlinks are unavailable")
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
 
     with pytest.raises(TreeSnapshotError, match="unsafe component"):
         BoundDirectoryTree(alias / "project")
@@ -876,9 +1790,7 @@ def test_portable_capture_does_not_require_path_stat_no_follow(
             raise NotImplementedError("no-follow stat is unavailable")
         return original_stat(self, *args, **kwargs)
 
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
     monkeypatch.setattr(Path, "stat", stat_without_no_follow)
 
     with bind_directory_tree(root) as bound:
@@ -911,10 +1823,6 @@ def test_portable_capture_rejects_an_unrestored_nested_directory_redirection(
             nested.symlink_to(outside, target_is_directory=True)
         return True
 
-    def checkpoint(event: str, _relative: str) -> None:
-        if event == "between-portable-captures":
-            restore()
-
     original_signature = tree_snapshot_module._stat_signature
 
     def coarse_directory_signature(metadata):
@@ -923,8 +1831,8 @@ def test_portable_capture_rejects_an_unrestored_nested_directory_redirection(
             return (*signature[:3], 0, 0, 0, 0)
         return signature
 
-    monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
-    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", checkpoint)
+    _use_portable_capture(monkeypatch)
+    _on_checkpoint(monkeypatch, "between-portable-captures", restore)
     monkeypatch.setattr(tree_snapshot_module, "_stat_signature", coarse_directory_signature)
     bound = BoundDirectoryTree(
         root,
@@ -972,7 +1880,7 @@ def test_portable_capture_rejects_a_restored_nested_directory_redirection(
             displaced.rename(nested)
             restored += 1
 
-    original_names = tree_snapshot_module._capture_path_names
+    original_names = tree_snapshot_module._capture_directory_names
     original_read = tree_snapshot_module._read_portable_file
     original_signature = tree_snapshot_module._stat_signature
 
@@ -995,8 +1903,8 @@ def test_portable_capture_rejects_a_restored_nested_directory_redirection(
             return (*signature[:3], 0, 0, 0, 0)
         return signature
 
-    monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
-    monkeypatch.setattr(tree_snapshot_module, "_capture_path_names", redirect_then_list)
+    _use_portable_capture(monkeypatch)
+    monkeypatch.setattr(tree_snapshot_module, "_capture_directory_names", redirect_then_list)
     monkeypatch.setattr(tree_snapshot_module, "_read_portable_file", read_then_restore)
     monkeypatch.setattr(tree_snapshot_module, "_stat_signature", coarse_directory_signature)
     bound = BoundDirectoryTree(
@@ -1044,9 +1952,7 @@ def test_portable_capture_rejects_a_file_swapped_to_fifo_without_blocking(
     def blocking_path_open(*_args, **_kwargs):
         raise AssertionError("portable capture must use nonblocking os.open")
 
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
     monkeypatch.setattr(Path, "open", blocking_path_open)
     bound = BoundDirectoryTree(
         root,
@@ -1065,9 +1971,7 @@ def test_portable_binding_normalizes_an_invalid_root_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
 
     with pytest.raises(TreeSnapshotError, match="cannot be inspected safely"):
         BoundDirectoryTree(tmp_path / "bad\0name")
@@ -1085,8 +1989,7 @@ def test_source_binding_normalizes_an_invalid_exclusion_path(
 def test_directory_binding_resolves_dot_dot_after_a_symlinked_ancestor_physically(
     tmp_path: Path,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     holder = tmp_path / "holder"
     (holder / "target").mkdir(parents=True)
     elsewhere = tmp_path / "elsewhere"
@@ -1108,8 +2011,7 @@ def test_directory_binding_resolves_dot_dot_after_a_symlinked_ancestor_physicall
 
 
 def test_directory_binding_refuses_a_symlinked_root(tmp_path: Path) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     real = tmp_path / "real"
     real.mkdir()
     alias = tmp_path / "alias"
@@ -1123,8 +2025,7 @@ def test_directory_binding_refuses_a_symlinked_root(tmp_path: Path) -> None:
 
 
 def test_directory_binding_accepts_a_symlinked_ancestor(tmp_path: Path) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     real = tmp_path / "real"
     project = real / "project"
     _index(project, "def throughAncestorLink : Nat := 0\n")
@@ -1149,8 +2050,7 @@ def test_directory_binding_accepts_a_symlinked_ancestor(tmp_path: Path) -> None:
 def test_directory_binding_needs_only_search_permission_on_ancestors(
     tmp_path: Path,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         pytest.skip("root bypasses directory permissions")
     ancestor = tmp_path / "search-only"
@@ -1175,8 +2075,7 @@ def test_directory_binding_rejects_an_invalid_path_without_opening_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     parent = tmp_path / "parent"
     parent.mkdir()
     original_open = os.open
@@ -1203,8 +2102,7 @@ def test_directory_binding_closes_its_descriptor_when_the_root_changes_while_ope
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     root = tmp_path / "root"
     root.mkdir()
     replacement = tmp_path / "replacement"
@@ -1324,25 +2222,22 @@ def test_exclusion_plan_survives_root_rename_restore_aba(
     _index(replacement, "def replacementOnly : Nat := 0\n", "Other.lean")
     displaced = tmp_path / "displaced"
     sources = open_project_sources(root, exclude_roots=(excluded,))
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
     swapped = False
 
-    def swap_and_restore(event: str, relative: str) -> None:
+    def swap() -> None:
         nonlocal swapped
-        original_checkpoint(event, relative)
-        if event == "after-directory-list" and relative == "" and not swapped:
+        if not swapped:
             root.rename(displaced)
             replacement.rename(root)
             swapped = True
-        elif event == "before-final-verification" and relative == "" and swapped:
+
+    def restore() -> None:
+        if swapped:
             root.rename(replacement)
             displaced.rename(root)
 
-    monkeypatch.setattr(
-        tree_snapshot_module,
-        "_tree_snapshot_checkpoint",
-        swap_and_restore,
-    )
+    _on_checkpoint(monkeypatch, "after-directory-list", swap, relative="")
+    _on_checkpoint(monkeypatch, "before-final-verification", restore, relative="")
     snapshot = None
     try:
         try:
@@ -1434,18 +2329,15 @@ def test_ignored_symlink_target_churn_does_not_invalidate_sources(
         link.symlink_to("target-0")
     except OSError:
         pytest.skip("symlinks are unavailable")
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
     edits = 0
 
-    def churn_link(event: str, relative: str) -> None:
+    def churn_link() -> None:
         nonlocal edits
-        original_checkpoint(event, relative)
-        if event == "before-final-verification" and relative == "":
-            edits += 1
-            link.unlink()
-            link.symlink_to(f"target-{edits}")
+        edits += 1
+        link.unlink()
+        link.symlink_to(f"target-{edits}")
 
-    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", churn_link)
+    _on_checkpoint(monkeypatch, "before-final-verification", churn_link, relative="")
 
     snapshot = snapshot_project_sources(tmp_path)
 
@@ -1469,6 +2361,27 @@ def test_lean_symlink_is_refused_whether_or_not_its_target_exists(tmp_path: Path
         snapshot_project_sources(tmp_path)
 
     assert str(tmp_path) not in str(caught.value)
+
+
+def test_case_variants_of_the_lean_suffix_are_ignored(tmp_path: Path) -> None:
+    _require_descriptor_capture()
+    _index(tmp_path, "def canonical : Nat := 0\n")
+    project = tmp_path / "Project"
+    clean = snapshot_project_sources(tmp_path)
+    (project / "Y.LEAN").write_text("theorem variantY : True := trivial\n", encoding="utf-8")
+    (project / "L.Lean").symlink_to("Basic.lean")
+    os.mkfifo(project / "P.LEAN")
+    unreadable = project / "U.Lean"
+    unreadable.touch(mode=0)
+    try:
+        captured = snapshot_project_sources(tmp_path)
+    finally:
+        unreadable.chmod(0o644)
+
+    assert set(captured.index.declarations) == {"canonical"}
+    assert captured.index.line_counts == {Path("Project/Basic.lean"): 1}
+    assert captured.revision == clean.revision
+    assert captured.generation_revision == clean.generation_revision
 
 
 def test_source_digest_preserves_surrogate_escaped_filename_bytes(tmp_path: Path) -> None:
@@ -1509,345 +2422,56 @@ def test_malformed_manifest_value_does_not_escape_source_indexing(
     assert index.find("visible") is not None
 
 
-@pytest.mark.parametrize(
-    "relative",
-    [
-        "../escaped.txt",
-        "C:escaped.txt",
-        "C:/escaped.txt",
-        "NUL",
-        "NUL.txt",
-        "NUL .txt",
-        "trailing.",
-        "trailing ",
-        "invalid?.txt",
-        "control\x01.txt",
-    ],
-)
-def test_snapshot_materialization_rejects_non_relative_paths(
-    tmp_path: Path,
-    relative: str,
-) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("",),
-        files=((relative, b"escaped\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
-    destination = tmp_path / "destination"
-
-    with pytest.raises(TreeSnapshotError, match="unsafe materialization path"):
-        snapshot.materialize_regular_files(destination)
-
-    assert not destination.exists()
-    assert not (tmp_path / "escaped.txt").exists()
-
-
-@pytest.mark.parametrize(
-    ("files", "directories"),
-    [
-        ((("A.txt", b"first"), ("a.txt", b"second")), ("",)),
-        ((("parent", b"file"), ("parent/child", b"child")), ("",)),
-        ((("a/child", b"child"),), ("", "A")),
-        ((), ("", "a/b")),
-    ],
-)
-def test_snapshot_materialization_rejects_aliases_and_type_conflicts(
-    tmp_path: Path,
-    files: tuple[tuple[str, bytes], ...],
-    directories: tuple[str, ...],
-) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=directories,
-        files=files,
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
-    destination = tmp_path / "destination"
-
-    with pytest.raises(TreeSnapshotError, match="materialization path"):
-        snapshot.materialize_regular_files(destination)
-
-    assert not destination.exists()
-
-
-def test_snapshot_materialization_orders_valid_directory_records(tmp_path: Path) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("", "a/b", "a"),
-        files=(("a/b/result.txt", b"result\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
-    destination = tmp_path / "destination"
-
-    snapshot.materialize_regular_files(destination)
-
-    assert (destination / "a/b/result.txt").read_bytes() == b"result\n"
-
-
-def test_snapshot_materialization_root_swap_never_redirects_bytes(
+def test_outer_managed_marker_hides_everything_below_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("", "nested"),
-        files=(("result.txt", b"captured\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
+    _index(tmp_path, "def authored : Nat := 0\n", "Authored.lean")
+    nested = tmp_path / "generated" / "nested"
+    nested.mkdir(parents=True)
+    (tmp_path / "generated" / "manifest.json").write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
     )
-    destination = tmp_path / "destination"
-    displaced = tmp_path / "displaced"
-    outside = tmp_path / "outside"
-    outside.mkdir()
+    (nested / "Copied.lean").write_text("def hiddenByOuterMarker : Nat := 0\n")
+    (nested / "manifest.json").write_text("{}\n")
     original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
-    swapped = False
+    scanned: list[str] = []
 
-    def swap_root(event: str, relative: str) -> None:
-        nonlocal swapped
+    def record_scan(event: str, relative: str) -> None:
         original_checkpoint(event, relative)
-        if event == "after-materialization-directory-open" and relative == "":
-            destination.rename(displaced)
-            destination.symlink_to(outside, target_is_directory=True)
-            swapped = True
+        if event == "after-directory-list":
+            scanned.append(relative)
 
-    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", swap_root)
-    try:
-        with pytest.raises(TreeSnapshotError, match="materialization"):
-            snapshot.materialize_regular_files(destination)
-        assert swapped
-        assert not (outside / "result.txt").exists()
-    finally:
-        if destination.is_symlink():
-            destination.unlink()
-        if displaced.exists():
-            for child in displaced.iterdir():
-                child.unlink()
-            displaced.rmdir()
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", record_scan)
+
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert snapshot.index.find("authored") is not None
+    assert snapshot.index.find("hiddenByOuterMarker") is None
+    # The scan lists every folder it walks; the root shows the hook fired.
+    assert "" in scanned
+    assert "generated/nested" not in scanned
 
 
-def test_snapshot_materialization_nested_swap_never_redirects_bytes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("", "nested"),
-        files=(("nested/result.txt", b"captured\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
-    destination = tmp_path / "destination"
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    displaced = destination / "nested-displaced"
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
-
-    def swap_nested(event: str, relative: str) -> None:
-        original_checkpoint(event, relative)
-        if event == "after-materialization-directory-open" and relative == "nested":
-            (destination / "nested").rename(displaced)
-            (destination / "nested").symlink_to(outside, target_is_directory=True)
-
-    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", swap_nested)
-    try:
-        with pytest.raises(TreeSnapshotError, match="materialization"):
-            snapshot.materialize_regular_files(destination)
-        assert not (outside / "result.txt").exists()
-    finally:
-        linked = destination / "nested"
-        if linked.is_symlink():
-            linked.unlink()
-        if displaced.exists():
-            displaced.rmdir()
-        if destination.exists():
-            destination.rmdir()
-
-
-def test_snapshot_materialization_retries_short_writes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("",),
-        files=(("result.txt", b"captured bytes\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
-    destination = tmp_path / "destination"
-    original_write = tree_snapshot_module.os.write
-
-    def short_write(descriptor: int, data) -> int:
-        return original_write(descriptor, bytes(data[:1]))
-
-    monkeypatch.setattr(tree_snapshot_module.os, "write", short_write)
-
-    snapshot.materialize_regular_files(destination)
-
-    assert (destination / "result.txt").read_bytes() == b"captured bytes\n"
-
-
-def test_snapshot_materialization_closes_descriptors_after_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("", "nested"),
-        files=(("nested/result.txt", b"captured\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
-    destination = tmp_path / "destination"
-    original_open = tree_snapshot_module.os.open
-    original_write = tree_snapshot_module.os.write
-    opened: list[int] = []
-    writes = 0
-
-    def tracked_open(*args, **kwargs):
-        descriptor = original_open(*args, **kwargs)
-        opened.append(descriptor)
-        return descriptor
-
-    def fail_second_write(descriptor: int, data) -> int:
-        nonlocal writes
-        writes += 1
-        if writes == 1:
-            return original_write(descriptor, bytes(data[:1]))
-        raise OSError(errno.EIO, "injected materialization failure")
-
-    monkeypatch.setattr(tree_snapshot_module.os, "open", tracked_open)
-    monkeypatch.setattr(tree_snapshot_module.os, "write", fail_second_write)
-
-    with pytest.raises(TreeSnapshotError, match="materialized safely"):
-        snapshot.materialize_regular_files(destination)
-
-    assert opened
-    assert writes == 2
-    for descriptor in opened:
-        with pytest.raises(OSError):
-            os.fstat(descriptor)
-    assert not destination.exists()
-
-
-@pytest.mark.parametrize(
-    "attack",
-    ["replace", "overwrite", "inject", "chmod", "hardlink"],
-)
-def test_snapshot_materialization_rejects_final_tree_tampering(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    attack: str,
-) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("", "nested"),
-        files=(("first.txt", b"first\n"), ("second.txt", b"second\n")),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
-    destination = tmp_path / "destination"
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
-    attacked = False
-
-    def tamper_before_second_file(event: str, relative: str) -> None:
-        nonlocal attacked
-        original_checkpoint(event, relative)
-        if (
-            event != "before-materialization-file-open"
-            or relative != "second.txt"
-            or attacked
-        ):
-            return
-        attacked = True
-        first = destination / "first.txt"
-        if attack == "replace":
-            first.unlink()
-            first.write_bytes(b"evil!\n")
-        elif attack == "overwrite":
-            first.write_bytes(b"evil!\n")
-        elif attack == "inject":
-            (destination / "injected.lean").write_text("def injected : Nat := 0\n")
-        elif attack == "chmod":
-            destination.chmod(0o777)
-            (destination / "nested").chmod(0o777)
-            first.chmod(0o666)
-        else:
-            os.link(first, tmp_path / "outside-link")
-
-    monkeypatch.setattr(
-        tree_snapshot_module,
-        "_tree_snapshot_checkpoint",
-        tamper_before_second_file,
+def test_folded_duplicate_marker_leaves_its_folder_indexed(tmp_path: Path) -> None:
+    generated = tmp_path / "review-packets"
+    generated.mkdir()
+    (generated / "manifest.json").write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
     )
     try:
-        with pytest.raises(TreeSnapshotError):
-            snapshot.materialize_regular_files(destination)
-        assert attacked
-    finally:
-        outside_link = tmp_path / "outside-link"
-        if outside_link.exists():
-            outside_link.unlink()
-        if destination.exists():
-            for child in destination.iterdir():
-                child.rmdir() if child.is_dir() else child.unlink()
-            destination.rmdir()
+        (generated / "MANIFEST.JSON").symlink_to("elsewhere")
+    except FileExistsError:
+        pytest.skip("filesystem folds letter case in names")
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    (generated / "Visible.lean").write_text("def visibleBesideFoldedLink : Nat := 0\n")
 
+    index = index_project(tmp_path)
 
-def test_outer_managed_marker_ignores_unrelated_files_below_it(
-    tmp_path: Path,
-) -> None:
-    outer_name = "manifest.json"
-    outer_data = (
-        b'{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
-    )
-    nested_name = "other.json"
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("", "generated", "generated/nested"),
-        files=(
-            ("generated/nested/Copied.lean", b"def hiddenByOuterMarker : Nat := 0\n"),
-            (f"generated/nested/{nested_name}", b"{}\n"),
-            (f"generated/{outer_name}", outer_data),
-        ),
-        symlinks=((f"generated/nested/{nested_name.upper()}", "elsewhere"),),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
-
-    index = lean_module._indexed_source_snapshot(tmp_path, snapshot, ())
-
-    assert index.index.find("hiddenByOuterMarker") is None
+    # Two folded matches are no marker, so the capture descends and reads the
+    # Lean file; indexing must keep what the capture kept.
+    assert index.find("visibleBesideFoldedLink") is not None
 
 
 def test_empty_non_source_directory_does_not_change_lean_generation(tmp_path: Path) -> None:
@@ -1869,27 +2493,17 @@ def test_directory_permission_churn_does_not_create_a_stale_generation_revision(
     _index(tmp_path, "def stableAcrossDirectoryMode : Nat := 0\n")
     source_directory.chmod(0o755)
     assert stat.S_IMODE(source_directory.stat().st_mode) == 0o755
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
     changed = False
 
-    def change_directory_mode(event: str, relative: str) -> None:
+    def change_directory_mode() -> None:
         nonlocal changed
-        original_checkpoint(event, relative)
-        if event == "before-final-verification" and relative == "" and not changed:
+        if not changed:
             source_directory.chmod(0o700)
             changed = True
 
-    monkeypatch.setattr(
-        tree_snapshot_module,
-        "_tree_snapshot_checkpoint",
-        change_directory_mode,
-    )
-    during_change = snapshot_project_sources(tmp_path)
-    monkeypatch.setattr(
-        tree_snapshot_module,
-        "_tree_snapshot_checkpoint",
-        original_checkpoint,
-    )
+    with monkeypatch.context() as context:
+        _on_checkpoint(context, "before-final-verification", change_directory_mode, relative="")
+        during_change = snapshot_project_sources(tmp_path)
     after_change = snapshot_project_sources(tmp_path)
 
     assert changed
@@ -1985,13 +2599,14 @@ def test_managed_output_marker_prunes_before_any_descendant_open(
     )
     original_read = tree_snapshot_module._read_file
 
-    def refuse_descendant(parent_descriptor, name, expected, *, max_bytes=None):
+    def refuse_descendant(parent_descriptor, name, expected, *, relative, max_bytes=None):
         if name == "Packet.lean":
             raise AssertionError("managed descendants must not be opened")
         return original_read(
             parent_descriptor,
             name,
             expected,
+            relative=relative,
             max_bytes=max_bytes,
         )
 
@@ -2015,17 +2630,14 @@ def test_managed_output_descendant_churn_does_not_retry_source_capture(
     (generated / "manifest.json").write_text(
         '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
     )
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
     edits = 0
 
-    def churn_output(event: str, relative: str) -> None:
+    def churn_output() -> None:
         nonlocal edits
-        original_checkpoint(event, relative)
-        if event == "before-final-verification" and relative == "":
-            edits += 1
-            packet.write_text(f"def generated : Nat := {edits}\n")
+        edits += 1
+        packet.write_text(f"def generated : Nat := {edits}\n")
 
-    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", churn_output)
+    _on_checkpoint(monkeypatch, "before-final-verification", churn_output, relative="")
 
     snapshot = snapshot_project_sources(tmp_path)
 
@@ -2034,10 +2646,15 @@ def test_managed_output_descendant_churn_does_not_retry_source_capture(
     assert snapshot.index.find("generated") is None
 
 
-def test_managed_marker_verification_never_reenumerates_opaque_siblings(
+def test_managed_marker_folder_is_listed_once_per_look_and_never_entered(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Skeleton output contributes no Lean input, so verification looks at it
+    # as at any unrecorded folder: one listing to recognize its marker, and
+    # no further.  The scan's listing is the only other one; the end-of-scan
+    # relist skips the folder because its identity did not change.  Growth
+    # inside it now counts against capture limits as a fresh scan would.
     _index(tmp_path, "def authored : Nat := 0\n", "Authored.lean")
     generated = tmp_path / "review-packets"
     generated.mkdir()
@@ -2047,46 +2664,44 @@ def test_managed_marker_verification_never_reenumerates_opaque_siblings(
     )
     generated_identity = (generated.stat().st_dev, generated.stat().st_ino)
     original_scandir = tree_snapshot_module.os.scandir
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
     opaque_scans = 0
 
-    def one_opaque_scan(path):
+    def count_opaque_scans(path):
         nonlocal opaque_scans
         if isinstance(path, int):
             metadata = os.fstat(path)
             if (metadata.st_dev, metadata.st_ino) == generated_identity:
                 opaque_scans += 1
-                if opaque_scans > 1:
-                    raise AssertionError("opaque siblings were re-enumerated")
         return original_scandir(path)
+    original_read = tree_snapshot_module._read_file
 
-    def add_irrelevant_churn(event: str, relative: str) -> None:
-        original_checkpoint(event, relative)
-        if event == "before-final-verification" and relative == "":
-            for index in range(100):
-                (generated / f"junk-{index}").write_text("junk\n")
+    def refuse_descendant(parent_descriptor, name, expected, *, relative, max_bytes=None):
+        if name == "Packet.lean":
+            raise AssertionError("managed descendants must not be opened")
+        return original_read(parent_descriptor, name, expected, relative=relative, max_bytes=max_bytes)
 
-    monkeypatch.setattr(tree_snapshot_module.os, "scandir", one_opaque_scan)
-    monkeypatch.setattr(
-        tree_snapshot_module,
-        "_tree_snapshot_checkpoint",
-        add_irrelevant_churn,
-    )
+    def add_irrelevant_churn() -> None:
+        for index in range(100):
+            (generated / f"junk-{index}").write_text("junk\n")
 
-    snapshot = snapshot_project_sources(
-        tmp_path,
-        limits=TreeCaptureLimits(max_entries=4),
-    )
+    monkeypatch.setattr(tree_snapshot_module.os, "scandir", count_opaque_scans)
+    monkeypatch.setattr(tree_snapshot_module, "_read_file", refuse_descendant)
+    _on_checkpoint(monkeypatch, "before-final-verification", add_irrelevant_churn, relative="")
 
-    assert opaque_scans == 1
+    snapshot = _snapshot_in_one_attempt(monkeypatch, tmp_path)
+
+    assert opaque_scans == 2
     assert snapshot.index.find("authored") is not None
     assert snapshot.index.find("generated") is None
 
 
-def test_managed_output_marker_change_retries_the_whole_capture(
+def test_managed_output_marker_rewrite_is_captured_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Skeleton output contributes no Lean input, so its manifest is not kept:
+    # a rewrite that is still recognized leaves the folder hidden and is not
+    # a change.
     _index(tmp_path, "def authored : Nat := 0\n", "Authored.lean")
     generated = tmp_path / "review-packets"
     generated.mkdir()
@@ -2095,34 +2710,23 @@ def test_managed_output_marker_change_retries_the_whole_capture(
     marker.write_text(
         '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
     )
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
     changed = False
-    attempts = 0
-    original_bind = lean_module.bind_project_sources
 
-    def change_marker_once(event: str, relative: str) -> None:
+    def change_marker_once() -> None:
         nonlocal changed
-        original_checkpoint(event, relative)
-        if event == "before-final-verification" and relative == "" and not changed:
+        if not changed:
             changed = True
             marker.write_text(
                 '{"kind": "packets", "packets": [], '
                 '"schema": "autoform-skeleton-packets/v2"}\n'
             )
 
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
-    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", change_marker_once)
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    _on_checkpoint(monkeypatch, "before-final-verification", change_marker_once, relative="")
     monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
 
-    snapshot = snapshot_project_sources(tmp_path)
+    snapshot = _snapshot_in_one_attempt(monkeypatch, tmp_path)
 
     assert changed
-    assert attempts == 2
     assert snapshot.index.find("authored") is not None
     assert snapshot.index.find("generated") is None
 
@@ -2147,21 +2751,14 @@ def test_root_managed_marker_churn_does_not_invalidate_sources(
     marker.write_text(
         '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
     )
-    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
     edits = 0
 
-    def churn_root_marker(event: str, relative: str) -> None:
+    def churn_root_marker() -> None:
         nonlocal edits
-        original_checkpoint(event, relative)
-        if event == "before-final-verification" and relative == "":
-            edits += 1
-            marker.write_text(f"{{\"irrelevant\": {edits}}}\n")
+        edits += 1
+        marker.write_text(f"{{\"irrelevant\": {edits}}}\n")
 
-    monkeypatch.setattr(
-        tree_snapshot_module,
-        "_tree_snapshot_checkpoint",
-        churn_root_marker,
-    )
+    _on_checkpoint(monkeypatch, "before-final-verification", churn_root_marker, relative="")
 
     snapshot = snapshot_project_sources(tmp_path)
 
@@ -2298,14 +2895,154 @@ def test_oversized_managed_manifest_leaves_its_directory_indexed_at_its_read_bou
 
     index = index_project(tmp_path)
 
-    assert observed_lengths == [65]
+    # The engine refuses bytes past the bound before it asks the recognizer.
+    assert observed_lengths == []
     assert index.find("oversizedPacket") is not None
+
+
+def test_only_a_complete_publication_manifest_hides_its_folder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Render copies a blueprint's Lean files into its site and mkdocs copies the
+    # site again, manifest included; both copies go stale when the source changes.
+    complete = {"complete": True, "schema": "autoform-publication/v2"}
+    manifests = {
+        "site-src": complete,
+        "site": complete,
+        "legacy": {**complete, "schema": "autoform-publication/v1"},
+        "unfinished": {**complete, "complete": False},
+        "web": {"name": "web app"},
+        "padded": {**complete, "padding": "x" * 64},
+    }
+    for folder, manifest in manifests.items():
+        (tmp_path / folder / "Copy").mkdir(parents=True)
+        (tmp_path / folder / "publication.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (tmp_path / folder / "Copy" / "Proofs.lean").write_text("theorem stale : True := trivial\n")
+    (tmp_path / "Proofs.lean").write_text("theorem renamed : True := trivial\n")
+    monkeypatch.setattr(lean_module, "PUBLICATION_MANIFEST_MAX_BYTES", 64, raising=False)
+
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert sorted(path.as_posix() for path, _data in snapshot.source_files) == [
+        "Proofs.lean",
+        "padded/Copy/Proofs.lean",
+        "unfinished/Copy/Proofs.lean",
+        "web/Copy/Proofs.lean",
+    ]
 
 
 def test_irreducible_definitions_are_indexed(tmp_path: Path) -> None:
     index = _index(tmp_path, "namespace A\nirreducible_def b : Nat := 1\nend A\n")
 
     assert index.find("A.b").keyword == "irreducible_def"
+
+
+def test_batteries_wanted_commands_are_indexed_with_their_keyword(tmp_path: Path) -> None:
+    source = [
+        "namespace W",
+        # The module system's `public`, as atlas-lean writes its wanted results.
+        "public theorem_wanted sturm (p : Nat) (hp : 0 < p) :",
+        "    p = p",
+        "private theorem_wanted lower : True",
+        "proof_wanted legacy : 1 = 1",
+        "@[simp] def_wanted η : Nat",
+        "def_wanted derived : Nat := ❰η❱ + 1",
+        "instance_wanted instFoo : Inhabited Nat",
+        "instance_wanted : Nonempty Nat",
+        "public theorem stated : True := trivial",
+        "end W",
+    ]
+    index = _index(tmp_path, "\n".join(source) + "\n")
+
+    assert {name: declaration.keyword for name, declaration in index.declarations.items()} == {
+        "W.sturm": "theorem_wanted",
+        "W.lower": "theorem_wanted",
+        "W.legacy": "proof_wanted",
+        "W.η": "def_wanted",
+        "W.derived": "def_wanted",
+        "W.instFoo": "instance_wanted",
+        "W.stated": "theorem",
+    }
+
+
+def test_aliases_are_indexed_with_where_their_target_can_be(tmp_path: Path) -> None:
+    source = [
+        "namespace A.B",
+        "alias u := t",
+        '@[deprecated (since := "2025-01-01")] protected alias «old u» := _root_.Nat.succ_le',
+        "alias ⟨mp, _⟩ := t_iff",
+        "alias ⟨_, mpr⟩ := t_iff",
+        "alias u2:=A.u",
+        "alias near :=",
+        "  t",
+        "alias far :=",
+        "",
+        "  t",
+        "private alias _root_.top := «x.y»",
+        # Without Batteries, `alias` is an ordinary identifier.
+        "  alias ++ s",
+        "  alias x",
+        "end A.B",
+    ]
+    index = _index(tmp_path, "\n".join(source) + "\n")
+
+    t = ("A.B.t", "A.t", "t")
+    assert {name: (declaration.protected, declaration.alias) for name, declaration in index.declarations.items()} == {
+        "A.B.u": (False, Alias(t, atomic=True, iff=False)),
+        "A.B.«old u»": (True, Alias(("Nat.succ_le",), atomic=False, iff=False)),
+        "A.B.mp": (False, Alias(("A.B.t_iff", "A.t_iff", "t_iff"), atomic=True, iff=True)),
+        "A.B.mpr": (False, Alias(("A.B.t_iff", "A.t_iff", "t_iff"), atomic=True, iff=True)),
+        "A.B.u2": (False, Alias(("A.B.A.u", "A.A.u", "A.u"), atomic=False, iff=False)),
+        "A.B.near": (False, Alias(t, atomic=True, iff=False)),
+        "A.B.far": (False, Alias(t, atomic=True, iff=False)),
+        "top": (False, Alias(("A.B.«x.y»", "A.«x.y»", "«x.y»"), atomic=True, iff=False)),
+    }
+    assert {declaration.keyword for declaration in index.declarations.values()} == {"alias"}
+    assert index.find("A.B.mpr").line == 5
+
+
+def test_root_qualified_names_leave_their_namespace_out(tmp_path: Path) -> None:
+    index = _index(tmp_path, "namespace A\ntheorem _root_.B.c : True := trivial\ntheorem d : True := trivial\nend A\n")
+
+    assert set(index.declarations) == {"B.c", "A.d"}
+
+
+def test_an_alias_is_followed_only_to_an_earlier_declaration_of_its_file(tmp_path: Path) -> None:
+    source = [
+        "namespace X",
+        "private theorem hidden : True := trivial",
+        "alias nearby := hidden",
+        "theorem base : True := trivial",
+        "alias chain := nearby",
+        "protected def p : Nat := 0",
+        "alias skips := p",
+        "protected",
+        "theorem q : True := trivial",
+        "alias skipsAbove := q",
+        "alias outside := Nat.succ_le_succ",
+        "alias partway := outside",
+        "end X",
+        "theorem t : True := trivial",
+        "namespace A",
+        "alias t := t",
+        "end A",
+        "alias dotted := X.p",
+    ]
+    (tmp_path / "A.lean").write_text("\n".join(source) + "\n", encoding="utf-8")
+    # `X.base` is in another file, on a later line than this alias.
+    (tmp_path / "B.lean").write_text("def base : Nat := 0\nnamespace X\nalias remote := base\nend X\n", encoding="utf-8")
+    index = index_project(tmp_path)
+
+    assert index.reached(index.find("X.chain")) == index.find("X.hidden")
+    assert index.reached(index.find("dotted")) == index.find("X.p")
+    # The alias is the innermost candidate of its own target, and is not declared yet.
+    assert index.alias_target(index.find("A.t")) == index.find("t")
+    # Another file may not be imported, the module system may have made a
+    # protected name private, which Lean does not skip, and a chain whose end
+    # is outside the index leads nowhere sure.
+    for name in ("X.remote", "X.skips", "X.skipsAbove", "X.partway"):
+        assert index.reached(index.find(name)) is None, name
 
 
 def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:
@@ -2396,71 +3133,8 @@ def test_no_link_without_repository_coordinates(tmp_path: Path) -> None:
     assert linker.location("Outer.alpha") is not None
 
 
-def test_build_linker_can_use_a_captured_index_without_live_detection(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    index = _index(tmp_path)
-
-    def unexpected_git(*_args, **_kwargs):
-        raise AssertionError("git detection must not run")
-
-    monkeypatch.setattr(lean_module, "_git", unexpected_git)
-
-    linker = build_linker(tmp_path, source_index=index, detect_missing=False)
-
-    assert linker.index is index
-    assert linker.repository_url is None
-    assert linker.ref is None
-
-
-def test_build_linker_never_pairs_a_captured_index_with_a_live_ref(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    index = _index(tmp_path)
-
-    def unexpected_ref(_root):
-        raise AssertionError("a captured source index requires an explicit ref")
-
-    monkeypatch.setattr(lean_module, "detect_ref", unexpected_ref)
-
-    linker = build_linker(
-        tmp_path,
-        repository_url="https://github.com/owner/repo",
-        source_index=index,
-    )
-
-    assert linker.ref is None
-    assert linker.url("Outer.alpha") is None
-
-
-def test_build_linker_rejects_a_captured_index_from_another_root(tmp_path: Path) -> None:
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    index = _index(first)
-    second.mkdir()
-
-    with pytest.raises(ValueError, match="different Lean root"):
-        build_linker(second, source_index=index, detect_missing=False)
-
-
-def _init_git_repository(root: Path, *, object_format: str = "sha1") -> str:
-    initialized = subprocess.run(
-        ["git", "init", f"--object-format={object_format}"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if initialized.returncode != 0:
-        pytest.skip(f"Git does not support {object_format} repositories")
-    subprocess.run(
-        ["git", "remote", "add", "origin", "https://github.com/owner/repo.git"],
-        cwd=root,
-        check=True,
-    )
-    subprocess.run(["git", "add", "."], cwd=root, check=True)
+def _git_commit(root: Path, message: str, path: str = ".") -> str:
+    subprocess.run(["git", "add", path], cwd=root, check=True)
     subprocess.run(
         [
             "git",
@@ -2470,7 +3144,7 @@ def _init_git_repository(root: Path, *, object_format: str = "sha1") -> str:
             "user.email=autoform@example.invalid",
             "commit",
             "-m",
-            "fixture",
+            message,
         ],
         cwd=root,
         capture_output=True,
@@ -2483,6 +3157,25 @@ def _init_git_repository(root: Path, *, object_format: str = "sha1") -> str:
         text=True,
         check=True,
     ).stdout.strip()
+
+
+def _init_git_repository(
+    root: Path,
+    *,
+    object_format: str = "sha1",
+    origin: str = "https://github.com/owner/repo.git",
+) -> str:
+    initialized = subprocess.run(
+        ["git", "init", f"--object-format={object_format}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if initialized.returncode != 0:
+        pytest.skip(f"Git does not support {object_format} repositories")
+    subprocess.run(["git", "remote", "add", "origin", origin], cwd=root, check=True)
+    return _git_commit(root, "fixture")
 
 
 @pytest.mark.parametrize("object_format", ["sha1", "sha256"])
@@ -2510,6 +3203,35 @@ def test_auto_linker_only_links_bytes_present_in_the_commit(
     assert linker.url("untracked") is None
 
 
+def test_tree_lookup_matches_the_spelling_git_committed_only_when_asked_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    on_disk = "Poincare\u0301\u212b.lean"  # NFD é, then U+212B ANGSTROM SIGN
+    committed = "Poincar\u00e9\u212b.lean"  # what macOS Git commits and prints: é composed, the sign kept
+    oid = "a" * 40
+
+    def ls_tree(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, f"100644 blob {oid}\t{committed}\0".encode(), b"")
+
+    monkeypatch.setattr(lean_module.subprocess, "run", ls_tree)
+    spellings: dict[str, str] = {}
+
+    assert lean_module._git_tree_oids(tmp_path, "c" * 40, (on_disk,), spellings) == {on_disk: oid}
+    assert spellings == {on_disk: committed}
+    assert lean_module._git_tree_oids(tmp_path, "c" * 40, (on_disk,)) == {committed: oid}
+
+
+def test_permalink_names_the_spelling_git_committed(tmp_path: Path) -> None:
+    linker = SourceLinker(
+        index=_index(tmp_path, "def decomposed : Nat := 0\n", "Poincare\u0301\u212b.lean"),
+        repository_url="https://github.com/owner/repo",
+        ref="deadbeef",
+        spellings={"Poincare\u0301\u212b.lean": "Poincar\u00e9\u212b.lean"},
+    )
+
+    assert linker.url("decomposed") == "https://github.com/owner/repo/blob/deadbeef/Poincar%C3%A9%E2%84%AB.lean#L1"
+
+
 def test_auto_linker_retries_ref_and_source_as_one_unit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2529,29 +3251,7 @@ def test_auto_linker_retries_ref_and_source_as_one_unit(
         captures += 1
         if captures == 1:
             source.write_text("def second : Nat := 0\n")
-            subprocess.run(["git", "add", "A.lean"], cwd=root, check=True)
-            subprocess.run(
-                [
-                    "git",
-                    "-c",
-                    "user.name=Autoform Tests",
-                    "-c",
-                    "user.email=autoform@example.invalid",
-                    "commit",
-                    "-m",
-                    "second",
-                ],
-                cwd=root,
-                capture_output=True,
-                check=True,
-            )
-            second_commit = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
+            second_commit = _git_commit(root, "second", "A.lean")
         return snapshot
 
     monkeypatch.setattr(lean_module, "snapshot_project_sources", capture_then_commit)
@@ -2566,29 +3266,6 @@ def test_auto_linker_retries_ref_and_source_as_one_unit(
     assert linker.url("second") == (
         f"https://github.com/owner/repo/blob/{second_commit}/A.lean#L1"
     )
-
-
-def test_build_linker_preserves_alias_spelled_exclusions(tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    _index(root, "def keptByLinker : Nat := 0\n", "Keep.lean")
-    excluded = root / "Generated"
-    excluded.mkdir()
-    (excluded / "Leak.lean").write_text("def leakedByLinker : Nat := 0\n")
-    alias = tmp_path / "alias"
-    try:
-        alias.symlink_to(root, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlinks are unavailable")
-
-    linker = build_linker(
-        alias,
-        exclude_roots=(alias / "generated",),
-        repository_url="https://github.com/owner/repo",
-        ref="attested",
-    )
-
-    assert linker.location("keptByLinker") is not None
-    assert linker.location("leakedByLinker") is None
 
 
 def test_auto_linker_supports_a_symlinked_repository_root(tmp_path: Path) -> None:
@@ -2617,29 +3294,7 @@ def test_auto_linker_ignores_git_replace_objects(tmp_path: Path) -> None:
     source.write_text("def originalTree : Nat := 0\n")
     original = _init_git_repository(root)
     source.write_text("def replacementTree : Nat := 0\n")
-    subprocess.run(["git", "add", "A.lean"], cwd=root, check=True)
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=Autoform Tests",
-            "-c",
-            "user.email=autoform@example.invalid",
-            "commit",
-            "-m",
-            "replacement",
-        ],
-        cwd=root,
-        capture_output=True,
-        check=True,
-    )
-    replacement = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+    replacement = _git_commit(root, "replacement", "A.lean")
     subprocess.run(["git", "checkout", "--detach", original], cwd=root, check=True)
     source.write_text("def replacementTree : Nat := 0\n")
     subprocess.run(["git", "replace", original, replacement], cwd=root, check=True)
@@ -2651,56 +3306,6 @@ def test_auto_linker_ignores_git_replace_objects(tmp_path: Path) -> None:
     assert linker.url("replacementTree") is None
 
 
-def test_explicit_ref_linker_keeps_remote_bound_to_resolved_root(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first = tmp_path / "first"
-    first.mkdir()
-    _index(first, "def fromFirstRepository : Nat := 0\n", "A.lean")
-    commit = _init_git_repository(first)
-    subprocess.run(
-        ["git", "remote", "set-url", "origin", "https://github.com/owner/A.git"],
-        cwd=first,
-        check=True,
-    )
-    second = tmp_path / "second"
-    second.mkdir()
-    _index(second, "def fromSecondRepository : Nat := 0\n", "B.lean")
-    _init_git_repository(second)
-    subprocess.run(
-        ["git", "remote", "set-url", "origin", "https://github.com/owner/B.git"],
-        cwd=second,
-        check=True,
-    )
-    alias = tmp_path / "alias"
-    try:
-        alias.symlink_to(first, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlinks are unavailable")
-    original_index = lean_module.index_project
-    swapped = False
-
-    def index_then_swap(*args, **kwargs):
-        nonlocal swapped
-        index = original_index(*args, **kwargs)
-        alias.unlink()
-        alias.symlink_to(second, target_is_directory=True)
-        swapped = True
-        return index
-
-    monkeypatch.setattr(lean_module, "index_project", index_then_swap)
-
-    linker = build_linker(alias, ref=commit)
-
-    assert swapped
-    assert linker.repository_url == "https://github.com/owner/A"
-    assert linker.location("fromFirstRepository") is not None
-    assert linker.url("fromFirstRepository") == (
-        f"https://github.com/owner/A/blob/{commit}/A.lean#L1"
-    )
-
-
 def test_auto_linker_ignores_inherited_repo_and_ci_redirects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2708,22 +3313,12 @@ def test_auto_linker_ignores_inherited_repo_and_ci_redirects(
     first = tmp_path / "first"
     first.mkdir()
     (first / "A.lean").write_text("def stableRepository : Nat := 0\n")
-    first_commit = _init_git_repository(first)
-    subprocess.run(
-        ["git", "remote", "set-url", "origin", "https://github.com/owner/A.git"],
-        cwd=first,
-        check=True,
-    )
+    first_commit = _init_git_repository(first, origin="https://github.com/owner/A.git")
     second = tmp_path / "second"
     second.mkdir()
     (second / "A.lean").write_text("def stableRepository : Nat := 0\n")
     (second / "OnlyB.txt").write_text("different tree\n")
-    second_commit = _init_git_repository(second)
-    subprocess.run(
-        ["git", "remote", "set-url", "origin", "https://github.com/owner/B.git"],
-        cwd=second,
-        check=True,
-    )
+    second_commit = _init_git_repository(second, origin="https://github.com/owner/B.git")
     monkeypatch.setenv("GIT_DIR", str(second / ".git"))
     monkeypatch.setenv("GIT_WORK_TREE", str(second))
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
@@ -2741,3 +3336,51 @@ def test_auto_linker_ignores_inherited_repo_and_ci_redirects(
     assert linker.url("stableRepository") == (
         f"https://github.com/owner/A/blob/{first_commit}/A.lean#L1"
     )
+
+
+def test_snapshot_attestation_accepts_a_clean_checkout_with_eol_conversion(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".gitattributes").write_text("*.lean text eol=crlf\n")
+    source = tmp_path / "A.lean"
+    source.write_text("def converted : Nat := 0\n")
+    commit = _init_git_repository(tmp_path)
+    source.unlink()
+    subprocess.run(["git", "checkout", "--", "A.lean"], cwd=tmp_path, check=True)
+    assert source.read_bytes() == b"def converted : Nat := 0\r\n"
+
+    assert verify_repository_snapshot(
+        tmp_path,
+        commit,
+        ((source, source.read_bytes()),),
+    ) == commit
+    assert verify_repository_snapshot(
+        tmp_path,
+        commit,
+        ((source, b"def changed : Nat := 0\r\n"),),
+    ) is None
+
+
+def test_snapshot_attestation_names_why_it_failed(tmp_path: Path) -> None:
+    lean_root = tmp_path / "lean"
+    lean_root.mkdir()
+    source = lean_root / "A.lean"
+    source.write_text("def tracked : Nat := 0\n")
+    commit = _init_git_repository(tmp_path)
+    reasons: list[str] = []
+
+    assert verify_repository_snapshot(
+        lean_root, commit, ((source, source.read_bytes()),), reasons=reasons
+    ) is None
+    assert reasons == [
+        "the Lean root is the subdirectory lean of its Git repository; "
+        "links need the repository top level"
+    ]
+
+    untracked = tmp_path / "Scratch.lean"
+    untracked.write_text("def scratch : Nat := 0\n")
+    reasons.clear()
+    assert verify_repository_snapshot(
+        tmp_path, commit, ((untracked, untracked.read_bytes()),), reasons=reasons
+    ) is None
+    assert reasons == [f"Scratch.lean is not a file in commit {commit[:12]}"]

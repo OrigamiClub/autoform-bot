@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
-import select
+import re
 import signal
 import subprocess
 import sys
 import threading
 import time
 from contextlib import ExitStack
+from types import SimpleNamespace
 
 import pytest
 
@@ -122,7 +124,14 @@ def test_close_kills_descendant_after_repl_wrapper_already_exited():
     )
     assert wrapper.stdout is not None
     child_pid = int(wrapper.stdout.readline())
-    wrapper.wait(timeout=2)
+    import psutil
+
+    deadline = time.monotonic() + 2
+    while psutil.Process(wrapper.pid).status() != psutil.STATUS_ZOMBIE:
+        if time.monotonic() >= deadline:
+            pytest.fail("REPL wrapper did not become a zombie")
+        time.sleep(0.01)
+    assert wrapper.returncode is None
 
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
@@ -134,16 +143,14 @@ def test_close_kills_descendant_after_repl_wrapper_already_exited():
     repl._process_group_id = wrapper.pid
     try:
         repl.close()
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.01)
-        else:
-            pytest.fail("REPL descendant survived process-group cleanup")
+        assert wrapper.returncode == 0
+        try:
+            assert psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            pass
     finally:
+        if wrapper.returncode is None:
+            repl.close()
         try:
             os.kill(child_pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -253,323 +260,23 @@ def test_process_group_cleanup_does_not_signal_an_all_zombie_group(monkeypatch):
     assert signals == [(1234, signal.SIGTERM)]
 
 
-def test_split_imports_preserves_body_offset_after_comments_and_blank_lines():
-    code = """-- preface
-import Mathlib.Data.Nat.Basic
-
--- body comment
-#check Nat
-"""
-
-    imports, body, offset = repl_core._split_imports_and_body(code)
-
-    assert imports == ["Mathlib.Data.Nat.Basic"]
-    assert body == "#check Nat\n"
-    assert offset == 4
-
-
-def test_split_imports_stops_at_the_first_body_statement():
-    imports, body, offset = repl_core._split_imports_and_body(
-        "import Mathlib\n#check Nat\nimport Aesop\n"
-    )
-
-    assert imports == ["Mathlib"]
-    assert body == "#check Nat\nimport Aesop\n"
-    assert offset == 1
-
-
-def test_run_rejects_disallowed_import_roots_before_touching_the_process():
-    repl = repl_core.LeanRepl(
-        repl_core.LeanReplConfig(
-            allowed_imports=frozenset({"Mathlib"}),
-            warmup_imports=frozenset(),
-        )
-    )
-
-    response = repl.run("import Unsafe.Module\n#check Nat")
-
-    assert response == {
-        "repl_error": "Disallowed imports: Unsafe. Allowed roots: Mathlib."
-    }
-    assert repl.process is None
-
-
-def test_run_offsets_diagnostics_after_stripping_import_header(monkeypatch):
-    repl = repl_core.LeanRepl(
-        repl_core.LeanReplConfig(
-            warmup_imports=frozenset(),
-            validate_imports=False,
-        )
-    )
-    monkeypatch.setattr(repl, "is_alive", lambda: True)
-    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
-    monkeypatch.setattr(
-        repl,
-        "_run",
-        lambda code, env_id, timeout: {
-            "env": 74,
-            "messages": [
-                {
-                    "severity": "error",
-                    "data": "boom",
-                    "pos": {"line": 1, "column": 2},
-                    "endPos": {"line": 1, "column": 3},
-                }
-            ],
-            "sorries": [
-                {
-                    "goal": "False",
-                    "proofState": None,
-                    "pos": {"line": 2, "column": 1},
-                    "endPos": {"line": 2, "column": 2},
-                }
-            ],
-        },
-    )
-
-    response = repl.run("import Mathlib\n\n#check Missing", timeout=1)
-
-    assert response["messages"][0]["pos"]["line"] == 3
-    assert response["messages"][0]["endPos"]["line"] == 3
-    assert response["sorries"][0]["pos"]["line"] == 4
-    assert response["sorries"][0]["endPos"]["line"] == 4
-
-
-def test_run_resolves_the_base_environment_after_restart(monkeypatch):
-    repl = repl_core.LeanRepl(
-        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
-    )
-    dispatched_envs = []
-
-    monkeypatch.setattr(repl, "is_alive", lambda: repl.process is not None)
-
-    def restart(timeout=None):
-        repl.process = object()
-        repl._base_env_id = 73
-
-    monkeypatch.setattr(repl, "restart", restart)
-    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
-    monkeypatch.setattr(
-        repl,
-        "_run",
-        lambda code, env_id, timeout: dispatched_envs.append(env_id) or {"env": 74},
-    )
-
-    assert repl.run("#check Nat", timeout=1) == {"env": 74}
-    assert dispatched_envs == [73]
-
-
-def test_explicit_environment_is_not_sent_after_an_entry_restart(monkeypatch):
-    repl = repl_core.LeanRepl(
-        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
-    )
-    monkeypatch.setattr(
-        repl,
-        "restart",
-        lambda timeout=None: pytest.fail("a stale explicit environment must not restart"),
-    )
-    monkeypatch.setattr(
-        repl,
-        "_run",
-        lambda code, env_id, timeout: pytest.fail("a stale environment must not be sent"),
-    )
-
-    with pytest.raises(repl_core.ReplProcessRestarted, match="environment state was lost"):
-        repl.run("#check Nat", env_id=7, timeout=1)
-
-
-def test_run_refreshes_the_base_environment_after_retry(monkeypatch):
-    repl = repl_core.LeanRepl(
-        repl_core.LeanReplConfig(
-            max_retries=1,
-            validate_imports=False,
-            warmup_imports=frozenset(),
-        )
-    )
-    repl.process = object()
-    repl._base_env_id = 11
-    dispatched_envs = []
-
-    monkeypatch.setattr(repl, "is_alive", lambda: True)
-    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
-    monkeypatch.setattr(repl_core.time, "sleep", lambda delay: None)
-    monkeypatch.setattr(repl_core.random, "uniform", lambda low, high: 0)
-
-    def run_once(code, env_id, timeout):
-        dispatched_envs.append(env_id)
-        if len(dispatched_envs) == 1:
-            raise RuntimeError("retry me")
-        return {"env": 23}
-
-    def restart(timeout=None):
-        repl.process = object()
-        repl._base_env_id = 22
-
-    monkeypatch.setattr(repl, "_run", run_once)
-    monkeypatch.setattr(repl, "restart", restart)
-
-    assert repl.run("#check Nat", timeout=5) == {"env": 23}
-    assert dispatched_envs == [11, 22]
-
-
-def test_pinned_repl_error_response_is_not_reported_as_success(monkeypatch):
-    repl = repl_core.LeanRepl(
-        repl_core.LeanReplConfig(
-            warmup_imports=frozenset(),
-            validate_imports=False,
-            max_retries=2,
-        )
-    )
-    repl.process = object()
-    calls = []
-    monkeypatch.setattr(repl, "is_alive", lambda: True)
-    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
-    monkeypatch.setattr(
-        repl,
-        "_run",
-        lambda code, env_id, timeout: calls.append((code, env_id))
-        or {"message": "Unknown environment."},
-    )
-
-    assert repl.run("#eval 1", timeout=1) == {
-        "repl_error": "Unknown environment."
-    }
-    assert calls == [("#eval 1", None)]
-
-
-@pytest.mark.parametrize(
-    "raw_response",
-    [
-        [],
-        {},
-        {"messages": []},
-        {"messages": {}},
-        {
-            "env": 1,
-            "messages": [
-                {
-                    "severity": [],
-                    "data": "boom",
-                    "pos": {"line": 1, "column": 1},
-                }
-            ],
-        },
-        {
-            "env": 1,
-            "messages": [
-                {
-                    "severity": {},
-                    "data": "boom",
-                    "pos": {"line": 1, "column": 1},
-                }
-            ],
-        },
-        {"env": True},
-        {"sorries": [{"goal": "False"}]},
-    ],
-)
-def test_malformed_body_response_is_not_retried(monkeypatch, raw_response):
-    repl = repl_core.LeanRepl(
-        repl_core.LeanReplConfig(
-            warmup_imports=frozenset(),
-            validate_imports=False,
-            max_retries=2,
-        )
-    )
-    repl.process = object()
-    calls = []
-    retired = []
-    monkeypatch.setattr(repl, "is_alive", lambda: True)
-    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
-    monkeypatch.setattr(
-        repl,
-        "_run",
-        lambda code, env_id, timeout: calls.append((code, env_id)) or raw_response,
-    )
-    monkeypatch.setattr(repl, "close", lambda **kwargs: retired.append(True))
-
-    result = repl.run("#eval 1", timeout=1)
-
-    assert result["outcome_unknown"] is True
-    assert calls == [("#eval 1", None)]
-    assert retired == [True]
-
-
-def test_env_scoped_malformed_response_reports_the_lost_environment(monkeypatch):
-    repl = repl_core.LeanRepl(
-        repl_core.LeanReplConfig(
-            warmup_imports=frozenset(),
-            validate_imports=False,
-        )
-    )
-    process = object()
-    repl.process = process
-    retired = []
-    monkeypatch.setattr(repl, "is_alive", lambda: True)
-    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
-    monkeypatch.setattr(repl, "_run", lambda code, env_id, timeout: {})
-    monkeypatch.setattr(repl, "close", lambda **kwargs: retired.append(True))
-
-    with pytest.raises(repl_core.ReplProcessRestarted) as error:
-        repl.run("#check Nat", env_id=7, timeout=1)
-
-    assert isinstance(error.value.__cause__, repl_core.ReplProtocolError)
-    assert retired == [True]
-
-
-@pytest.mark.parametrize("raw_response", [[], {"sorries": [{"goal": "False"}]}])
-def test_malformed_backlog_response_is_reported_as_unknown(
-    monkeypatch, raw_response
+def test_process_group_cleanup_refuses_a_pre_reaped_leader_with_live_members(
+    monkeypatch,
 ):
-    repl = repl_core.LeanRepl(
-        repl_core.LeanReplConfig(
-            warmup_imports=frozenset(),
-            validate_imports=False,
-        )
-    )
-    repl.process = object()
-    monkeypatch.setattr(repl, "is_alive", lambda: True)
-    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+    process = SimpleNamespace(returncode=0)
     monkeypatch.setattr(
-        repl,
-        "_run",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            repl_core.ReplStderrBacklog("stderr backlog", raw_response)
-        ),
-    )
-    monkeypatch.setattr(repl, "close", lambda **kwargs: None)
-
-    result = repl.run("#eval 1", timeout=1)
-
-    assert result["outcome_unknown"] is True
-    assert "malformed" in result["repl_error"]
-
-
-def test_explicit_environment_is_not_sent_after_a_memory_restart(monkeypatch):
-    repl = repl_core.LeanRepl(
-        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
-    )
-    repl.process = object()
-
-    monkeypatch.setattr(repl, "is_alive", lambda: True)
-
-    def restart_during_memory_check(timeout):
-        repl.process = object()
-        repl._base_env_id = 22
-
-    monkeypatch.setattr(
-        repl,
-        "_check_memory_and_maybe_restart",
-        restart_during_memory_check,
+        repl_core,
+        "_process_group_has_live_members",
+        lambda process_group_id: True,
     )
     monkeypatch.setattr(
-        repl,
-        "_run",
-        lambda code, env_id, timeout: pytest.fail("a stale environment must not be sent"),
+        repl_core.os,
+        "killpg",
+        lambda *args: pytest.fail("a reused process group was signalled"),
     )
 
-    with pytest.raises(repl_core.ReplProcessRestarted, match="environment state was lost"):
-        repl.run("#check Nat", env_id=7, timeout=1)
+    with pytest.raises(RuntimeError, match="leader was reaped"):
+        repl_core._kill_subprocesses(process, 1234)
 
 
 def test_format_repl_response_prioritizes_errors_and_keeps_sorries():
@@ -651,11 +358,7 @@ def test_additive_response_fields_are_tolerated_but_not_exported():
         ],
     }
 
-    repl_core._validate_command_response(
-        response,
-        context="test",
-        require_environment=True,
-    )
+    repl_core._validate_command_response(response)
 
     assert repl_core._without_process_handles(response) == {
         "messages": [
@@ -687,7 +390,7 @@ class _PipeProcess:
         return None
 
 
-def _repl_with_process(process: _PipeProcess, *, chunk_size: int = 4096, max_buffer_bytes: int = 1024):
+def _repl_with_process(process: _PipeProcess | None, *, chunk_size: int = 4096, max_buffer_bytes: int = 1024):
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
             chunk_size=chunk_size,
@@ -697,6 +400,14 @@ def _repl_with_process(process: _PipeProcess, *, chunk_size: int = 4096, max_buf
         )
     )
     repl.process = process
+    return repl
+
+
+def _disposable_repl_with_process(monkeypatch, process: _PipeProcess, **config):
+    """Return a clean repl whose disposable call starts on ``process``."""
+    # Start clean, as a pool slot does: the close() that opens a call would close the stand-in's pipes.
+    repl = _repl_with_process(None, **config)
+    monkeypatch.setattr(repl, "start", lambda: setattr(repl, "process", process))
     return repl
 
 
@@ -737,79 +448,1183 @@ def _patch_pipe_reads(monkeypatch, process: _PipeProcess):
     monkeypatch.setattr(repl_core.select, "select", fake_select)
 
 
-def test_response_timeout_after_full_write_is_not_retried(monkeypatch):
+def test_disposable_call_uses_one_frame_and_removes_process_handles(monkeypatch):
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
-            warmup_imports=frozenset(),
-            validate_imports=False,
-            max_retries=2,
+            validate_imports=True,
+            warmup_imports=frozenset({"Mathlib"}),
         )
     )
-    repl.process = object()
+    starts = []
     calls = []
-    monkeypatch.setattr(repl, "is_alive", lambda: True)
-    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+    closes = []
+
+    def close(**kwargs):
+        closes.append(kwargs)
+        repl.process = None
+        repl._process_group_id = None
+
+    def start():
+        starts.append(True)
+        repl.process = object()
+        repl._process_group_id = 7
+
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "start", start)
     monkeypatch.setattr(
         repl,
-        "close",
-        lambda **kwargs: setattr(repl, "process", None),
-    )
-    monkeypatch.setattr(
-        repl,
-        "restart",
-        lambda timeout=None: pytest.fail("a sent request must not be retried"),
+        "_check_header",
+        lambda code, deadline: repl_core._LeanHeaderAnalysis((), True),
     )
 
-    def fail_after_send(code, env_id, timeout, mark_sent):
-        calls.append((code, env_id))
-        mark_sent()
-        raise TimeoutError("response timed out")
+    def run(code, timeout):
+        calls.append(code)
+        return {
+            "env": 4,
+            "messages": [
+                {
+                    "severity": "error",
+                    "data": "unknown module prefix 'Mathlib'",
+                    "pos": {"line": 1, "column": 0},
+                    "endPos": {"line": 1, "column": 14},
+                },
+                {
+                    "severity": "info",
+                    "data": "message",
+                    "pos": {"line": 2, "column": 1},
+                    "endPos": {"line": 2, "column": 3},
+                },
+            ],
+            "sorries": [
+                {
+                    "goal": "False",
+                    "proofState": 8,
+                    "pos": {"line": 3, "column": 1},
+                    "endPos": {"line": 3, "column": 2},
+                }
+            ],
+        }
 
-    monkeypatch.setattr(repl, "_run_io", fail_after_send)
-    response = repl.run("#eval 1", timeout=1)
+    monkeypatch.setattr(repl, "_run", run)
 
-    assert response["outcome_unknown"] is True
-    assert "fully sent" in response["repl_error"]
-    assert calls == [("#eval 1", None)]
-    assert repl.process is None
+    assert repl.run_disposable("#check Nat", timeout=3) == {
+        "messages": [
+            {
+                "severity": "error",
+                "data": "unknown module prefix 'Mathlib'",
+                "pos": {"line": 1, "column": 0},
+                "endPos": {"line": 1, "column": 14},
+            },
+            {
+                "severity": "info",
+                "data": "message",
+                "pos": {"line": 1, "column": 1},
+                "endPos": {"line": 1, "column": 3},
+            },
+        ],
+        "sorries": [
+            {
+                "goal": "False",
+                "pos": {"line": 2, "column": 1},
+                "endPos": {"line": 2, "column": 2},
+            }
+        ],
+    }
+    assert len(starts) == 1
+    assert calls == ["import Mathlib\n#check Nat"]
+    assert len(closes) == 2
 
 
-def test_cleanup_failure_after_full_write_preserves_unknown_outcome(monkeypatch):
+def test_disposable_call_uses_one_decreasing_phase_budget(monkeypatch):
+    clock = {"now": 0.0}
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(warmup_imports=frozenset({"Mathlib"}))
+    )
+    budgets = []
+
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: clock["now"])
+
+    def check_header(code, deadline):
+        assert deadline == 10
+        clock["now"] = 2
+        return repl_core._LeanHeaderAnalysis((), True)
+
+    def start():
+        budgets.append("startup")
+        clock["now"] = 5
+
+    def run(code, timeout):
+        budgets.append(("command", timeout, code))
+        return {"env": 1, "messages": []}
+
+    monkeypatch.setattr(repl, "_check_header", check_header)
+    monkeypatch.setattr(repl, "start", start)
+    monkeypatch.setattr(repl, "_run", run)
+
+    assert repl.run_disposable("#check Nat", timeout=10) == {"messages": []}
+    assert budgets == [
+        "startup",
+        ("command", 5, "import Mathlib\n#check Nat"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("expired_phase", "expected"),
+    [
+        ("header", {"repl_error": "Lean REPL header validation timed out after 3 seconds"}),
+        ("startup", {"repl_error": "Lean REPL disposable child startup timed out after 3 seconds"}),
+        ("command", {"repl_error": "Lean REPL combined command execution timed out after 3 seconds"}),
+        (
+            "dispatched",
+            {
+                "repl_error": "Lean REPL combined command execution timed out after 3 seconds",
+                "outcome_unknown": True,
+            },
+        ),
+    ],
+)
+def test_disposable_timeout_names_the_expired_phase(monkeypatch, expired_phase, expected):
+    clock = {"now": 0.0}
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(warmup_imports=frozenset())
+    )
+
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: clock["now"])
+
+    def check_header(code, deadline):
+        if expired_phase == "header":
+            raise TimeoutError("timed out checking the Lean header")
+        if expired_phase == "startup":
+            clock["now"] = 2
+        return repl_core._LeanHeaderAnalysis((), True)
+
+    def start():
+        if expired_phase == "startup":
+            pytest.fail("expired budget started a REPL child")
+        if expired_phase == "command":
+            clock["now"] = 2
+
+    def run(**kwargs):
+        if expired_phase != "dispatched":
+            pytest.fail("expired budget dispatched the command")
+        raise repl_core.ReplOutcomeUnknown("transport failed") from TimeoutError()
+
+    monkeypatch.setattr(repl, "_check_header", check_header)
+    monkeypatch.setattr(repl, "start", start)
+    monkeypatch.setattr(repl, "_run", run)
+
+    assert repl.run_disposable("#check Nat", timeout=1, budget=3) == expected
+
+
+def test_disposable_backlog_adjusts_prefixed_positions(monkeypatch):
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
-            warmup_imports=frozenset(),
-            validate_imports=False,
-            max_retries=2,
+            validate_imports=True,
+            warmup_imports=frozenset({"Mathlib"}),
         )
     )
-    repl.process = object()
-    close_calls = 0
-    monkeypatch.setattr(repl, "is_alive", lambda: True)
-    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+
+    monkeypatch.setattr(repl, "start", lambda: None)
     monkeypatch.setattr(
         repl,
-        "restart",
-        lambda timeout=None: pytest.fail("a sent request must not be retried"),
+        "_check_header",
+        lambda code, deadline: repl_core._LeanHeaderAnalysis((), True),
     )
+    response = {
+        "env": 4,
+        "messages": [
+            {
+                "severity": "error",
+                "data": "unknown module prefix 'Mathlib'",
+                "pos": {"line": 1, "column": 0},
+            },
+            {
+                "severity": "error",
+                "data": "bad",
+                "pos": {"line": 2, "column": 1},
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda **kwargs: (_ for _ in ()).throw(
+            repl_core.ReplStderrBacklog("stderr backlog", response)
+        ),
+    )
+
+    assert repl.run_disposable("#check missing", timeout=3) == {
+        "messages": [
+            {
+                "severity": "error",
+                "data": "unknown module prefix 'Mathlib'",
+                "pos": {"line": 1, "column": 0},
+            },
+            {
+                "severity": "error",
+                "data": "bad",
+                "pos": {"line": 1, "column": 1},
+            },
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    ("code", "analysis", "expected_frame"),
+    [
+        (
+            "#check autoformWarmupMarker",
+            repl_core._LeanHeaderAnalysis((), True),
+            "import Mathlib\n#check autoformWarmupMarker",
+        ),
+        (
+            "import Mathlib\n#check Nat",
+            repl_core._LeanHeaderAnalysis(("Mathlib",), True),
+            "import Mathlib\n#check Nat",
+        ),
+        (
+            "module\npublic import REPL.Frontend\n",
+            repl_core._LeanHeaderAnalysis(("REPL.Frontend",), False),
+            "module\npublic import REPL.Frontend\n",
+        ),
+        (
+            "prelude\nimport REPL.Frontend\n#check Nat",
+            repl_core._LeanHeaderAnalysis(("REPL.Frontend",), False),
+            "prelude\nimport REPL.Frontend\n#check Nat",
+        ),
+    ],
+)
+def test_unvalidated_disposable_composes_only_proven_ordinary_headers(
+    monkeypatch, code, analysis, expected_frame
+):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            validate_imports=False,
+            warmup_imports=frozenset({"Mathlib"}),
+        )
+    )
+
+    monkeypatch.setattr(repl, "start", lambda: None)
+    monkeypatch.setattr(repl, "_check_header", lambda code, deadline: analysis)
+    frames = []
+
+    def run(**kwargs):
+        frames.append(kwargs["code"])
+        return {"env": 4, "messages": []}
+
+    monkeypatch.setattr(repl, "_run", run)
+
+    assert repl.run_disposable(code, timeout=3) == {"messages": []}
+    assert frames == [expected_frame]
+
+
+def test_disposable_call_does_not_return_a_result_before_verified_cleanup(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    close_calls = 0
 
     def close(**kwargs):
         nonlocal close_calls
         close_calls += 1
-        raise RuntimeError("cleanup failed")
+        if close_calls == 2:
+            raise RuntimeError("cleanup failed")
+        repl.process = None
+        repl._process_group_id = None
 
-    def fail_after_send(code, env_id, timeout, mark_sent):
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "start", lambda: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda **kwargs: {"env": 1, "messages": []},
+    )
+
+    with pytest.raises(repl_core.ReplCleanupError, match="retirement is required") as error:
+        repl.run_disposable("#check Nat", timeout=1)
+
+    assert error.value.result == {"messages": []}
+
+
+def _repl_log(caplog) -> list[tuple[int, str]]:
+    """Return the level and message of each repl_core record; caplog's root handler sees every logger."""
+    return [(level, message) for name, level, message in caplog.record_tuples if name == repl_core.logger.name]
+
+
+_MALFORMED_RESPONSE = {
+    "repl_error": "Lean REPL returned a malformed response for the requested command.",
+    "outcome_unknown": True,
+}
+_MALFORMED_LOGGED = f"Lean REPL call in . failed: {_MALFORMED_RESPONSE['repl_error']}"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected", "logged"),
+    [
+        # The REPL's error variant means that Lean itself failed, here while finding its sysroot.
+        (
+            {"message": "process 'lean' exited with code 1"},
+            {"repl_error": "process 'lean' exited with code 1"},
+            ["Lean REPL call in . failed: process 'lean' exited with code 1"],
+        ),
+        ([], _MALFORMED_RESPONSE, [_MALFORMED_LOGGED]),
+        (
+            repl_core.ReplOutcomeUnknown("x"),
+            {"repl_error": "x", "outcome_unknown": True},
+            ["Lean REPL call in . failed: x"],
+        ),
+        (repl_core.ReplProcessExited("x"), {"repl_error": "x"}, ["Lean REPL call in . failed: x"]),
+        (
+            repl_core.ReplStderrBacklog("x", {"message": "bad"}),
+            {"repl_error": "bad"},
+            ["Lean REPL call in .: x", "Lean REPL call in . failed: bad"],
+        ),
+        (repl_core.ReplStderrBacklog("x", []), _MALFORMED_RESPONSE, ["Lean REPL call in .: x", _MALFORMED_LOGGED]),
+        (
+            repl_core.ReplStderrBacklog(
+                "x",
+                {"env": 7, "sorries": [{"goal": "False", "proofState": 9}]},
+            ),
+            {"sorries": [{"goal": "False"}]},
+            ["Lean REPL call in .: x"],
+        ),
+    ],
+)
+def test_disposable_call_maps_each_response_outcome_without_a_retry(
+    monkeypatch, caplog, outcome, expected, logged
+):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    frames = []
+
+    def run(**kwargs):
+        frames.append(kwargs["code"])
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(repl, "start", lambda: None)
+    monkeypatch.setattr(repl, "_run", run)
+
+    with caplog.at_level(logging.WARNING, logger=repl_core.logger.name):
+        assert repl.run_disposable("#eval 1", timeout=1) == expected
+
+    assert frames == ["#eval 1"]
+    assert _repl_log(caplog) == [(logging.WARNING, line) for line in logged]
+
+
+@pytest.mark.parametrize(
+    "raw_response",
+    [
+        {},
+        {"messages": []},
+        {"messages": {}},
+        {
+            "env": 1,
+            "messages": [
+                {
+                    "severity": [],
+                    "data": "boom",
+                    "pos": {"line": 1, "column": 1},
+                }
+            ],
+        },
+        {
+            "env": 1,
+            "messages": [
+                {
+                    "severity": {},
+                    "data": "boom",
+                    "pos": {"line": 1, "column": 1},
+                }
+            ],
+        },
+        {"env": True},
+        {"sorries": [{"goal": "False"}]},
+    ],
+)
+def test_disposable_call_reports_every_malformed_response_as_unknown(
+    monkeypatch, raw_response
+):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    frames = []
+    monkeypatch.setattr(repl, "start", lambda: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda **kwargs: frames.append(kwargs["code"]) or raw_response,
+    )
+
+    result = repl.run_disposable("#eval 1", timeout=1)
+
+    assert result["outcome_unknown"] is True
+    assert frames == ["#eval 1"]
+
+
+def _fake_header_command(stdout: str, returncode: int = 0, stderr: str = "") -> list[str]:
+    script = (
+        "import sys; sys.stdin.read(); "
+        f"sys.stdout.write({stdout!r}); sys.stderr.write({stderr!r}); "
+        f"sys.exit({returncode})"
+    )
+    return [sys.executable, "-c", script]
+
+
+def _header_json(
+    *modules: str,
+    errors: tuple[str, ...] = (),
+    is_module: bool = False,
+    prelude: bool = False,
+) -> str:
+    def item(module: str, is_meta: bool = False) -> dict:
+        return {"module": module, "importAll": False, "isExported": True, "isMeta": is_meta}
+
+    entry: dict = {"errors": list(errors)}
+    if not errors:
+        implicit = [] if prelude else [item("Init"), item("Init", is_meta=True)]
+        imports = implicit + [item(module) for module in modules]
+        entry["result"] = {"imports": imports, "isModule": is_module, "isPrelude": prelude}
+    return json.dumps({"imports": [entry]})
+
+
+def _header_modules(command: list[str], *, timeout: float = 10, **config) -> list[str]:
+    repl = repl_core.LeanRepl(repl_core.LeanReplConfig(header_command=command, **config))
+    try:
+        return list(repl._check_header("import Mathlib", time.monotonic() + timeout).modules)
+    finally:
+        repl.close()
+
+
+def test_header_check_accepts_the_header_parser_schema():
+    command = _fake_header_command(_header_json("Init", "Mathlib.Tactic"))
+
+    assert _header_modules(command) == ["Mathlib.Tactic"]
+
+
+def test_default_header_parser_selects_lean_from_the_lake_toolchain():
+    command = repl_core.LeanReplConfig().header_command
+
+    assert command[:3] == ["lake", "env", sys.executable]
+    assert "LEAN_SYSROOT" in command[-2]
+    assert command[-1] == repl_core.LEAN_HEADER_PARSER
+    assert os.path.isfile(command[-1])
+
+
+def test_header_parser_launcher_ignores_a_path_shadow(tmp_path):
+    trusted_bin = tmp_path / "toolchain" / "bin"
+    shadow_bin = tmp_path / "shadow"
+    trusted_bin.mkdir(parents=True)
+    shadow_bin.mkdir()
+
+    def write_parser(path, module):
+        path.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            f"assert sys.argv[1:] == ['--run', {repl_core.LEAN_HEADER_PARSER!r}]\n"
+            "sys.stdin.read()\n"
+            f"sys.stdout.write({_header_json(module)!r})\n"
+        )
+        path.chmod(0o755)
+
+    write_parser(trusted_bin / "lean", "Mathlib")
+    write_parser(shadow_bin / "lean", "Unsafe")
+    env = {
+        "LEAN_SYSROOT": str(trusted_bin.parent),
+        "PATH": f"{shadow_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+    }
+
+    modules = _header_modules(
+        [sys.executable, "-c", repl_core.LEAN_HEADER_LAUNCHER, repl_core.LEAN_HEADER_PARSER],
+        env=env,
+    )
+
+    assert modules == ["Mathlib"]
+
+
+# Plain ``lean --deps-json`` output, in its older and current schemas. Its fast
+# parser can miss imports that the REPL loads.
+_LEGACY_INIT_ONLY = json.dumps(
+    {"imports": [{"errors": [], "imports": [{"module": "Init", "importAll": False}]}]}
+)
+_FAST_PARSER_ORDINARY = json.dumps(
+    {
+        "imports": [
+            {
+                "errors": [],
+                "result": {
+                    "imports": [
+                        {"importAll": False, "isExported": True, "isMeta": False, "module": "Init"},
+                        {"importAll": False, "isExported": True, "isMeta": True, "module": "Init"},
+                    ],
+                    "isModule": False,
+                },
+            }
+        ]
+    }
+)
+
+
+@pytest.mark.parametrize(
+    ("command", "message"),
+    [
+        (_fake_header_command(_header_json(errors=("bad header",))), "bad header"),
+        (
+            _fake_header_command(_header_json("Mathlib.«/abs/path/Secret»")),
+            "plain, nonempty module components",
+        ),
+        (
+            _fake_header_command(_header_json("Mathlib.«..».Secret")),
+            re.escape("import Mathlib.«..».Secret must use plain, nonempty module components"),
+        ),
+        # parse_header.lean prints this name escaped. Unescaped, as Name.toString
+        # prints it, its root would read as the allowlisted Mathlib.
+        (
+            _fake_header_command(_header_json("«Mathlib.Unsafe».«x✝»")),
+            "plain, nonempty module components",
+        ),
+    ],
+)
+def test_header_check_rejects_parse_errors_and_ambiguous_module_components(command, message):
+    with pytest.raises(ValueError, match=message):
+        _header_modules(command)
+
+
+# The parser reports parse errors as JSON, so these are failures of the check.
+@pytest.mark.parametrize(
+    ("command", "message"),
+    [
+        (_fake_header_command("", returncode=1, stderr="unknown package\n"), "unknown package"),
+        (_fake_header_command("not json"), "unrecognized output"),
+        (
+            _fake_header_command(
+                '{"imports":[{"errors":[],"result":{"isModule":false,"isPrelude":false,'
+                '"imports":[{"module":"Unsafe","isMeta":false}],"imports":[]}}]}'
+            ),
+            "unrecognized output",
+        ),
+        (
+            _fake_header_command(
+                '{"imports":[{"errors":[],"result":{"isModule":false,"isPrelude":false,'
+                '"imports":[{"module":"Mathlib","isMeta":false,"importAll":NaN}]}}]}'
+            ),
+            "unrecognized output",
+        ),
+        (_fake_header_command(_LEGACY_INIT_ONLY), "unrecognized output"),
+        (_fake_header_command(_FAST_PARSER_ORDINARY), "unrecognized output"),
+    ],
+)
+def test_header_check_fails_closed_when_the_parser_fails(command, message):
+    with pytest.raises(RuntimeError, match=f"Lean header check failed: {message}"):
+        _header_modules(command)
+
+
+_NO_IMPORTS = {"imports": [], "isModule": False, "isPrelude": False}
+
+
+# Each payload breaks one rule of parse_header.lean's schema.
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"imports": [{"errors": [], "result": _NO_IMPORTS}], "errors": []},
+        {"imports": {}},
+        {"imports": []},
+        {"imports": [{"errors": [], "result": _NO_IMPORTS}] * 2},
+        {"imports": [[]]},
+        {"imports": [{"result": _NO_IMPORTS}]},
+        {"imports": [{"errors": "bad header", "result": _NO_IMPORTS}]},
+        {"imports": [{"errors": [""]}]},
+        {"imports": [{"errors": [1]}]},
+        {"imports": [{"errors": []}]},
+        {"imports": [{"errors": [], "imports": []}]},
+        {"imports": [{"errors": [], "result": _NO_IMPORTS, "imports": []}]},
+        {"imports": [{"errors": [], "result": []}]},
+        {"imports": [{"errors": [], "result": {"isModule": False, "isPrelude": False}}]},
+        {"imports": [{"errors": [], "result": {**_NO_IMPORTS, "imports": {}}}]},
+        {"imports": [{"errors": [], "result": {"imports": [], "isPrelude": False}}]},
+        {"imports": [{"errors": [], "result": {**_NO_IMPORTS, "isModule": 0}}]},
+        {"imports": [{"errors": [], "result": {"imports": [], "isModule": False}}]},
+        {"imports": [{"errors": [], "result": {**_NO_IMPORTS, "isPrelude": None}}]},
+        {"imports": [{"errors": [], "result": {**_NO_IMPORTS, "imports": ["Mathlib"]}}]},
+        {"imports": [{"errors": [], "result": {**_NO_IMPORTS, "imports": [{"isMeta": False}]}}]},
+        {"imports": [{"errors": [], "result": {**_NO_IMPORTS, "imports": [{"module": ""}]}}]},
+        {"imports": [{"errors": [], "result": {**_NO_IMPORTS, "imports": [{"module": 1}]}}]},
+        {"imports": [{"errors": [], "result": {**_NO_IMPORTS, "imports": [{"module": "Mathlib", "isMeta": 1}]}}]},
+    ],
+)
+def test_header_decoder_fails_closed_on_unrecognized_output(payload):
+    with pytest.raises(RuntimeError, match="Lean header check failed: unrecognized output"):
+        repl_core._decode_header_analysis(json.dumps(payload).encode())
+
+
+def test_header_decoder_fails_closed_on_invalid_utf8():
+    with pytest.raises(RuntimeError, match="Lean header check failed: unrecognized output"):
+        repl_core._decode_header_analysis(b"\xff")
+
+
+@pytest.mark.parametrize("module", ["Mathlib/X", "Mathlib\\X", "Mathlib..X"])
+def test_header_decoder_refuses_path_like_or_empty_module_components(module):
+    with pytest.raises(ValueError, match="plain, nonempty module components"):
+        repl_core._decode_header_analysis(_header_json(module).encode())
+
+
+@pytest.mark.parametrize(
+    ("header_output", "expected_error"),
+    [
+        (_header_json("Mathlib", "Unsafe.Mod"), "Disallowed imports: Unsafe"),
+        (_header_json(errors=("bad header",)), "Rejected Lean header: bad header"),
+    ],
+)
+def test_disposable_call_rejects_what_lean_reports_before_starting(
+    monkeypatch, caplog, header_output, expected_error
+):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            allowed_imports=frozenset({"Mathlib"}),
+            warmup_imports=frozenset(),
+            header_command=_fake_header_command(header_output),
+        )
+    )
+    monkeypatch.setattr(
+        repl,
+        "start",
+        lambda: pytest.fail("invalid input must not start Lean"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=repl_core.logger.name):
+        response = repl.run_disposable("/- hidden -/ import Unsafe\n#check Nat")
+
+    assert expected_error in response["repl_error"]
+    assert repl.is_clean()
+    # The caller's input is at fault, not the runtime, so nothing is logged.
+    assert _repl_log(caplog) == []
+
+
+_LEAN_TYPE_MISMATCH = (
+    "parse_header.lean:14:47: error: Application type mismatch: The argument\n"
+    "  input\n"
+    "has type\n"
+    "  String : Type\n"
+    "but is expected to have type\n"
+    "  Parser.InputContext : Type\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "detail"),
+    [
+        # The launcher outside lake env, where LEAN_SYSROOT is unset.
+        (
+            "",
+            "Traceback (most recent call last):\n"
+            '  File "<string>", line 1, in <module>\n'
+            "KeyError: 'LEAN_SYSROOT'\n",
+            "KeyError: 'LEAN_SYSROOT'",
+        ),
+        # Lean prints elaboration errors on stdout.
+        (
+            "parse_header.lean:14:3: error: unknown constant 'Lean.Parser.parseHeader'\n\n",
+            "",
+            "parse_header.lean:14:3: error: unknown constant 'Lean.Parser.parseHeader'",
+        ),
+        # Lean follows the error line with indented terms, and Lake warns on
+        # stderr while the manifest is out of date.
+        (
+            _LEAN_TYPE_MISMATCH,
+            "",
+            "parse_header.lean:14:47: error: Application type mismatch: The argument",
+        ),
+        (
+            _LEAN_TYPE_MISMATCH,
+            "warning: manifest out of date: git revision of dependency 'repl' changed; "
+            "use `lake update repl` to update it\n",
+            "parse_header.lean:14:47: error: Application type mismatch: The argument",
+        ),
+        # Without an error line on stdout, stderr's last non-empty line wins...
+        ("stdout first\nstdout last\n", "stderr first\nstderr last\n\n", "stderr last"),
+        # ...and stdout's last non-empty line is used only when stderr has none.
+        ("stdout first\nstdout last\n\n", "", "stdout last"),
+        ("", "", "exit status 1"),
+        ("", "x" * 1000, "x" * repl_core._HEADER_FAILURE_DETAIL_CHARS + "..."),
+    ],
+)
+def test_failed_header_command_reports_its_error_line(monkeypatch, stdout, stderr, detail):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            header_command=_fake_header_command(stdout, returncode=1, stderr=stderr),
+        )
+    )
+    monkeypatch.setattr(
+        repl,
+        "start",
+        lambda: pytest.fail("a failed header check must not start Lean"),
+    )
+
+    assert repl.run_disposable("#check Nat") == {"repl_error": f"Lean header check failed: {detail}"}
+    assert repl.is_clean()
+
+
+# lake env exits without reading its input when the lakefile or toolchain is
+# broken, so writing a snippet larger than any pipe buffer meets a closed pipe.
+def test_header_command_that_exits_without_reading_reports_its_error_line(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            header_command=[
+                sys.executable,
+                "-c",
+                "import sys; sys.stderr.write('error: broken lakefile\\n'); sys.exit(1)",
+            ],
+        )
+    )
+    monkeypatch.setattr(
+        repl,
+        "start",
+        lambda: pytest.fail("a failed header check must not start Lean"),
+    )
+    code = "-- " + "x" * (1 << 20) + "\n#check Nat"
+
+    assert repl.run_disposable(code, timeout=30) == {
+        "repl_error": "Lean header check failed: error: broken lakefile"
+    }
+    assert repl.is_clean()
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "/- note -/ import Unsafe\n#check Nat",
+        "/- /---/ -/\nimport Unsafe\n-- -/\n#check Nat\n",
+        "/- a --/\n/- x /--/ -/\nimport Unsafe\n-- -/\n#check Nat\n",
+    ],
+)
+def test_disposable_call_checks_submitted_header_before_warmup_prefix(monkeypatch, code):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            allowed_imports=frozenset({"Mathlib"}),
+            warmup_imports=frozenset({"Mathlib"}),
+        )
+    )
+    checked = []
+
+    def check_header(code, deadline):
+        checked.append(code)
+        raise ValueError("stop")
+
+    monkeypatch.setattr(repl, "_check_header", check_header)
+
+    repl.run_disposable(code)
+
+    assert checked == [code]
+
+
+def test_disposable_call_refuses_non_posix_before_spawning_header_parser(monkeypatch):
+    repl = repl_core.LeanRepl(repl_core.LeanReplConfig())
+    monkeypatch.setattr(repl_core.os, "name", "nt")
+    monkeypatch.setattr(
+        repl_core.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("non-POSIX call spawned a parser"),
+    )
+
+    response = repl.run_disposable("#check Nat")
+
+    assert "requires a POSIX platform" in response["repl_error"]
+    assert repl.is_clean()
+
+
+def _failing_lake_exe(stderr: str) -> list[str]:
+    # Reading the whole frame first makes the failure arrive after the frame is
+    # sent, as it does with Lake, which takes longer to start than a short
+    # frame takes to write.
+    script = (
+        "import sys\n"
+        "while sys.stdin.readline() not in ('\\n', ''):\n"
+        "    pass\n"
+        f"sys.stderr.write({stderr!r})\n"
+        "sys.exit(1)\n"
+    )
+    return [sys.executable, "-c", script]
+
+
+@pytest.mark.parametrize(
+    ("lake_error", "hinted"),
+    [
+        ("error: unknown package `repl`", True),
+        ("error: unknown executable @repl/repl", False),
+    ],
+)
+def test_failed_repl_start_names_the_remedies_only_for_an_unknown_package(lake_error, hinted):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            validate_imports=False,
+            warmup_imports=frozenset(),
+            repl_command=_failing_lake_exe(lake_error + "\n"),
+        )
+    )
+
+    error = repl.run_disposable("#check Nat", timeout=30)["repl_error"]
+
+    assert lake_error in error
+    assert error.startswith("Lake could not find the REPL package: ") is hinted
+    assert ("add `leanprover-community/repl` as a require named `repl`" in error) is hinted
+    assert ("rename the require to `repl`" in error) is hinted
+    assert ('restart the runtime with LEAN_REPL_CMD="lake exe @<name>/repl"' in error) is hinted
+    assert ("applies to every project the runtime serves" in error) is hinted
+    assert repl.is_clean()
+
+
+# Lake exits without reading the frame when it cannot find the REPL package, so
+# a frame larger than the pipe buffer is not fully sent when the child's pipes
+# close, and either stream can be seen closing first.
+@pytest.mark.parametrize("closed_stream", ["stdout", "stderr"])
+def test_failed_repl_start_before_the_frame_is_sent_names_the_remedies(monkeypatch, closed_stream):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [])
+        process._stderr_write.write(b"error: unknown package `repl`\n")
+        if closed_stream == "stdout":
+            process._stdout_write.close()
+        else:
+            process._stderr_write.close()
+        repl = _disposable_repl_with_process(monkeypatch, process)
+
+        response = repl.run_disposable("#check Nat", timeout=1)
+
+    assert response["repl_error"].startswith("Lake could not find the REPL package: ")
+    assert "outcome_unknown" not in response
+    assert repl.is_clean()
+
+
+# The header parser on Lean v4.27.0 reports one plain Init import both for an
+# ordinary header and for ``prelude`` followed by ``import Init``.
+_V4_27_INIT_ONLY = (
+    '{"imports":[{"errors":[],"result":{"imports":[{"importAll":false,"isExported":true,'
+    '"isMeta":false,"module":"Init"}],"isModule":false,"isPrelude":%s}}]}'
+)
+
+
+@pytest.mark.parametrize(
+    ("header_output", "code", "frame"),
+    [
+        (_header_json(), "#check Nat", "import Mathlib\n#check Nat"),
+        (
+            _header_json("Mathlib.TraversalAnchor"),
+            "import Mathlib.TraversalAnchor\n#check autoformWarmupMarker",
+            "import Mathlib\nimport Mathlib.TraversalAnchor\n#check autoformWarmupMarker",
+        ),
+        (
+            _header_json("REPL.Frontend", is_module=True),
+            "module\npublic import REPL.Frontend\n",
+            "module\npublic import REPL.Frontend\n",
+        ),
+        (
+            _header_json("REPL.Frontend", prelude=True),
+            "prelude\nimport REPL.Frontend\n#check Nat",
+            "prelude\nimport REPL.Frontend\n#check Nat",
+        ),
+        (_V4_27_INIT_ONLY % "false", "#check Nat", "import Mathlib\n#check Nat"),
+        (
+            _V4_27_INIT_ONLY % "true",
+            "prelude\nimport Init\n#check Nat",
+            "prelude\nimport Init\n#check Nat",
+        ),
+    ],
+)
+def test_disposable_call_prefixes_warmup_only_onto_proven_ordinary_headers(monkeypatch, header_output, code, frame):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            allowed_imports=frozenset({"Mathlib", "REPL"}),
+            warmup_imports=frozenset({"Mathlib"}),
+            header_command=_fake_header_command(header_output),
+        )
+    )
+    frames = []
+    monkeypatch.setattr(repl, "start", lambda: None)
+
+    def run_frame(code, timeout):
+        frames.append(code)
+        return {"env": 1, "messages": [], "sorries": []}
+
+    monkeypatch.setattr(repl, "_run", run_frame)
+
+    assert repl.run_disposable(code) == {"messages": [], "sorries": []}
+    assert frames == [frame]
+
+
+def test_disposable_call_rejects_disallowed_warmup_import(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            allowed_imports=frozenset({"Mathlib"}),
+            warmup_imports=frozenset({"Unsafe.Prelude"}),
+            header_command=_fake_header_command(_header_json()),
+        )
+    )
+    monkeypatch.setattr(
+        repl,
+        "start",
+        lambda: pytest.fail("disallowed warmup must not start Lean"),
+    )
+
+    response = repl.run_disposable("#check Nat")
+
+    assert "Disallowed imports: Unsafe" in response["repl_error"]
+
+
+def test_header_check_kills_a_command_that_outlives_the_deadline():
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        _header_modules([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.2)
+
+    assert time.monotonic() - started < 5
+
+
+def test_header_check_never_spawns_after_its_shared_deadline(monkeypatch):
+    repl = repl_core.LeanRepl(repl_core.LeanReplConfig())
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: 2.0)
+    monkeypatch.setattr(
+        repl_core.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("expired header check spawned Lean"),
+    )
+
+    with pytest.raises(TimeoutError, match="timed out checking the Lean header"):
+        repl._check_header("#check Nat", deadline=1.0)
+
+
+def test_header_check_rejects_output_over_the_combined_limit():
+    with pytest.raises(RuntimeError, match="Lean header check failed: header command output exceeded 1024 bytes"):
+        _header_modules(_fake_header_command("x" * 600, stderr="y" * 600), max_buffer_bytes=1024)
+
+
+def test_header_check_reaps_descendants_after_success(tmp_path):
+    process_record = tmp_path / "processes.json"
+    script = (
+        "import json, os, subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(30)'], stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL); "
+        f"open({str(process_record)!r}, 'w').write(json.dumps("
+        "{'group': os.getpgrp()})); "
+        "sys.stdin.read(); "
+        f"sys.stdout.write({_header_json('Mathlib')!r})"
+    )
+
+    assert _header_modules([sys.executable, "-c", script]) == ["Mathlib"]
+    process_ids = json.loads(process_record.read_text())
+    assert not repl_core._process_group_has_live_members(process_ids["group"])
+
+
+# Answers one frame, then waits for the next as the REPL does.
+_ONE_FRAME_REPL = (
+    "import sys\n"
+    "while sys.stdin.readline() not in ('\\n', ''):\n"
+    "    pass\n"
+    "sys.stdout.write('{\"env\": 0}\\n\\n')\n"
+    "sys.stdout.flush()\n"
+    "sys.stdin.read()\n"
+)
+
+
+def test_disposable_call_closes_the_pipes_of_both_process_generations(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            header_command=_fake_header_command(_header_json()),
+            repl_command=[sys.executable, "-c", _ONE_FRAME_REPL],
+        )
+    )
+    processes = []
+    real_spawn = repl._spawn
+
+    def spawn(command):
+        processes.append(real_spawn(command))
+        return processes[-1]
+
+    monkeypatch.setattr(repl, "_spawn", spawn)
+
+    assert repl.run_disposable("#check Nat", timeout=30) == {}
+
+    # The header parser's pipes, then the REPL child's.
+    assert [
+        [stream.closed for stream in (process.stdin, process.stdout, process.stderr)]
+        for process in processes
+    ] == [[True, True, True], [True, True, True]]
+    assert repl.is_clean()
+
+
+def _repl_failing_first_header_cleanup(monkeypatch, error: BaseException):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(), header_command=_fake_header_command(_header_json("Mathlib"))
+        )
+    )
+    real_kill = repl_core._kill_subprocesses
+    cleanup_calls = []
+
+    def fail_once(process, process_group_id, deadline=None):
+        cleanup_calls.append(process_group_id)
+        if len(cleanup_calls) == 1:
+            raise error
+        return real_kill(process, process_group_id, deadline)
+
+    monkeypatch.setattr(repl_core, "_kill_subprocesses", fail_once)
+    return repl, cleanup_calls
+
+
+def test_disposable_call_retries_header_cleanup_before_reuse(monkeypatch):
+    repl, cleanup_calls = _repl_failing_first_header_cleanup(monkeypatch, RuntimeError("injected cleanup failure"))
+    monkeypatch.setattr(repl, "start", lambda: pytest.fail("unclean header must not start Lean"))
+
+    response = repl.run_disposable("import Mathlib\n#check Nat")
+
+    assert "injected cleanup failure" in response["repl_error"]
+    assert len(cleanup_calls) == 2
+    assert repl.is_clean()
+
+
+def test_disposable_call_preserves_header_cleanup_cancellation(monkeypatch):
+    repl, cleanup_calls = _repl_failing_first_header_cleanup(
+        monkeypatch, asyncio.CancelledError("cancel header cleanup")
+    )
+
+    with pytest.raises(asyncio.CancelledError, match="cancel header cleanup"):
+        repl.run_disposable("import Mathlib\n#check Nat")
+
+    assert len(cleanup_calls) == 2
+    assert repl.is_clean()
+
+
+def test_disposable_call_preserves_header_request_cancellation(monkeypatch):
+    repl, cleanup_calls = _repl_failing_first_header_cleanup(monkeypatch, RuntimeError("header cleanup failed"))
+
+    def cancel(*args, **kwargs):
+        raise KeyboardInterrupt("cancel header request")
+
+    monkeypatch.setattr(repl_core, "_communicate_bounded", cancel)
+
+    with pytest.raises(KeyboardInterrupt, match="cancel header request") as raised:
+        repl.run_disposable("import Mathlib\n#check Nat")
+
+    if hasattr(raised.value, "add_note"):
+        assert raised.value.__notes__ == ["Lean REPL process cleanup also failed: header cleanup failed"]
+    # The slot keeps the parser until a later close() verifies that it exited.
+    assert not repl.is_clean()
+    repl.close()
+    assert len(cleanup_calls) == 2
+    assert repl.is_clean()
+
+
+def test_disposable_timeout_before_the_frame_is_sent_states_the_budget(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [])
+        repl = _disposable_repl_with_process(monkeypatch, process)
+        # Nothing becomes ready, so the write times out before the frame is sent.
+        monkeypatch.setattr(repl_core.select, "select", lambda r, w, x, timeout=None: ([], [], []))
+
+        response = repl.run_disposable("#check Nat", timeout=1, budget=3)
+
+    assert response == {"repl_error": "Lean REPL combined command execution timed out after 3 seconds"}
+    assert repl.is_clean()
+
+
+def test_disposable_timeout_after_full_write_is_not_retried(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(warmup_imports=frozenset(), validate_imports=False)
+    )
+    calls = []
+    monkeypatch.setattr(repl, "start", lambda: setattr(repl, "process", object()))
+
+    def fail_after_send(code, timeout, mark_sent):
+        calls.append(code)
+        mark_sent()
+        raise TimeoutError("response timed out")
+
+    monkeypatch.setattr(repl, "_run_io", fail_after_send)
+    response = repl.run_disposable("#eval 1", timeout=1)
+
+    assert response == {
+        "repl_error": "Lean REPL combined command execution timed out after 1 seconds",
+        "outcome_unknown": True,
+    }
+    assert calls == ["#eval 1"]
+    assert repl.process is None
+
+
+def test_disposable_cleanup_failure_after_full_write_keeps_the_unknown_outcome(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(warmup_imports=frozenset(), validate_imports=False)
+    )
+    close_calls = 0
+
+    def close(**kwargs):
+        nonlocal close_calls
+        close_calls += 1
+        # The slot is clean when the call begins; every later cleanup fails.
+        if close_calls > 1:
+            raise RuntimeError("cleanup failed")
+
+    def fail_after_send(code, timeout, mark_sent):
         mark_sent()
         raise TimeoutError("response timed out")
 
     monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "start", lambda: setattr(repl, "process", object()))
     monkeypatch.setattr(repl, "_run_io", fail_after_send)
 
-    response = repl.run("#eval 1", timeout=1)
+    with pytest.raises(repl_core.ReplCleanupError, match="retirement is required: cleanup failed") as error:
+        repl.run_disposable("#eval 1", timeout=1)
 
-    assert response["outcome_unknown"] is True
-    assert "process cleanup also failed" in response["repl_error"]
-    assert close_calls == 2
+    assert error.value.result == {
+        "repl_error": (
+            "Lean REPL combined command execution timed out after 1 seconds; "
+            "process cleanup also failed: cleanup failed"
+        ),
+        "outcome_unknown": True,
+    }
+    assert close_calls == 3
     assert repl.process is not None
+
+
+def test_disposable_timeout_after_full_write_keeps_and_logs_a_cleanup_failure(monkeypatch, caplog):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(warmup_imports=frozenset(), validate_imports=False)
+    )
+    real_close = repl.close
+    close_calls = 0
+
+    def close(**kwargs):
+        nonlocal close_calls
+        close_calls += 1
+        # Only the cleanup right after the timeout fails; the slot's own
+        # cleanup then retires the process.
+        if close_calls == 2:
+            raise RuntimeError("cleanup failed")
+        real_close(**kwargs)
+
+    def fail_after_send(code, timeout, mark_sent):
+        mark_sent()
+        raise TimeoutError("response timed out")
+
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "start", lambda: setattr(repl, "process", object()))
+    monkeypatch.setattr(repl, "_run_io", fail_after_send)
+
+    with caplog.at_level(logging.WARNING, logger=repl_core.logger.name):
+        response = repl.run_disposable("#eval 1", timeout=1)
+
+    message = (
+        "Lean REPL combined command execution timed out after 1 seconds; "
+        "process cleanup also failed: cleanup failed"
+    )
+    assert response == {"repl_error": message, "outcome_unknown": True}
+    assert _repl_log(caplog) == [(logging.WARNING, f"Lean REPL call in . failed: {message}")]
+    assert close_calls == 3
+    assert repl.is_clean()
 
 
 @pytest.mark.parametrize("request_sent", [False, True])
@@ -820,7 +1635,7 @@ def test_run_closes_and_reraises_cancellation(monkeypatch, request_sent):
     repl.process = object()
     retired = []
 
-    def cancel(code, env_id, timeout, mark_sent):
+    def cancel(code, timeout, mark_sent):
         if request_sent:
             mark_sent()
         raise asyncio.CancelledError
@@ -829,7 +1644,7 @@ def test_run_closes_and_reraises_cancellation(monkeypatch, request_sent):
     monkeypatch.setattr(repl, "close", lambda **kwargs: retired.append(True))
 
     with pytest.raises(asyncio.CancelledError):
-        repl._run("#check Nat", env_id=None, timeout=1)
+        repl._run("#check Nat", timeout=1)
 
     assert retired == [True]
 
@@ -852,7 +1667,7 @@ def test_run_preserves_cancellation_when_cleanup_fails(monkeypatch):
     )
 
     with pytest.raises(asyncio.CancelledError) as raised:
-        repl._run("#check Nat", env_id=None, timeout=1)
+        repl._run("#check Nat", timeout=1)
 
     if hasattr(raised.value, "add_note"):
         assert raised.value.__notes__ == [
@@ -866,10 +1681,10 @@ def test_wire_protocol_accepts_response_split_across_reads(monkeypatch):
         repl = _repl_with_process(process, chunk_size=8)
         _patch_pipe_reads(monkeypatch, process)
 
-        assert repl._run("#check Nat", env_id=3, timeout=1) == {"messages": []}
+        assert repl._run("#check Nat", timeout=1) == {"messages": []}
 
         request = process._stdin_read.read(4096)
-        assert json.loads(request.decode().strip()) == {"cmd": "#check Nat", "env": 3}
+        assert json.loads(request.decode().strip()) == {"cmd": "#check Nat"}
 
 
 def test_wire_protocol_rechecks_deadline_before_dispatch_delimiter(monkeypatch):
@@ -895,7 +1710,6 @@ def test_wire_protocol_rechecks_deadline_before_dispatch_delimiter(monkeypatch):
         with pytest.raises(TimeoutError, match="while writing"):
             repl._run_io(
                 "#check Nat",
-                env_id=None,
                 timeout=1,
                 mark_sent=lambda: sent.append(True),
             )
@@ -922,7 +1736,7 @@ def test_final_delimiter_write_failure_has_unknown_outcome(monkeypatch):
         monkeypatch.setattr(repl, "close", lambda **kwargs: retired.append(True))
 
         with pytest.raises(repl_core.ReplOutcomeUnknown, match="fully sent"):
-            repl._run("#check Nat", env_id=None, timeout=1)
+            repl._run("#check Nat", timeout=1)
 
         request = os.read(process._stdin_read.fileno(), 4096)
         assert request.endswith(b"\n") and not request.endswith(b"\n\n")
@@ -936,35 +1750,28 @@ def test_wire_protocol_retires_process_on_unsolicited_second_frame(monkeypatch):
         _patch_pipe_reads(monkeypatch, process)
 
         with pytest.raises(repl_core.ReplOutcomeUnknown, match="unsolicited bytes"):
-            repl._run("#check Nat", env_id=3, timeout=1)
+            repl._run("#check Nat", timeout=1)
 
         assert repl.process is None
 
 
-def test_wire_protocol_rejects_delayed_stdout_before_the_next_request():
+def test_wire_protocol_exchanges_one_frame_over_real_pipes():
     with ExitStack() as stack:
         process = _PipeProcess(stack, [])
         repl = _repl_with_process(process)
-        first_request = bytearray()
+        request = bytearray()
 
-        def serve_first_request() -> None:
-            while b"\n\n" not in first_request:
-                first_request.extend(os.read(process._stdin_read.fileno(), 4096))
+        def serve_request() -> None:
+            while b"\n\n" not in request:
+                request.extend(os.read(process._stdin_read.fileno(), 4096))
             os.write(process._stdout_write.fileno(), b'{"env":1}\n\n')
 
-        worker = threading.Thread(target=serve_first_request, daemon=True)
+        worker = threading.Thread(target=serve_request, daemon=True)
         worker.start()
-        assert repl._run("first", env_id=None, timeout=1) == {"env": 1}
-        worker.join(timeout=1)
+        assert repl._run("#check Nat", timeout=10) == {"env": 1}
+        worker.join(timeout=10)
         assert not worker.is_alive()
-
-        os.write(process._stdout_write.fileno(), b'{"env":999}\n\n')
-        with pytest.raises(repl_core.ReplProcessExited, match="unsolicited stdout"):
-            repl._run("second", env_id=None, timeout=1)
-
-        readable, _, _ = select.select([process._stdin_read.fileno()], [], [], 0)
-        assert readable == []
-        assert repl.process is None
+        assert bytes(request) == b'{"cmd": "#check Nat"}\n\n'
 
 
 def test_wire_protocol_rechecks_stdout_before_dispatching_a_complete_request_body(
@@ -988,7 +1795,7 @@ def test_wire_protocol_rechecks_stdout_before_dispatching_a_complete_request_bod
         monkeypatch.setattr(repl_core.os, "write", write_body_then_emit_stdout)
 
         with pytest.raises(repl_core.ReplProcessExited, match="unsolicited stdout"):
-            repl._run("second", env_id=None, timeout=1)
+            repl._run("#check Nat", timeout=1)
 
         os.set_blocking(process._stdin_read.fileno(), False)
         written = os.read(process._stdin_read.fileno(), 4096)
@@ -1008,7 +1815,7 @@ def test_wire_protocol_preserves_utf8_split_across_reads(monkeypatch):
         repl = _repl_with_process(process, chunk_size=7)
         _patch_pipe_reads(monkeypatch, process)
 
-        result = repl._run("#check Nat", env_id=None, timeout=1)
+        result = repl._run("#check Nat", timeout=1)
 
     assert result["messages"][0]["data"] == "Nat → Nat"
 
@@ -1021,7 +1828,7 @@ def test_wire_protocol_reports_a_bounded_stderr_tail_on_premature_eof(monkeypatc
         _patch_pipe_reads(monkeypatch, process)
 
         with pytest.raises(repl_core.ReplOutcomeUnknown) as error:
-            repl._run("#check Nat", env_id=None, timeout=1)
+            repl._run("#check Nat", timeout=1)
 
     assert str(error.value).endswith(stderr[-repl_core._STDERR_TAIL_BYTES :].decode())
     assert "discarded-prefix" not in str(error.value)
@@ -1043,10 +1850,10 @@ def test_wire_protocol_services_stdout_while_stderr_remains_readable(monkeypatch
         monkeypatch.setattr(repl_core.os, "read", fake_read)
 
         # Endlessly readable stderr never starves stdout, so the response is
-        # captured. It cannot be drained to a boundary though, so the process is
-        # reported as unusable rather than silently reused.
+        # captured. stderr cannot be drained to a boundary though, so the
+        # process is retired and the response travels on the backlog error.
         with pytest.raises(repl_core.ReplStderrBacklog) as error:
-            repl._run("#check Nat", env_id=None, timeout=1)
+            repl._run("#check Nat", timeout=1)
 
     assert error.value.response == {"messages": []}
 
@@ -1075,7 +1882,7 @@ def test_wire_protocol_times_out_while_stderr_remains_readable(monkeypatch):
         monkeypatch.setattr(repl_core.time, "monotonic", fake_monotonic)
 
         with pytest.raises(repl_core.ReplOutcomeUnknown, match="timed out"):
-            repl._run("#check Nat", env_id=None, timeout=1)
+            repl._run("#check Nat", timeout=1)
 
 
 def test_wire_protocol_retires_a_process_generation_that_exceeds_its_stderr_quota(monkeypatch):
@@ -1085,7 +1892,7 @@ def test_wire_protocol_retires_a_process_generation_that_exceeds_its_stderr_quot
         _patch_pipe_reads(monkeypatch, process)
 
         with pytest.raises(repl_core.ReplStderrBacklog, match="process-generation stderr") as error:
-            repl._run("#check Nat", env_id=None, timeout=1)
+            repl._run("#check Nat", timeout=1)
 
     assert error.value.response == {}
     assert repl.process is None
@@ -1094,34 +1901,16 @@ def test_wire_protocol_retires_a_process_generation_that_exceeds_its_stderr_quot
     assert "23456789" in str(error.value)
 
 
-def test_process_stderr_overflow_without_a_response_is_not_retried(monkeypatch):
+def test_disposable_stderr_overflow_without_a_response_is_not_retried(monkeypatch):
     with ExitStack() as stack:
         process = _PipeProcess(stack, [], stderr=b"x" * 32)
-        repl = _repl_with_process(process, max_buffer_bytes=16)
+        repl = _disposable_repl_with_process(monkeypatch, process, max_buffer_bytes=16)
         _patch_pipe_reads(monkeypatch, process)
-        monkeypatch.setattr(
-            repl,
-            "restart",
-            lambda timeout=None: pytest.fail("an uncertain command must not be retried"),
-        )
 
-        response = repl.run("#check Nat", timeout=1)
+        response = repl.run_disposable("#check Nat", timeout=1)
 
         assert "execution outcome is unknown and was not retried" in response["repl_error"]
         assert response["outcome_unknown"] is True
-        assert repl.process is None
-
-
-def test_explicit_environment_preserves_an_unknown_outcome(monkeypatch):
-    with ExitStack() as stack:
-        process = _PipeProcess(stack, [], stderr=b"x" * 32)
-        repl = _repl_with_process(process, max_buffer_bytes=16)
-        _patch_pipe_reads(monkeypatch, process)
-
-        with pytest.raises(repl_core.ReplOutcomeUnknown) as error:
-            repl.run("#check Nat", env_id=7, timeout=1)
-
-        assert isinstance(error.value, repl_core.ReplProcessRestarted)
         assert repl.process is None
 
 
@@ -1149,7 +1938,7 @@ def test_wire_protocol_drains_stderr_while_waiting_to_write(monkeypatch):
             block_stdin_until_stderr_is_drained,
         )
 
-        assert repl._run("#check Nat", env_id=None, timeout=1) == {}
+        assert repl._run("#check Nat", timeout=1) == {}
         assert process.stderr_bytes == b""
         assert repl._stderr_bytes == 8
 
@@ -1161,9 +1950,25 @@ def test_wire_protocol_retires_a_process_with_closed_stderr_before_writing():
         repl = _repl_with_process(process)
 
         with pytest.raises(repl_core.ReplProcessExited, match="before the request frame"):
-            repl._run("#check Nat", env_id=None, timeout=1)
+            repl._run("#check Nat", timeout=1)
 
         assert repl.process is None
+
+
+def test_stdout_eof_before_the_frame_is_sent_reports_the_stderr_tail():
+    # A child that exits before reading the frame, as Lake does when it cannot
+    # find the REPL package, says why only on stderr.
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [])
+        process._stderr_write.write(b"error: unknown package `repl`\n")
+        process._stdout_write.close()
+        repl = _repl_with_process(process)
+
+        with pytest.raises(repl_core.ReplProcessExited, match="closed stdout before") as error:
+            repl._run("#check Nat", timeout=1)
+
+        assert repl.process is None
+    assert "error: unknown package `repl`" in str(error.value)
 
 
 def test_stdout_eof_keeps_only_a_fixed_stderr_tail(monkeypatch):
@@ -1181,7 +1986,7 @@ def test_stdout_eof_keeps_only_a_fixed_stderr_tail(monkeypatch):
         _patch_pipe_reads(monkeypatch, process)
 
         with pytest.raises(repl_core.ReplProcessExited) as error:
-            repl._run_io("#check Nat", env_id=None, timeout=1, mark_sent=lambda: None)
+            repl._run_io("#check Nat", timeout=1, mark_sent=lambda: None)
 
         assert len(repl._stderr_tail) == repl_core._STDERR_TAIL_BYTES
         assert bytes(repl._stderr_tail) == b"b" * repl_core._STDERR_TAIL_BYTES
@@ -1216,7 +2021,7 @@ def test_stdout_eof_takes_one_final_stderr_read_after_deadline(monkeypatch):
         monkeypatch.setattr(repl_core.select, "select", fake_select)
 
         with pytest.raises(repl_core.ReplProcessExited, match="diagnostdiagnost"):
-            repl._run_io("#check Nat", env_id=None, timeout=1, mark_sent=lambda: None)
+            repl._run_io("#check Nat", timeout=1, mark_sent=lambda: None)
 
         assert stderr_reads == 2
 
@@ -1228,9 +2033,9 @@ def test_wire_protocol_drains_queued_stderr_after_the_response_frame_completes(m
         repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=1024)
         _patch_pipe_reads(monkeypatch, process)
 
-        assert repl._run("#check Nat", env_id=None, timeout=5) == {"messages": []}
+        assert repl._run("#check Nat", timeout=5) == {"messages": []}
 
-        # Nothing is left to be charged against, or misattributed to, the next command.
+        # Unlike a fairness cycle, the post-response drain reads until stderr is empty.
         assert process.stderr_bytes == b""
 
 
@@ -1241,11 +2046,11 @@ def test_wire_protocol_reports_a_backlog_when_the_cap_ends_the_post_response_dra
         _patch_pipe_reads(monkeypatch, process)
 
         with pytest.raises(repl_core.ReplStderrBacklog) as error:
-            repl._run("#check Nat", env_id=None, timeout=5)
+            repl._run("#check Nat", timeout=5)
 
-    # The response survives, so the caller need not recompute it...
+    # The response survives as the request's answer...
     assert error.value.response == {"messages": []}
-    # ...but the over-budget process generation must not serve another request.
+    # ...and the drain stops once the generation exceeds its stderr cap.
     assert process.stderr_bytes == b"e" * 4
 
 
@@ -1255,28 +2060,10 @@ def test_wire_protocol_accepts_stderr_that_ends_exactly_at_the_cap(monkeypatch):
         repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=20)
         _patch_pipe_reads(monkeypatch, process)
 
-        assert repl._run("#check Nat", env_id=None, timeout=5) == {"messages": []}
+        assert repl._run("#check Nat", timeout=5) == {"messages": []}
 
         assert repl.process is process
         assert process.stderr_bytes == b""
-
-
-def test_stderr_quota_is_cumulative_across_a_process_generation(monkeypatch):
-    with ExitStack() as stack:
-        process = _PipeProcess(stack, [b"{}\n\n"], stderr=b"a" * 6)
-        repl = _repl_with_process(process, chunk_size=6, max_buffer_bytes=10)
-        _patch_pipe_reads(monkeypatch, process)
-
-        assert repl._run("first", env_id=None, timeout=1) == {}
-        assert repl._stderr_bytes == 6
-
-        process.stdout_chunks.append(b"{}\n\n")
-        process.stderr_bytes = b"b" * 6
-        with pytest.raises(repl_core.ReplStderrBacklog) as error:
-            repl._run("second", env_id=None, timeout=1)
-
-        assert error.value.response == {}
-        assert repl.process is None
 
 
 def test_wire_protocol_keeps_the_response_when_the_deadline_ends_the_stderr_drain(monkeypatch):
@@ -1305,144 +2092,30 @@ def test_wire_protocol_keeps_the_response_when_the_deadline_ends_the_stderr_drai
         # Endlessly readable stderr must not hang the post-response drain, and the
         # deadline must not discard a response that was already captured.
         with pytest.raises(repl_core.ReplStderrBacklog) as error:
-            repl._run("#check Nat", env_id=None, timeout=1)
+            repl._run("#check Nat", timeout=1)
 
     assert error.value.response == {"messages": []}
 
 
-def _patch_reads_across_processes(monkeypatch, processes: list[_PipeProcess]):
-    """Serve reads and readiness for several processes, keyed by descriptor."""
-    real_read = os.read
-
-    def take_chunk(chunks: list[bytes], size: int) -> bytes:
-        if not chunks:
-            return b""
-        result = chunks[0][:size]
-        chunks[0] = chunks[0][size:]
-        if not chunks[0]:
-            chunks.pop(0)
-        return result
-
-    def fake_read(fd: int, size: int) -> bytes:
-        for process in processes:
-            if fd == process.stdout.fileno():
-                return take_chunk(process.stdout_chunks, size)
-            if fd == process.stderr.fileno():
-                if not process.stderr_bytes:
-                    raise BlockingIOError
-                result = process.stderr_bytes[:size]
-                process.stderr_bytes = process.stderr_bytes[size:]
-                return result
-        return real_read(fd, size)
-
-    def fake_select(readable, writable, exceptional, timeout=None):
-        if writable:
-            return [], writable, []
-        ready = []
-        for process in processes:
-            if process.stderr_bytes:
-                ready.append(process.stderr.fileno())
-            if process.stdout_chunks:
-                ready.append(process.stdout.fileno())
-        return [fd for fd in ready if fd in readable], [], []
-
-    monkeypatch.setattr(repl_core.os, "read", fake_read)
-    monkeypatch.setattr(repl_core.select, "select", fake_select)
-
-
-def test_backlog_recycles_the_process_so_two_commands_cannot_share_stderr(monkeypatch):
-    with ExitStack() as stack:
-        first = _PipeProcess(stack, [b'{"env":9}\n\n'], stderr=b"e" * 40)
-        second = _PipeProcess(stack, [b'{"env": 1}\n\n'])
-        repl = _repl_with_process(first, chunk_size=18, max_buffer_bytes=20)
-        _patch_reads_across_processes(monkeypatch, [first, second])
-
-        # Command one completes, but its stderr cannot be drained within budget.
-        assert repl.run("#check Nat", timeout=5) == {}
-
-        # The process holding the remainder is gone, so nothing can inherit it.
-        assert repl.process is None
-        assert first.stderr_bytes == b"e" * 4
-
-        monkeypatch.setattr(repl, "restart", lambda timeout=None: setattr(repl, "process", second))
-
-        # Command two runs on a clean process and sees only its own streams.
-        assert repl.run("#check Nat", timeout=5) == {"env": 1}
-
-        assert second.stderr_bytes == b""
-        # Command one's stderr was never consumed by, or charged against, command two.
-        assert first.stderr_bytes == b"e" * 4
-
-
-def test_backlog_response_drops_environment_owned_by_the_recycled_process(monkeypatch):
+def test_disposable_backlog_drops_the_environment_and_warns_that_stderr_became_unsafe(monkeypatch, caplog):
     with ExitStack() as stack:
         process = _PipeProcess(
             stack,
             [b'{"env":9,"messages":[]}\n\n'],
             stderr=b"e" * 64,
         )
-        repl = _repl_with_process(process, chunk_size=30, max_buffer_bytes=32)
+        repl = _disposable_repl_with_process(monkeypatch, process, chunk_size=30, max_buffer_bytes=32)
         _patch_pipe_reads(monkeypatch, process)
 
-        response = repl.run("#check Nat", timeout=5)
+        with caplog.at_level(logging.WARNING, logger=repl_core.logger.name):
+            response = repl.run_disposable("#check Nat", timeout=5)
 
         assert response == {"messages": []}
         assert repl.process is None
-
-
-def test_env_scoped_request_refuses_to_outlive_the_recycled_process(monkeypatch):
-    with ExitStack() as stack:
-        process = _PipeProcess(stack, [b'{"env": 9, "messages": []}\n\n'], stderr=b"e" * 40)
-        repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=20)
-        _patch_pipe_reads(monkeypatch, process)
-
-        # An explicit environment cannot transparently survive the recycle, so the
-        # caller is told rather than handed a response tied to a dead process.
-        with pytest.raises(repl_core.ReplProcessRestarted):
-            repl.run("#check Nat", env_id=7, timeout=5)
-
-        assert repl.process is None
-
-
-def test_deadline_ended_drain_recycles_the_process_so_two_commands_cannot_share_stderr(monkeypatch):
-    with ExitStack() as stack:
-        first = _PipeProcess(stack, [b'{"env": 9, "messages": []}\n\n'], stderr=b"x")
-        second = _PipeProcess(stack, [b'{"env": 1}\n\n'])
-        # A ceiling far out of reach, so the deadline is what ends the drain.
-        repl = _repl_with_process(first, max_buffer_bytes=1_000_000)
-        _patch_reads_across_processes(monkeypatch, [first, second])
-
-        real_read = repl_core.os.read
-
-        def fake_read(fd: int, size: int) -> bytes:
-            # first's stderr never empties, so no clean boundary is ever reached.
-            if fd == first.stderr.fileno():
-                return b"x" * size
-            return real_read(fd, size)
-
-        now = 0.0
-
-        def fake_monotonic() -> float:
-            nonlocal now
-            now += 0.25
-            return now
-
-        monkeypatch.setattr(repl_core.os, "read", fake_read)
-        monkeypatch.setattr(repl_core.time, "monotonic", fake_monotonic)
-
-        # Command one still gets its response: the deadline must not starve stdout.
-        assert repl.run("#check Nat", timeout=5) == {"messages": []}
-
-        # But the process that still holds unread stderr is out of service.
-        assert repl.process is None
-        assert first.stderr_bytes
-
-        monkeypatch.setattr(repl, "restart", lambda timeout=None: setattr(repl, "process", second))
-        monkeypatch.setattr(repl_core.os, "read", real_read)
-
-        # Command two runs on a clean process, unaffected by command one's stderr.
-        assert repl.run("#check Nat", timeout=5) == {"env": 1}
-        assert second.stderr_bytes == b""
+    [(level, message)] = _repl_log(caplog)
+    assert level == logging.WARNING
+    assert message.startswith("Lean REPL call in .: ")
+    assert "stderr became unsafe" in message
 
 
 def test_run_never_leaves_a_reusable_process_when_a_backlog_stops_the_drain(monkeypatch):
@@ -1453,108 +2126,19 @@ def test_run_never_leaves_a_reusable_process_when_a_backlog_stops_the_drain(monk
         _patch_pipe_reads(monkeypatch, process)
 
         with pytest.raises(repl_core.ReplStderrBacklog):
-            repl._run("#check Nat", env_id=None, timeout=5)
+            repl._run("#check Nat", timeout=5)
 
         assert repl.process is None
-        assert repl.is_alive() is False
+        assert repl.is_clean()
 
 
-def test_stderr_salvage_removes_every_process_owned_handle(monkeypatch):
-    with ExitStack() as stack:
-        process = _PipeProcess(stack, [b"{}\n\n"])
-        repl = _repl_with_process(process)
-        response = {
-            "env": 7,
-            "sorries": [{"goal": "False", "proofState": 9}],
-        }
-        monkeypatch.setattr(
-            repl,
-            "_run",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                repl_core.ReplStderrBacklog("stderr backlog", response)
-            ),
-        )
-
-        result = repl.run("#check Nat", timeout=1)
-
-    assert result == {"sorries": [{"goal": "False"}]}
-    assert repl.process is None
-
-
-def test_stderr_arriving_during_the_next_write_is_process_scoped(monkeypatch):
-    with ExitStack() as stack:
-        first = _PipeProcess(stack, [])
-        second = _PipeProcess(stack, [])
-        repl = _repl_with_process(first, max_buffer_bytes=16)
-        requests: list[bytes] = []
-
-        def serve(process: _PipeProcess, responses: list[bytes]) -> None:
-            for response in responses:
-                request = bytearray()
-                while b"\n\n" not in request:
-                    request.extend(os.read(process._stdin_read.fileno(), 4096))
-                requests.append(bytes(request))
-                os.write(process._stdout_write.fileno(), response)
-
-        first_worker = threading.Thread(
-            target=serve,
-            args=(first, [b'{"env":1}\n\n', b'{"env":2}\n\n']),
-            daemon=True,
-        )
-        second_worker = threading.Thread(
-            target=serve,
-            args=(second, [b'{"env":3}\n\n']),
-            daemon=True,
-        )
-        first_worker.start()
-        second_worker.start()
-
-        normal_select = repl_core.select.select
-        writes = 0
-
-        def inject_during_second_write(readable, writable, exceptional, timeout=None):
-            nonlocal writes
-            result = normal_select(readable, writable, exceptional, timeout)
-            if writable:
-                writes += 1
-                if writes == 4:
-                    # These bytes are emitted by command one after command two's
-                    # old preflight window, while command two is being written.
-                    os.write(first._stderr_write.fileno(), b"x" * 32)
-            return result
-
-        monkeypatch.setattr(repl_core.select, "select", inject_during_second_write)
-
-        assert repl.run("first", timeout=1) == {"env": 1}
-        # The process-generation quota is exceeded, but command two's captured
-        # response survives without the dead environment identifier or a retry.
-        assert repl.run("second", timeout=1) == {}
-        assert writes == 4
-        assert repl.process is None
-
-        monkeypatch.setattr(repl, "restart", lambda timeout=None: setattr(repl, "process", second))
-
-        # A third command starts on a clean process generation; command one's
-        # delayed stderr was neither consumed nor charged as command-three output.
-        assert repl.run("third", timeout=1) == {"env": 3}
-        assert repl._stderr_bytes == 0
-        assert len(requests) == 3
-        first_worker.join(timeout=1)
-        second_worker.join(timeout=1)
-
-
-def test_invalid_json_with_a_stderr_backlog_is_not_retried(monkeypatch):
+def test_disposable_invalid_json_with_a_stderr_backlog_is_not_retried(monkeypatch):
     with ExitStack() as stack:
         process = _PipeProcess(stack, [b"not-json\n\n"], stderr=b"e" * 40)
-        repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=20)
+        repl = _disposable_repl_with_process(monkeypatch, process, chunk_size=18, max_buffer_bytes=20)
         _patch_pipe_reads(monkeypatch, process)
-        monkeypatch.setattr(
-            repl,
-            "restart",
-            lambda timeout=None: pytest.fail("an uncertain command must not be retried"),
-        )
 
-        response = repl.run("#check Nat", timeout=5)
+        response = repl.run_disposable("#check Nat", timeout=5)
 
         assert response["outcome_unknown"] is True
         assert "response frame was malformed" in response["repl_error"]
@@ -1569,7 +2153,7 @@ def test_wire_protocol_rejects_invalid_json(monkeypatch):
         _patch_pipe_reads(monkeypatch, process)
 
         with pytest.raises(repl_core.ReplOutcomeUnknown, match="fully sent"):
-            repl._run("#check Nat", env_id=None, timeout=1)
+            repl._run("#check Nat", timeout=1)
 
 
 @pytest.mark.parametrize(
@@ -1579,13 +2163,13 @@ def test_wire_protocol_rejects_invalid_json(monkeypatch):
         b'{"env":NaN}\n\n',
     ],
 )
-def test_wire_protocol_rejects_noncanonical_response_json(monkeypatch, response):
+def test_disposable_call_rejects_noncanonical_response_json(monkeypatch, response):
     with ExitStack() as stack:
         process = _PipeProcess(stack, [response])
-        repl = _repl_with_process(process)
+        repl = _disposable_repl_with_process(monkeypatch, process)
         _patch_pipe_reads(monkeypatch, process)
 
-        result = repl.run("#check Nat", timeout=1)
+        result = repl.run_disposable("#check Nat", timeout=1)
 
         assert result["outcome_unknown"] is True
         assert repl.process is None
@@ -1598,35 +2182,7 @@ def test_wire_protocol_rejects_oversized_response(monkeypatch):
         _patch_pipe_reads(monkeypatch, process)
 
         with pytest.raises(repl_core.ReplOutcomeUnknown, match="response exceeded 8 bytes"):
-            repl._run("#check Nat", env_id=None, timeout=1)
-
-
-_RESPONSIVE_FAKE_REPL = (
-    "import json, sys, time\n"
-    "buf = ''\n"
-    "n = 0\n"
-    "for line in sys.stdin:\n"
-    "    if line.strip():\n"
-    "        buf += line\n"
-    "        continue\n"
-    "    request = json.loads(buf)\n"
-    "    buf = ''\n"
-    "    if 'HANG' in request['cmd']:\n"
-    "        time.sleep(3600)\n"
-    "    sys.stdout.write(json.dumps({'env': n}) + '\\n\\n')\n"
-    "    sys.stdout.flush()\n"
-    "    n += 1\n"
-)
-
-
-def _responsive_fake_repl():
-    return repl_core.LeanRepl(
-        repl_core.LeanReplConfig(
-            repl_command=[sys.executable, "-c", _RESPONSIVE_FAKE_REPL],
-            warmup_imports=frozenset({"Mathlib"}),
-            validate_imports=False,
-        )
-    )
+            repl._run("#check Nat", timeout=1)
 
 
 def test_close_after_an_expired_deadline_still_reserves_cleanup_time(monkeypatch):
@@ -1648,56 +2204,37 @@ def test_close_after_an_expired_deadline_still_reserves_cleanup_time(monkeypatch
     assert deadlines[0] >= before + repl_core.DEFAULT_REPL_CLEANUP_SECONDS
 
 
-def test_request_timeout_reaps_a_slow_to_exit_process_without_cleanup_failure(
+def test_disposable_timeout_reaps_a_slow_to_exit_process_without_cleanup_failure(
     monkeypatch,
 ):
     real_kill = repl_core._kill_subprocesses
+    refused = []
 
     def slow_reap(process, process_group_id, deadline=None):
         # A large Lean process needs real time to exit after SIGKILL.
         if deadline is not None and deadline - time.monotonic() < 0.5:
+            refused.append(deadline)
             raise RuntimeError("timed out reaping the Lean REPL process")
         real_kill(process, process_group_id, deadline)
 
     monkeypatch.setattr(repl_core, "_kill_subprocesses", slow_reap)
-    repl = _responsive_fake_repl()
-    repl.start()
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            # Never answers. The frame still fits in the pipe buffer, so the
+            # call times out after it is fully sent.
+            repl_command=[sys.executable, "-c", "import time; time.sleep(3600)"],
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
     try:
-        response = repl.run("HANG", timeout=0.5)
+        response = repl.run_disposable("#check Nat", timeout=0.5)
 
-        assert response.get("outcome_unknown") is True
-        assert "cleanup also failed" not in response["repl_error"]
-        assert repl.process is None
-        assert repl._process_group_id is None
-        assert repl._retire_pending is False
-    finally:
-        repl.close()
-
-
-def test_worker_whose_close_failed_is_restarted_before_the_next_request(
-    monkeypatch,
-):
-    repl = _responsive_fake_repl()
-    repl.start()
-    real_kill = repl_core._kill_subprocesses
-    failures = iter([RuntimeError("timed out reaping the Lean REPL process")])
-
-    def fail_once(process, process_group_id, deadline=None):
-        error = next(failures, None)
-        if error is not None:
-            # The group is dead but its leader is left unreaped.
-            os.killpg(process_group_id, signal.SIGKILL)
-            raise error
-        real_kill(process, process_group_id, deadline)
-
-    monkeypatch.setattr(repl_core, "_kill_subprocesses", fail_once)
-    try:
-        with pytest.raises(RuntimeError, match="timed out reaping"):
-            repl.close()
-        assert not repl.is_alive()
-
-        response = repl.run("#check Nat", timeout=10)
-
-        assert "repl_error" not in response
+        assert response == {
+            "repl_error": "Lean REPL combined command execution timed out after 0.5 seconds",
+            "outcome_unknown": True,
+        }
+        assert refused == []
+        assert repl.is_clean()
     finally:
         repl.close()

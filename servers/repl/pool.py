@@ -1,4 +1,4 @@
-"""Pooled Lean REPL instances with load balancing."""
+"""Cold Lean REPL slots that each admit one disposable call."""
 
 from __future__ import annotations
 
@@ -9,118 +9,151 @@ from dataclasses import dataclass
 from logging import getLogger
 from typing import Any
 
-from .core import LeanRepl, LeanReplConfig
+from .core import LeanRepl, LeanReplConfig, ReplCleanupError
 
 logger = getLogger(__name__)
 
-DEFAULT_RAM_FRACTION = 0.5
-DEFAULT_STARTUP_STAGGER_SECONDS = 2.0
+_SHUTDOWN = object()
+_SHUTDOWN_REFUSAL = "Lean REPL pool is shut down; this call did not start and can be retried"
+
+
+def _slot_timeout(timeout: float) -> TimeoutError:
+    """Return the error for a call whose budget ran out before it started."""
+    return TimeoutError(f"timed out after {timeout:g} seconds waiting for an idle Lean REPL slot")
 
 
 @dataclass
 class LeanReplPoolConfig(LeanReplConfig):
-    """Configuration for a pool of Lean REPL instances."""
+    """Configuration for a pool of cold Lean REPL slots."""
 
-    num_repls: int | None = None
-    startup_stagger: float = DEFAULT_STARTUP_STAGGER_SECONDS
-
-    def __post_init__(self) -> None:
-        if self.num_repls is None:
-            try:
-                import psutil
-
-                total_gb = psutil.virtual_memory().total / (1024**3)
-                self.num_repls = max(1, int(total_gb * DEFAULT_RAM_FRACTION / self.instance_mem_limit_gb))
-            except ImportError:
-                self.num_repls = 1
+    num_repls: int = 1
 
 
 class LeanReplPool:
-    """Pool of Lean REPL instances with queue-based load balancing.
+    """Pool of cold wrappers that each own at most one disposable call.
 
-    Each worker thread owns its own LeanRepl subprocess. Tasks are
-    distributed to idle workers via a FIFO queue.
+    A dirty wrapper poisons the whole generation.  The project cache retains
+    that generation and retries ``shutdown`` on a background reaper; request
+    threads never spin on unbounded cleanup and no replacement can overlap it.
     """
 
     def __init__(self, config: LeanReplPoolConfig) -> None:
         self.config = config
-        self.capacity = config.num_repls or 1
+        self.capacity = config.num_repls
         self._shutdown = False
+        self._requires_retirement = False
+        self._shutdown_wakeup = False
 
         self._workers: list[LeanRepl] = []
-        self._idle: queue.Queue[LeanRepl] = queue.Queue()
+        self._idle: queue.Queue[LeanRepl | object] = queue.Queue()
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._active_calls = 0
 
-        try:
-            for i in range(self.capacity):
-                if i > 0:
-                    import time
+        for _ in range(self.capacity):
+            # Slots retain only Python wrappers. Each public call starts
+            # and retires its own subprocess generation.
+            repl = LeanRepl(config)
+            self._workers.append(repl)
+            self._idle.put(repl)
 
-                    time.sleep(config.startup_stagger)
-                repl = LeanRepl(config)
-                try:
-                    repl.start()
-                except BaseException:
-                    # LeanRepl.start() currently cleans up its own process, but
-                    # keep the pool transaction safe for alternate/test workers
-                    # and future implementations too.
-                    try:
-                        repl.close()
-                    except Exception:
-                        logger.exception("failed to close REPL after startup error")
-                    raise
-                self._workers.append(repl)
-                self._idle.put(repl)
-        except BaseException:
-            self._close_workers()
-            raise
+    @property
+    def requires_retirement(self) -> bool:
+        """Whether this generation must leave the resident project cache."""
+        with self._condition:
+            return self._requires_retirement
+
+    def _stop_admission_locked(self, *, require_retirement: bool = False) -> None:
+        """Stop admission and wake every queue waiter; condition is held."""
+        if require_retirement:
+            self._requires_retirement = True
+        self._shutdown = True
+        if not self._shutdown_wakeup:
+            self._idle.put(_SHUTDOWN)
+            self._shutdown_wakeup = True
+        self._condition.notify_all()
 
     def _close_workers(self) -> None:
         """Close every constructed worker, preserving cleanup after one failure."""
+        survivors: list[LeanRepl] = []
+        first_error: BaseException | None = None
         for worker in reversed(self._workers):
             try:
                 worker.close()
-            except Exception:
+            except BaseException as error:
                 logger.exception("failed to close REPL worker")
-        self._workers.clear()
+                survivors.append(worker)
+                if first_error is None:
+                    first_error = error
+        self._workers = list(reversed(survivors))
         while True:
             try:
                 self._idle.get_nowait()
             except queue.Empty:
                 break
+        self._shutdown_wakeup = False
+        if first_error is not None:
+            raise RuntimeError("one or more Lean REPL workers remain owned") from first_error
 
-    def run(self, code: str, **kwargs: Any) -> dict[str, Any]:
-        """Run code on an idle REPL within one queue-and-execution timeout."""
-        timeout = kwargs.pop("timeout", None)
+    def run(self, code: str, timeout: float | None = None) -> dict[str, Any]:
+        """Run one cold call within a total queue-and-execution timeout."""
         deadline = time.monotonic() + timeout if timeout is not None else None
-        try:
-            repl = self._idle.get(timeout=timeout)
-        except queue.Empty as error:
-            raise TimeoutError(
-                f"timed out after {timeout:g}s waiting for an idle Lean REPL"
-            ) from error
+        with self._condition:
+            if self._shutdown:
+                raise RuntimeError(_SHUTDOWN_REFUSAL)
+            self._active_calls += 1
 
-        def run_once() -> dict[str, Any]:
-            call_kwargs = dict(kwargs)
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"timed out after {timeout:g}s waiting for an idle Lean REPL"
-                    )
-                call_kwargs["timeout"] = remaining
-            return repl.run(code, **call_kwargs)
-
+        repl: LeanRepl | None = None
         try:
-            return run_once()
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise _slot_timeout(timeout)
+            try:
+                candidate = self._idle.get(timeout=remaining)
+            except queue.Empty as error:
+                raise _slot_timeout(timeout) from error
+            if candidate is _SHUTDOWN:
+                # Hand the wakeup to the next waiter.
+                self._idle.put(_SHUTDOWN)
+                raise RuntimeError(_SHUTDOWN_REFUSAL)
+            repl = candidate
+
+            with self._condition:
+                if self._shutdown:
+                    raise RuntimeError(_SHUTDOWN_REFUSAL)
+
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise _slot_timeout(timeout)
+            try:
+                return repl.run_disposable(code, timeout=remaining, budget=timeout)
+            except ReplCleanupError as error:
+                # The response is process-free and remains valid. The dirty
+                # generation transfers to retained project-cache retirement.
+                return error.result
         finally:
-            self._idle.put(repl)
+            with self._condition:
+                try:
+                    if repl is not None:
+                        if repl.is_clean():
+                            if not self._shutdown:
+                                self._idle.put(repl)
+                        else:
+                            self._stop_admission_locked(require_retirement=True)
+                finally:
+                    self._active_calls -= 1
+                    self._condition.notify_all()
 
     def get_memory_usage(self) -> float:
-        """Total memory usage across all REPL instances in GB."""
-        return sum(w.get_memory_usage() for w in self._workers)
+        """Total memory usage in GB of the live child processes of calls in progress."""
+        with self._lock:
+            workers = tuple(self._workers)
+        return sum(worker.get_memory_usage() for worker in workers)
 
     def shutdown(self) -> None:
-        """Shut down all REPL instances."""
-        self._shutdown = True
+        """Stop admission, wait for active calls, then retire every wrapper."""
+        with self._condition:
+            self._stop_admission_locked()
+            while self._active_calls:
+                self._condition.wait()
         self._close_workers()

@@ -119,3 +119,94 @@ def parse_release_catalog(payload: object) -> ReleaseCatalog:
     ):
         raise ProjectCatalogError("releases need unique ids and pairs, with exactly one recommended")
     return ReleaseCatalog(releases)
+
+
+LIBRARY_CATALOG_SCHEMA = "autoform-project-library-catalog/v1"
+_LIBRARY_FIELDS = frozenset({"name", "git", "commit", "release", "offered", "module_roots", "manifest_packages"})
+_LAKE_PACKAGE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+_MODULE_ROOT = re.compile(r"[A-Z][A-Za-z0-9]*")
+# Spliced into a TOML basic string, so no quote, backslash, or control character.
+_LIBRARY_GIT = re.compile(r"https://[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+")
+
+
+@dataclass(frozen=True, slots=True)
+class SharedLibrary:
+    """A shared Lean library `project new --library` can require, at its pinned commit."""
+
+    name: str
+    git: str
+    commit: str
+    release: str
+    offered: bool
+    module_roots: tuple[str, ...]
+    manifest_packages: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryCatalog:
+    libraries: tuple[SharedLibrary, ...]
+
+    def get(self, name: object) -> SharedLibrary | None:
+        return next((library for library in self.libraries if library.name == name), None)
+
+
+def load_library_catalog() -> LibraryCatalog:
+    try:
+        payload = json.loads(files(__package__).joinpath("libraries.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ProjectCatalogError("the bundled library catalog is unreadable") from error
+    return parse_library_catalog(payload, load_release_catalog())
+
+
+def parse_library_catalog(payload: object, releases: ReleaseCatalog) -> LibraryCatalog:
+    try:
+        if payload["schema"] != LIBRARY_CATALOG_SCHEMA:
+            raise ProjectCatalogError("the library catalog has an unsupported schema")
+        if set(payload) != {"schema", "libraries"} or type(payload["libraries"]) is not list:
+            raise ProjectCatalogError("the library catalog is malformed")
+        libraries = tuple(_parse_library(entry) for entry in payload["libraries"])
+    except (KeyError, TypeError) as error:
+        raise ProjectCatalogError("the library catalog is malformed") from error
+    release_ids = {release.id for release in releases.releases}
+    if len({library.name for library in libraries}) != len(libraries):
+        raise ProjectCatalogError("library names must be unique")
+    for library in libraries:
+        if library.release not in release_ids:
+            raise ProjectCatalogError(f"library {library.name!r} names a release the release catalog does not list")
+    return LibraryCatalog(libraries)
+
+
+def _parse_library(entry: object) -> SharedLibrary:
+    if type(entry) is not dict or set(entry) != _LIBRARY_FIELDS:
+        raise ProjectCatalogError("a library entry is malformed")
+    name, git, commit, roots, packages = (
+        entry["name"], entry["git"], entry["commit"], entry["module_roots"], entry["manifest_packages"]
+    )
+    if not (
+        type(name) is str
+        and _LAKE_PACKAGE.fullmatch(name)
+        and type(git) is str
+        and _LIBRARY_GIT.fullmatch(git)
+        and type(commit) is str
+        and _COMMIT.fullmatch(commit)
+        and type(entry["release"]) is str
+        and type(entry["offered"]) is bool
+        and type(roots) is list
+        and roots
+        and all(type(root) is str and _MODULE_ROOT.fullmatch(root) for root in roots)
+        and len({root.casefold() for root in roots}) == len(roots)
+        and type(packages) is list
+        and packages
+        and all(type(package) is dict for package in packages)
+    ):
+        raise ProjectCatalogError(f"library {name!r} is malformed")
+    direct = [package for package in packages if package.get("inherited") is False]
+    if (
+        len(direct) != 1
+        or direct[0].get("name") != name
+        or direct[0].get("url") != git
+        or direct[0].get("rev") != commit
+        or direct[0].get("inputRev") != commit
+    ):
+        raise ProjectCatalogError(f"library {name!r} does not lock its own require at its commit")
+    return SharedLibrary(name, git, commit, entry["release"], entry["offered"], tuple(roots), tuple(packages))

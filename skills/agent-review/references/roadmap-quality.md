@@ -9,8 +9,21 @@ scope against the sources, then inspect the fine DAG and its coarse roadmap.
    substitutes for the source.
 2. Run `autoform check` and inspect the project, chapter, and node-neighborhood
    graphs.
-3. Inspect every milestone and every node in the requested review scope.
+3. Inspect every milestone and every node in the requested review scope, with
+   its hidden `blueprint/.implementation-notes/<article_id>.md` when present.
 4. Distinguish statement prerequisites from proof-only prerequisites.
+5. Run `autoform search`, described in the
+   [search contract](../../../autoform_cli/README.md#search-contract), for each
+   main result in scope, by a few distinctive words and by its Lean name when
+   it has one, and list the queries run. Each result hits its own article; a
+   second article stating the same result is a duplicate. Finding none, even
+   after a retry with fewer words, is not proof, because matching is literal:
+   also compare the statements read for item 3.
+   Include the project's usable shared libraries, as the
+   [library search rules](../../formalize/references/library-search.md)
+   describe, searching by the words of the result, since a library names it
+   differently; a library hit is not a duplicate of an article. List any
+   library refused.
 
 ## Source fidelity and coverage — 40%
 
@@ -39,9 +52,14 @@ scope against the sources, then inspect the fine DAG and its coarse roadmap.
 
 - Titles, paths, source links, and proof sketches let a contributor understand
   the intended change without reconstructing the plan from unrelated pages.
+- Each statement uses standard notation, gives context for each symbol, says
+  what the result is for, and contains no proof steps.
 - Frontmatter asserts only verified facts. Readiness and completion remain
   derived from the DAG.
 - Uncertainty, Mathlib candidates, and unresolved source questions are explicit.
+  Articles hold only frontmatter and informal mathematics, so Mathlib candidates
+  and other Lean-side findings are in the article's implementation note, never
+  in the article.
 
 ## Scores and verdict
 
